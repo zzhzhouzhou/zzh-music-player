@@ -1,0 +1,46 @@
+[package]
+name = "zzhmusicplayer"
+version = "0.1.0"
+edition = "2024"
+description = "极简原生 Rust + Slint 桌面音乐播放器（Windows 11 亚克力毛玻璃）"
+license = "MIT"
+
+[dependencies]
+# GUI 框架：声明式 UI，运行时开销极小。raw-window-handle-06 用于获取 HWND 以调用
+# Win32 API 设置亚克力毛玻璃效果。关闭默认的无障碍/软渲染/托盘等重 feature 以降低内存。
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-femtovg",
+    "raw-window-handle-06",
+    "compat-1-2",
+] }
+# 从 slint::WindowHandle 获取原生 HWND（与 slint 的 raw-window-handle-06 feature 配套）。
+raw-window-handle = "0.6"
+# 音频播放：基于 cpal + symphonia。默认 features 已覆盖 mp3/flac/wav/vorbis/mp4(aac)。
+rodio = "0.22"
+# 波形生成：独立解码 PCM 数据（与 rodio 内部使用的 symphonia 0.5 保持同版本，
+# 避免同时编译两个大版本）。default 已含 flac/wav/vorbis，补充 mp3/aac/m4a 容器。
+symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac"] }
+# 系统原生文件选择对话框（双击窗口打开，非应用内窗口）。
+rfd = "0.15"
+# Win32 API：DwmSetWindowAttribute（亚克力/圆角）、SetWindowPos（置顶）、
+# DragAcceptFiles/SetWindowLongPtrW/DefWindowProcW（文件拖拽）。
+windows-sys = { version = "0.61", features = [
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+    "Win32_Foundation",
+] }
+
+[build-dependencies]
+# 编译 main.slint -> Rust 代码。
+slint-build = "1.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
