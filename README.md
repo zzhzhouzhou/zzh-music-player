@@ -57,5 +57,4 @@ cargo run
 | OGG | Ogg | symphonia-format-ogg + Vorbis |
 | M4A / AAC | MP4 / ADTS | symphonia-format-isomp4 + AAC |
 
-- **置顶开关**为第五个 UI 元素（需求"仅四元素"与"置顶可选"冲突时按你的选择实现）
 
