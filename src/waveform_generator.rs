@@ -26,8 +26,6 @@ pub const WAVE_HEIGHT: u32 = 64;
 const BG_COLOR: [u8; 3] = [255, 255, 255];
 const BG_ALPHA: u8 = 40;
 
-/// 波形高亮色（已播放部分，主题蓝）。
-const FG_COLOR: [u8; 3] = [79, 195, 247];
 const FG_ALPHA: u8 = 230;
 
 /// 音频波形分析结果：逐列 min/max（保留符号，约 -1.0 ~ 1.0）与元信息。
@@ -40,6 +38,10 @@ pub struct Waveform {
     pub title: Option<String>,
     /// 从元数据读取的艺术家（可能缺失）。
     pub artist: Option<String>,
+    /// 主题色（来自内嵌封面主色调，或文件名哈希兜底）。
+    pub theme: [u8; 3],
+    /// 逐列响度（0~255，用于底部律动光带呼吸）。
+    pub loudness: Vec<u8>,
 }
 
 /// 解码音频文件并生成逐列 min/max 波形点阵，同时读取歌曲元数据。
@@ -59,7 +61,7 @@ pub fn analyze(path: &Path) -> Result<Waveform, String> {
     let channel_count = track.codec_params.channels.map(|c| c.count() as u16);
     let mut decoder = make_decoder(track)?;
 
-    let (title, artist) = read_tags(&mut format);
+    let (title, artist, cover) = read_metadata(&mut format);
 
     // 优先使用容器给出的帧数，单遍完成；否则两遍（先计数，再回到开头聚合）。
     let (total_samples, rate, channels) =
@@ -87,6 +89,11 @@ pub fn analyze(path: &Path) -> Result<Waveform, String> {
     }
 
     let columns = aggregate(&mut format, &mut decoder, track_id, total_samples)?;
+    let loudness = compute_loudness(&columns);
+    let theme = cover
+        .as_deref()
+        .and_then(theme_from_cover)
+        .unwrap_or_else(|| hash_theme(path));
 
     let seconds = total_samples as f64 / (f64::from(rate) * f64::from(channels));
     Ok(Waveform {
@@ -94,16 +101,21 @@ pub fn analyze(path: &Path) -> Result<Waveform, String> {
         duration: Duration::from_secs_f64(seconds),
         title,
         artist,
+        theme,
+        loudness,
     })
 }
 
-/// 读取容器元数据中的歌曲名与艺术家。
-fn read_tags(format: &mut Box<dyn FormatReader>) -> (Option<String>, Option<String>) {
+/// 读取容器元数据中的歌曲名、艺术家与内嵌封面。
+fn read_metadata(
+    format: &mut Box<dyn FormatReader>,
+) -> (Option<String>, Option<String>, Option<Vec<u8>>) {
     let mut title = None;
     let mut artist = None;
+    let mut cover = None;
     let mut metadata = format.metadata();
     let Some(revision) = metadata.skip_to_latest() else {
-        return (None, None);
+        return (None, None, None);
     };
     for tag in revision.tags() {
         let value = tag.value.to_string();
@@ -118,7 +130,14 @@ fn read_tags(format: &mut Box<dyn FormatReader>) -> (Option<String>, Option<Stri
             _ => {}
         }
     }
-    (title, artist)
+    // 封面取第一张图片类内嵌图（常见为封面）。
+    if let Some(visual) = revision.visuals().first()
+        && visual.media_type.starts_with("image/")
+        && !visual.data.is_empty()
+    {
+        cover = Some(visual.data.to_vec());
+    }
+    (title, artist, cover)
 }
 
 /// 打开文件并用 symphonia 探测格式。
@@ -231,14 +250,102 @@ fn aggregate(
     Ok(mins.into_iter().zip(maxs).collect())
 }
 
-/// 将逐列 min/max 点阵渲染为两张 RGBA 位图：半透明背景波形 + 高亮色波形。
+/// 逐列响度：取该列 |min|/|max| 的峰值（0~255），用于底部律动光带呼吸。
+fn compute_loudness(columns: &[(f32, f32)]) -> Vec<u8> {
+    columns
+        .iter()
+        .map(|&(mn, mx)| {
+            let peak = mn.abs().max(mx.abs()).clamp(0.0, 1.0);
+            (peak * 255.0) as u8
+        })
+        .collect()
+}
+
+/// 从内嵌封面提取主色调：解码后缩到 16×16 取平均，再提饱和度/亮度保证渐变好看。
+fn theme_from_cover(data: &[u8]) -> Option<[u8; 3]> {
+    let img = image::load_from_memory(data).ok()?;
+    let small = img.thumbnail(16, 16).to_rgb8();
+    let count = small.pixels().count().max(1) as u64;
+    let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
+    for p in small.pixels() {
+        r += u64::from(p[0]);
+        g += u64::from(p[1]);
+        b += u64::from(p[2]);
+    }
+    let rgb = [(r / count) as u8, (g / count) as u8, (b / count) as u8];
+    Some(normalize_theme(rgb))
+}
+
+/// 无封面时用文件名哈希生成固定主题色（同一文件每次启动颜色一致）。
+fn hash_theme(path: &Path) -> [u8; 3] {
+    let bytes = path.to_string_lossy();
+    let mut hash = 0x811c9dc5u32;
+    for &b in bytes.as_bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    let hue = (hash % 360) as f32;
+    let sat = 0.58 + ((hash >> 8) % 30) as f32 / 100.0; // 0.58 ~ 0.87
+    let light = 0.46 + ((hash >> 16) % 24) as f32 / 100.0; // 0.46 ~ 0.69
+    hsl_to_rgb(hue, sat, light)
+}
+
+/// 把平均色归一化为饱和、明亮的主题色（HSL 空间调整后转回 RGB）。
+fn normalize_theme(rgb: [u8; 3]) -> [u8; 3] {
+    let (h, _s, _l) = rgb_to_hsl(rgb);
+    hsl_to_rgb(h, 0.72, 0.58)
+}
+
+/// RGB -> HSL（h 0~360，s/l 0~1）。
+fn rgb_to_hsl([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
+    let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    let s = if d == 0.0 { 0.0 } else { d / (1.0 - (2.0 * l - 1.0).abs()) };
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    (h, s, l)
+}
+
+/// HSL -> RGB。
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    ]
+}
+
+/// 将逐列 min/max 点阵渲染为两张 RGBA 位图：半透明背景波形 + 主题色高亮波形。
 /// 返回的像素缓冲可跨线程传递（`Send`），由 UI 线程构造 `slint::Image`。
 pub fn render_wave_buffers(
     columns: &[(f32, f32)],
+    fg: [u8; 3],
 ) -> (SharedPixelBuffer<Rgba8Pixel>, SharedPixelBuffer<Rgba8Pixel>) {
     (
         render_buffer(columns, BG_COLOR, BG_ALPHA),
-        render_buffer(columns, FG_COLOR, FG_ALPHA),
+        render_buffer(columns, fg, FG_ALPHA),
     )
 }
 
@@ -335,6 +442,9 @@ mod tests {
         // 元数据从 LIST INFO 中读出。
         assert_eq!(wf.title.as_deref(), Some("Test Title"));
         assert_eq!(wf.artist.as_deref(), Some("Test Artist"));
+        // 无封面时主题色来自文件名哈希，响度数组与列数一致。
+        assert_eq!(wf.loudness.len(), WAVE_COLUMNS);
+        assert!(wf.loudness.iter().any(|&v| v > 0), "正弦波应有响度");
 
         // 全幅正弦波：正峰值应接近 +1，负谷值接近 -1（证明波形来自真实 PCM）。
         let peak = wf.columns.iter().map(|&(_, mx)| mx).fold(f32::MIN, f32::max);
@@ -343,7 +453,7 @@ mod tests {
         assert!(trough < -0.9, "谷值过浅: {trough}");
 
         // 渲染位图尺寸与内容验证。
-        let (mut bg, fg) = render_wave_buffers(&wf.columns);
+        let (mut bg, fg) = render_wave_buffers(&wf.columns, wf.theme);
         assert_eq!(bg.width(), WAVE_COLUMNS as u32);
         assert_eq!(fg.height(), WAVE_HEIGHT);
         let bytes = bg.make_mut_bytes();
@@ -383,7 +493,7 @@ mod tests {
                 wf.columns.iter().any(|&(mn, mx)| mn.abs() > 0.01 || mx.abs() > 0.01),
                 "{name} 波形全静音"
             );
-            let (mut bg, fg) = render_wave_buffers(&wf.columns);
+            let (mut bg, fg) = render_wave_buffers(&wf.columns, wf.theme);
             assert_eq!(bg.width(), WAVE_COLUMNS as u32);
             assert_eq!(fg.height(), WAVE_HEIGHT);
             assert!(bg.make_mut_bytes()[WAVE_COLUMNS * (WAVE_HEIGHT as usize / 2) * 4 + 3] > 0);

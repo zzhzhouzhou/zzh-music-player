@@ -1,5 +1,5 @@
 //! zzhMusicPlayer —— 极简原生 Rust + Slint 桌面音乐播放器。
-//! 长条形窗口 + Windows 11 亚克力毛玻璃，仅含播放控制与波形进度条。
+//! 长条形窗口 + Windows 11 亚克力毛玻璃 + 主题渐变背景。
 
 // Release 构建下隐藏控制台窗口（纯 GUI 应用）。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -9,16 +9,17 @@ mod waveform_generator;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use audio_engine::{AudioEngine, Command, Event};
+use audio_engine::{AudioEngine, Command, Event, PlaybackMode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
-use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
@@ -27,7 +28,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC,
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_DROPFILES,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_CLOSE, WM_DROPFILES,
+    WM_MOUSEWHEEL,
 };
 
 slint::include_modules!();
@@ -47,18 +49,25 @@ struct WaveformResult {
     duration: Duration,
     title: Option<String>,
     artist: Option<String>,
+    theme: [u8; 3],
+    loudness: Vec<u8>,
 }
 
-/// 文件相关外部事件（OS 拖拽 / 双击），经通道由 UI 线程统一处理。
+/// 文件相关外部事件（OS 拖拽 / 双击 / 滚轮），经通道由 UI 线程统一处理。
 enum FileEvent {
     Dropped(Vec<PathBuf>),
     DoubleClick,
+    Wheel(i32),
+    /// 关闭请求（右上角按钮或系统 WM_CLOSE）。
+    CloseRequest,
 }
 
 /// WndProc 与 UI 线程之间的文件事件通道。
 static FILE_EVENTS: OnceLock<Sender<FileEvent>> = OnceLock::new();
 /// 被替换的原窗口过程（winit 的 WndProc）。
 static ORIGINAL_WNDPROC: OnceLock<isize> = OnceLock::new();
+/// 播放列表抽屉是否打开（打开时滚轮交给列表滚动，不调节音量）。
+static PLAYLIST_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// `SetWindowCompositionAttribute`（未文档化 API）的亚克力策略。
 /// 结构布局参考 winapi 的 `ACCENT_POLICY`。
@@ -81,7 +90,94 @@ struct WindowCompositionAttribData {
 const WCA_ACCENT_POLICY: i32 = 19;
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: i32 = 4;
 
-/// 启动波形后台线程：接收文件路径，解码生成波形位图与时长。
+/// 记忆设置：退出时保存，启动时恢复。
+#[derive(Default)]
+struct Settings {
+    playlist: Vec<PathBuf>,
+    position: f32,
+    volume: f32,
+    mode: PlaybackMode,
+    pin: bool,
+    current: Option<PathBuf>,
+}
+
+/// 设置文件路径：%APPDATA%\zzhMusicPlayer\settings.txt。
+fn settings_path() -> PathBuf {
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    base.join("zzhMusicPlayer").join("settings.txt")
+}
+
+fn load_settings() -> Settings {
+    let mut s = Settings {
+        volume: 1.0,
+        mode: PlaybackMode::Sequential,
+        ..Default::default()
+    };
+    let Ok(text) = std::fs::read_to_string(settings_path()) else {
+        return s;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        match key {
+            "volume" => s.volume = value.parse().unwrap_or(1.0),
+            "position" => s.position = value.parse().unwrap_or(0.0),
+            "mode" => {
+                s.mode = match value.parse::<u8>().unwrap_or(0) {
+                    1 => PlaybackMode::ListLoop,
+                    2 => PlaybackMode::SingleLoop,
+                    3 => PlaybackMode::Random,
+                    _ => PlaybackMode::Sequential,
+                };
+            }
+            "pin" => s.pin = value == "1",
+            "current" => s.current = Some(PathBuf::from(value)),
+            "playlist" => s.playlist.push(PathBuf::from(value)),
+            _ => {}
+        }
+    }
+    s
+}
+
+fn save_settings(
+    playlist: &[PathBuf],
+    position: f32,
+    volume: f32,
+    mode: PlaybackMode,
+    pin: bool,
+    current: Option<&PathBuf>,
+) {
+    let path = settings_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+    let mode = match mode {
+        PlaybackMode::Sequential => 0,
+        PlaybackMode::ListLoop => 1,
+        PlaybackMode::SingleLoop => 2,
+        PlaybackMode::Random => 3,
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "volume={volume}\nposition={position}\nmode={mode}\npin={}\n",
+        u8::from(pin)
+    ));
+    if let Some(cur) = current {
+        out.push_str(&format!("current={}\n", cur.display()));
+    }
+    for p in playlist {
+        out.push_str(&format!("playlist={}\n", p.display()));
+    }
+    let _ = std::fs::write(path, out);
+}
+
+/// 播放列表显示名：文件名，缺失时用完整路径。
+fn track_name(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// 启动波形后台线程：接收文件路径，解码生成波形位图、时长、主题色与响度。
 fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
     let (job_tx, job_rx) = mpsc::channel::<PathBuf>();
     let (res_tx, res_rx) = mpsc::channel::<WaveformResult>();
@@ -90,7 +186,7 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
         .spawn(move || {
             while let Ok(path) = job_rx.recv() {
                 let result = waveform_generator::analyze(&path).map(|wf| {
-                    let (bg, fg) = waveform_generator::render_wave_buffers(&wf.columns);
+                    let (bg, fg) = waveform_generator::render_wave_buffers(&wf.columns, wf.theme);
                     WaveformResult {
                         path,
                         bg,
@@ -98,6 +194,8 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
                         duration: wf.duration,
                         title: wf.title,
                         artist: wf.artist,
+                        theme: wf.theme,
+                        loudness: wf.loudness,
                     }
                 });
                 match result {
@@ -114,13 +212,64 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
     (job_tx, res_rx)
 }
 
-/// 新文件即刻入队播放，同时交给后台线程生成波形（播放不等待波形）。
-fn enqueue_file(path: PathBuf, audio: &AudioEngine, wave_tx: &Sender<PathBuf>) {
-    audio.send(Command::Load(path.clone()));
-    let _ = wave_tx.send(path);
+/// 颜色混合工具。
+fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    [
+        (f32::from(a[0]) + (f32::from(b[0]) - f32::from(a[0])) * t).round() as u8,
+        (f32::from(a[1]) + (f32::from(b[1]) - f32::from(a[1])) * t).round() as u8,
+        (f32::from(a[2]) + (f32::from(b[2]) - f32::from(a[2])) * t).round() as u8,
+    ]
 }
 
-/// 把波形结果应用到 UI（波形图、时长与歌曲元数据）。
+/// 生成柔和模糊感背景位图：低分辨率纵向渐变 + 若干主题色光斑，
+/// 由 UI 平滑放大后呈现“高斯模糊”的柔和观感，体积极小（80×48）。
+fn render_background(theme: [u8; 3]) -> SharedPixelBuffer<Rgba8Pixel> {
+    const W: u32 = 80;
+    const H: u32 = 48;
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(W, H);
+    let bytes = buf.make_mut_bytes();
+    let stride = W as usize * 4;
+
+    let black = [10u8, 12, 18];
+    // 深色覆盖约 70%：颜色整体向深色收敛，仅保留主题色调。
+    let top = mix_rgb(theme, black, 0.56);
+    let bottom = mix_rgb(theme, black, 0.82);
+    // (归一化x, 归一化y, 半径, 光斑色, 强度)：柔和光晕模拟高斯模糊，强度压低。
+    let blobs: [(f32, f32, f32, [u8; 3], f32); 4] = [
+        (0.24, 0.28, 0.46, mix_rgb(theme, black, 0.42), 0.14),
+        (0.72, 0.18, 0.40, mix_rgb(theme, black, 0.50), 0.12),
+        (0.52, 0.84, 0.48, mix_rgb(theme, black, 0.32), 0.10),
+        (0.92, 0.62, 0.36, mix_rgb(theme, black, 0.46), 0.10),
+    ];
+
+    for y in 0..H {
+        for x in 0..W {
+            let fx = x as f32 / (W - 1) as f32;
+            let fy = y as f32 / (H - 1) as f32;
+            let mut r = f32::from(top[0]) + (f32::from(bottom[0]) - f32::from(top[0])) * fy;
+            let mut g = f32::from(top[1]) + (f32::from(bottom[1]) - f32::from(top[1])) * fy;
+            let mut b = f32::from(top[2]) + (f32::from(bottom[2]) - f32::from(top[2])) * fy;
+            let a = 0.70 + fy * 0.10; // 暗色覆盖约 70%~80%，毛玻璃轻微透出。
+            for &(bx, by, br, col, strength) in &blobs {
+                let d = ((fx - bx).powi(2) + (fy - by).powi(2)).sqrt() / br;
+                if d < 1.0 {
+                    let f = (1.0 - d).powi(2) * strength;
+                    r += (f32::from(col[0]) - r) * f;
+                    g += (f32::from(col[1]) - g) * f;
+                    b += (f32::from(col[2]) - b) * f;
+                }
+            }
+            let i = y as usize * stride + x as usize * 4;
+            bytes[i] = r.clamp(0.0, 255.0) as u8;
+            bytes[i + 1] = g.clamp(0.0, 255.0) as u8;
+            bytes[i + 2] = b.clamp(0.0, 255.0) as u8;
+            bytes[i + 3] = (a.clamp(0.0, 1.0) * 255.0) as u8;
+        }
+    }
+    buf
+}
+
+/// 把波形结果应用到 UI：波形图、时长、元数据与主题渐变背景。
 fn apply_waveform(state: &UIState, res: &WaveformResult) {
     state.set_wave_bg_image(Image::from_rgba8(res.bg.clone()));
     state.set_wave_fg_image(Image::from_rgba8(res.fg.clone()));
@@ -137,6 +286,83 @@ fn apply_waveform(state: &UIState, res: &WaveformResult) {
         .unwrap_or_default();
     state.set_track_title(title.into());
     state.set_track_artist(res.artist.clone().unwrap_or_default().into());
+    // 主题色 + 柔和模糊感背景。
+    let theme = slint::Color::from_rgb_u8(res.theme[0], res.theme[1], res.theme[2]);
+    state.set_theme_color(theme);
+    state.set_bg_image(Image::from_rgba8(render_background(res.theme)));
+}
+
+/// 播放位置变化时按当前曲目响度数组更新 UI（底部光带呼吸）。
+fn update_loudness(
+    state: &UIState,
+    loudness: &[u8],
+    last_idx: &mut Option<usize>,
+    pos: Duration,
+) {
+    if loudness.is_empty() {
+        return;
+    }
+    let duration = state.get_duration();
+    let frac = if duration > 0.0 {
+        (pos.as_secs_f32() / duration).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let idx = ((frac * loudness.len() as f32) as usize).min(loudness.len() - 1);
+    if *last_idx != Some(idx) {
+        *last_idx = Some(idx);
+        state.set_loudness(f32::from(loudness[idx]) / 255.0);
+    }
+}
+
+/// 新文件加入播放列表：去重、同步模型与引擎、空闲时立即播放。
+fn add_track(
+    path: PathBuf,
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    model: &Rc<VecModel<SharedString>>,
+    state: &UIState,
+    audio: &AudioEngine,
+    wave_tx: &Sender<PathBuf>,
+) {
+    {
+        let mut list = playlist.borrow_mut();
+        if list.iter().any(|p| *p == path) {
+            return;
+        }
+        list.push(path.clone());
+        model.push(track_name(&path).into());
+    }
+    let idx = playlist.borrow().len() - 1;
+    audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+    let _ = wave_tx.send(path);
+    // 当前没有在播曲目时，新加入的文件立即开始播放。
+    if state.get_playlist_current() < 0 {
+        state.set_playlist_current(idx as i32);
+        audio.send(Command::PlayAt(idx));
+    }
+}
+
+/// 播放列表中的指定曲目。
+fn play_at(
+    index: usize,
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    state: &UIState,
+    audio: &AudioEngine,
+    wave_tx: &Sender<PathBuf>,
+    waveform_cache: &Rc<RefCell<HashMap<PathBuf, WaveformResult>>>,
+) {
+    let list = playlist.borrow();
+    if index >= list.len() {
+        return;
+    }
+    state.set_playlist_current(index as i32);
+    let path = list[index].clone();
+    drop(list);
+    audio.send(Command::PlayAt(index));
+    // 缓存中没有才重新分析；已有则等 TrackStarted 直接上屏。
+    if !waveform_cache.borrow().contains_key(&path) {
+        let _ = wave_tx.send(path);
+    }
 }
 
 /// 从 `slint::Window` 获取原生 HWND。
@@ -147,6 +373,12 @@ fn hwnd_from_window(window: &slint::Window) -> Option<HWND> {
         RawWindowHandle::Win32(win32) => Some(win32.hwnd.get() as *mut _),
         _ => None,
     }
+}
+
+/// 读取鼠标在屏幕上的物理坐标（用于平滑拖动窗口）。
+fn cursor_position() -> Option<(i32, i32)> {
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { (GetCursorPos(&mut pt) != 0).then_some((pt.x, pt.y)) }
 }
 
 /// 应用 Windows 11 亚克力毛玻璃、深色着色与圆角。
@@ -240,12 +472,6 @@ fn set_always_on_top(window: &slint::Window, on: bool) {
     }
 }
 
-/// 读取鼠标在屏幕上的物理坐标（用于平滑拖动窗口）。
-fn cursor_position() -> Option<(i32, i32)> {
-    let mut pt = POINT { x: 0, y: 0 };
-    unsafe { (GetCursorPos(&mut pt) != 0).then_some((pt.x, pt.y)) }
-}
-
 /// 收集 `WM_DROPFILES` 中的全部文件路径。
 unsafe fn collect_dropped_files(drop: HDROP) -> Vec<PathBuf> {
     let mut paths = Vec::new();
@@ -262,7 +488,19 @@ unsafe fn collect_dropped_files(drop: HDROP) -> Vec<PathBuf> {
     paths
 }
 
-/// 子类化窗口过程：拦截文件拖拽，其余消息转发原过程。
+/// 把消息转发给原始窗口过程。
+unsafe fn forward_to_original(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let original = ORIGINAL_WNDPROC.get().copied().unwrap_or(0);
+    if original != 0 {
+        let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+            unsafe { std::mem::transmute(original) };
+        unsafe { proc(hwnd, msg, wparam, lparam) }
+    } else {
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
+
+/// 子类化窗口过程：拦截文件拖拽与滚轮音量，其余消息转发原过程。
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_DROPFILES => {
@@ -272,16 +510,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             0
         }
-        _ => {
-            let original = ORIGINAL_WNDPROC.get().copied().unwrap_or(0);
-            if original != 0 {
-                let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
-                    unsafe { std::mem::transmute(original) };
-                unsafe { proc(hwnd, msg, wparam, lparam) }
+        WM_MOUSEWHEEL => {
+            // 播放列表打开时交给列表滚动；否则滚轮调节音量。
+            if PLAYLIST_OPEN.load(Ordering::Relaxed) {
+                unsafe { forward_to_original(hwnd, msg, wparam, lparam) }
             } else {
-                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+                let delta = ((wparam >> 16) as u16 as i16) as i32;
+                if let Some(tx) = FILE_EVENTS.get() {
+                    let _ = tx.send(FileEvent::Wheel(delta));
+                }
+                0
             }
         }
+        WM_CLOSE => {
+            // 拦截系统关闭（Alt+F4 / 任务栏），统一走“保存设置再退出”。
+            if let Some(tx) = FILE_EVENTS.get() {
+                let _ = tx.send(FileEvent::CloseRequest);
+            }
+            0
+        }
+        _ => unsafe { forward_to_original(hwnd, msg, wparam, lparam) },
     }
 }
 
@@ -306,13 +554,47 @@ fn setup_drag_drop(window: &slint::Window) {
 }
 
 /// 双击窗口（空白区域）：弹出系统原生文件选择对话框（非应用内窗口）。
-fn open_file_dialog(audio: &AudioEngine, wave_tx: &Sender<PathBuf>) {
+fn open_file_dialog(
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    model: &Rc<VecModel<SharedString>>,
+    state: &UIState,
+    audio: &AudioEngine,
+    wave_tx: &Sender<PathBuf>,
+) {
     if let Some(path) = rfd::FileDialog::new()
         .add_filter("音频文件", &["mp3", "flac", "wav", "aac", "m4a", "ogg"])
         .pick_file()
     {
-        enqueue_file(path, audio, wave_tx);
+        add_track(path, playlist, model, state, audio, wave_tx);
     }
+}
+
+/// 统一关闭流程：保存记忆设置、隐藏窗口并退出事件循环。
+fn do_close(
+    ui: &MainWindow,
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    mode_cell: &Rc<std::cell::Cell<PlaybackMode>>,
+) {
+    let state = ui.global::<UIState>();
+    let current = {
+        let list = playlist.borrow();
+        let idx = state.get_playlist_current();
+        if idx >= 0 {
+            list.get(idx as usize).cloned()
+        } else {
+            None
+        }
+    };
+    save_settings(
+        &playlist.borrow(),
+        state.get_position(),
+        state.get_volume(),
+        mode_cell.get(),
+        state.get_always_on_top(),
+        current.as_ref(),
+    );
+    let _ = ui.window().hide();
+    let _ = slint::quit_event_loop();
 }
 
 fn main() {
@@ -322,8 +604,33 @@ fn main() {
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>();
     let _ = FILE_EVENTS.set(file_tx.clone());
 
-    // 初始音量 100%，与 UI 滑块保持一致。
-    audio.send(Command::SetVolume(1.0));
+    // —— 恢复记忆设置 ——
+    let settings = load_settings();
+    let state = ui.global::<UIState>();
+    state.set_volume(settings.volume);
+    state.set_volume_text(
+        slint::SharedString::from(format!("{}%", (settings.volume * 100.0).round() as u32)),
+    );
+    state.set_mode_text(settings.mode.label().into());
+    audio.send(Command::SetVolume(settings.volume));
+    audio.send(Command::SetMode(settings.mode));
+
+    // 播放列表（仅保留仍存在的文件，避免启动后大量报错）。
+    let playlist: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let playlist_model: Rc<VecModel<SharedString>> = Rc::new(VecModel::default());
+    for path in &settings.playlist {
+        if path.is_file() {
+            playlist.borrow_mut().push(path.clone());
+            playlist_model.push(track_name(path).into());
+        }
+    }
+    state.set_playlist(ModelRc::from(playlist_model.clone()));
+    audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+
+    let waveform_cache: Rc<RefCell<HashMap<PathBuf, WaveformResult>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let cache_order: Rc<RefCell<VecDeque<PathBuf>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let mode_cell: Rc<std::cell::Cell<PlaybackMode>> = Rc::new(std::cell::Cell::new(settings.mode));
 
     ui.show().expect("显示窗口失败");
 
@@ -345,8 +652,21 @@ fn main() {
         });
     }
 
-    // 音量百分比提示的自动隐藏计时器。
-    let volume_hide_timer = Rc::new(slint::Timer::default());
+    // 模式提示 / 音量弹层的自动隐藏计时器。
+    let mode_hide_timer = Rc::new(slint::Timer::default());
+    let popup_hide_timer = Rc::new(slint::Timer::default());
+    // 粒子系统：每 33ms 推进相位，驱动白色粒子持续生成、飘散、淡出。
+    let particle_timer = Rc::new(slint::Timer::default());
+    {
+        let ui_weak = ui.as_weak();
+        particle_timer.start(slint::TimerMode::Repeated, Duration::from_millis(33), move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                let t = state.get_particle_time() + 0.033;
+                state.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
+            }
+        });
+    }
 
     // —— 回调接线 ——
     {
@@ -360,6 +680,14 @@ fn main() {
                 state.set_playing(!state.get_playing());
             }
         });
+    }
+    {
+        let audio = audio.clone();
+        ui.global::<UIState>().on_next(move || audio.send(Command::Next));
+    }
+    {
+        let audio = audio.clone();
+        ui.global::<UIState>().on_previous(move || audio.send(Command::Prev));
     }
     {
         let ui_weak = ui.as_weak();
@@ -385,46 +713,176 @@ fn main() {
             audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
         });
     }
+    // 播放模式：顺序 → 列表循环 → 单曲循环 → 随机。
     {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
-        let volume_hide_timer = Rc::clone(&volume_hide_timer);
+        let mode_cell = Rc::clone(&mode_cell);
+        let mode_hide_timer = Rc::clone(&mode_hide_timer);
+        ui.global::<UIState>().on_cycle_mode(move || {
+            let mode = mode_cell.get().cycle();
+            mode_cell.set(mode);
+            audio.send(Command::SetMode(mode));
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                state.set_mode_text(mode.label().into());
+                state.set_mode_showing(true);
+            }
+            mode_hide_timer.restart();
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let mode_hide_timer = Rc::clone(&mode_hide_timer);
+        mode_hide_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(1600),
+            move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.global::<UIState>().set_mode_showing(false);
+                }
+            },
+        );
+    }
+    // 音量：滑块 / 滚轮统一入口。
+    {
+        let ui_weak = ui.as_weak();
+        let audio = audio.clone();
+        let popup_hide_timer = Rc::clone(&popup_hide_timer);
         ui.global::<UIState>().on_set_volume(move |volume| {
             let volume = volume.clamp(0.0, 1.0);
             if let Some(ui) = ui_weak.upgrade() {
                 let state = ui.global::<UIState>();
                 state.set_volume(volume);
-                // 调整时显示音量百分比（1.5 秒后自动隐藏）。
-                let percent = (volume * 100.0).round() as u32;
-                state.set_volume_text(slint::SharedString::from(format!("{percent}%")));
-                state.set_volume_showing(true);
+                state.set_volume_text(
+                    slint::SharedString::from(format!("{}%", (volume * 100.0).round() as u32)),
+                );
+                // 调整音量时保持弹层可见，随后自动收起。
+                state.set_volume_popup_open(true);
             }
             audio.send(Command::SetVolume(volume));
-            volume_hide_timer.restart();
+            popup_hide_timer.restart();
         });
     }
-    // 音量百分比自动隐藏计时器。
+    // 音量弹层开关 + 自动收起。
     {
         let ui_weak = ui.as_weak();
-        let volume_hide_timer = Rc::clone(&volume_hide_timer);
-        volume_hide_timer.start(
+        let popup_hide_timer = Rc::clone(&popup_hide_timer);
+        ui.global::<UIState>().on_toggle_volume_popup(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                let open = !state.get_volume_popup_open();
+                state.set_volume_popup_open(open);
+                if open {
+                    popup_hide_timer.restart();
+                }
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let popup_hide_timer = Rc::clone(&popup_hide_timer);
+        popup_hide_timer.start(
             slint::TimerMode::SingleShot,
-            Duration::from_millis(1500),
+            Duration::from_millis(3000),
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.global::<UIState>().set_volume_showing(false);
+                    ui.global::<UIState>().set_volume_popup_open(false);
                 }
             },
         );
     }
+    // 播放列表抽屉。
     {
         let ui_weak = ui.as_weak();
-        // 右上角关闭按钮：隐藏窗口并退出事件循环。
+        ui.global::<UIState>().on_toggle_playlist(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                let open = !state.get_playlist_open();
+                state.set_playlist_open(open);
+                PLAYLIST_OPEN.store(open, Ordering::Relaxed);
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let audio = audio.clone();
+        let wave_tx = wave_tx.clone();
+        let waveform_cache = Rc::clone(&waveform_cache);
+        ui.global::<UIState>().on_play_at(move |index| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let state = ui.global::<UIState>();
+            play_at(
+                index as usize,
+                &playlist,
+                &state,
+                &audio,
+                &wave_tx,
+                &waveform_cache,
+            );
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let model = Rc::clone(&playlist_model);
+        let audio = audio.clone();
+        ui.global::<UIState>().on_remove_track(move |index| {
+            let index = index as usize;
+            {
+                let mut list = playlist.borrow_mut();
+                if index >= list.len() {
+                    return;
+                }
+                list.remove(index);
+                model.remove(index);
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                let cur = state.get_playlist_current();
+                if cur as usize == index {
+                    state.set_playlist_current(-1);
+                } else if cur as usize > index {
+                    state.set_playlist_current(cur - 1);
+                }
+                state.set_playlist(ModelRc::from(model.clone()));
+            }
+            audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let model = Rc::clone(&playlist_model);
+        let audio = audio.clone();
+        ui.global::<UIState>().on_clear_playlist(move || {
+            playlist.borrow_mut().clear();
+            model.set_vec(Vec::new());
+            audio.send(Command::SetPlaylist(Vec::new()));
+            if let Some(ui) = ui_weak.upgrade() {
+                let state = ui.global::<UIState>();
+                state.set_playlist_current(-1);
+                state.set_playlist(ModelRc::from(model.clone()));
+            }
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let mode_cell = Rc::clone(&mode_cell);
         ui.global::<UIState>().on_close_window(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let _ = ui.window().hide();
+                do_close(&ui, &playlist, &mode_cell);
             }
-            let _ = slint::quit_event_loop();
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.global::<UIState>().on_minimize_window(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.window().set_minimized(true);
+            }
         });
     }
     {
@@ -438,7 +896,6 @@ fn main() {
         });
     }
     // 窗口拖动（空白区域按下 -> 跟随移动）+ 空白区域双击打开文件。
-    // 用系统光标屏幕坐标计算位移，窗口移动不会再反过来干扰鼠标坐标，拖动跟手不闪烁。
     let drag_state = Rc::new(RefCell::new(None::<(slint::PhysicalPosition, i32, i32)>));
     let last_press = Rc::new(RefCell::new(None::<(Instant, f32, f32)>));
     {
@@ -500,24 +957,52 @@ fn main() {
         });
     }
 
-    // 启动参数（如“打开方式”传入的音乐文件）立即播放。
+    // 恢复置顶状态与上次播放进度。
+    if settings.pin {
+        state.set_always_on_top(true);
+        set_always_on_top(ui.window(), true);
+    }
+    if let Some(cur) = &settings.current {
+        if let Some(idx) = playlist.borrow().iter().position(|p| p == cur) {
+            state.set_playlist_current(idx as i32);
+            audio.send(Command::PlayAt(idx));
+            let _ = wave_tx.send(cur.clone());
+            if settings.position > 1.0 {
+                audio.send(Command::Seek(Duration::from_secs_f32(settings.position)));
+            }
+        }
+    }
+
+    // 启动参数（如“打开方式”传入的音乐文件）加入播放列表。
     for arg in std::env::args().skip(1) {
         let path = PathBuf::from(arg);
         if path.is_file() {
-            enqueue_file(path, &audio, &wave_tx);
+            add_track(
+                path,
+                &playlist,
+                &playlist_model,
+                &state,
+                &audio,
+                &wave_tx,
+            );
         }
     }
 
     // —— 周期性事件泵：音频事件 / 文件事件 / 波形结果 ——
     let timer = slint::Timer::default();
-    // 波形按路径缓存：切到队列中下一首时立刻上屏，快速拖入多文件也不会错位。
-    let mut waveform_cache: HashMap<PathBuf, WaveformResult> = HashMap::new();
-    let mut cache_order: VecDeque<PathBuf> = VecDeque::new();
     let mut current_path: Option<PathBuf> = None;
+    let mut active_loudness: Vec<u8> = Vec::new();
+    let mut last_loudness_idx: Option<usize> = None;
     {
         let ui_weak = ui.as_weak();
         let audio = Rc::clone(&audio);
         let wave_tx = wave_tx.clone();
+        let playlist = Rc::clone(&playlist);
+        let playlist_model = Rc::clone(&playlist_model);
+        let waveform_cache = Rc::clone(&waveform_cache);
+        let cache_order = Rc::clone(&cache_order);
+        let popup_hide_timer = Rc::clone(&popup_hide_timer);
+        let mode_cell = Rc::clone(&mode_cell);
         timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
@@ -528,45 +1013,110 @@ fn main() {
                         current_path = Some(path.clone());
                         state.set_playing(true);
                         state.set_position(0.0);
-                        if let Some(res) = waveform_cache.get(&path) {
+                        state.set_seek_pending(false);
+                        state.set_dragging(false);
+                        let idx = playlist.borrow().iter().position(|p| *p == path);
+                        state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
+                        if let Some(res) = waveform_cache.borrow().get(&path) {
                             apply_waveform(&state, res);
+                            active_loudness = res.loudness.clone();
+                            last_loudness_idx = None;
                         }
                         eprintln!("开始播放: {:?}", path);
                     }
-                    Event::Position(pos) => state.set_position(pos.as_secs_f32()),
+                    Event::Position(pos) => {
+                        // 跳转确认：播放位置上报后释放预览，进度条直接落在目标处，不回弹。
+                        if state.get_seek_pending() {
+                            state.set_seek_pending(false);
+                            state.set_dragging(false);
+                        }
+                        state.set_position(pos.as_secs_f32());
+                        update_loudness(&state, &active_loudness, &mut last_loudness_idx, pos);
+                    }
                     Event::Finished => {
                         state.set_playing(false);
                         state.set_position(state.get_duration());
+                        state.set_seek_pending(false);
+                        state.set_dragging(false);
+                        current_path = None;
+                        state.set_playlist_current(-1);
+                        active_loudness.clear();
+                        state.set_loudness(0.0);
                     }
-                    Event::Error(e) => eprintln!("音频错误: {e}"),
+                    Event::Error(e) => {
+                        // 跳转失败时同样解除预览，避免进度条卡在拖拽位置。
+                        state.set_seek_pending(false);
+                        state.set_dragging(false);
+                        eprintln!("音频错误: {e}");
+                    }
                 }
             }
             while let Ok(evt) = file_rx.try_recv() {
                 match evt {
                     FileEvent::Dropped(paths) => {
                         for path in paths {
-                            enqueue_file(path, &audio, &wave_tx);
+                            add_track(
+                                path,
+                                &playlist,
+                                &playlist_model,
+                                &state,
+                                &audio,
+                                &wave_tx,
+                            );
                         }
                     }
-                    FileEvent::DoubleClick => open_file_dialog(&audio, &wave_tx),
+                    FileEvent::DoubleClick => open_file_dialog(
+                        &playlist,
+                        &playlist_model,
+                        &state,
+                        &audio,
+                        &wave_tx,
+                    ),
+                    FileEvent::Wheel(delta) => {
+                        let step = (delta as f32 / 120.0) * 0.05;
+                        let volume = (state.get_volume() + step).clamp(0.0, 1.0);
+                        state.set_volume(volume);
+                        state.set_volume_text(
+                            slint::SharedString::from(format!("{}%", (volume * 100.0).round() as u32)),
+                        );
+                        state.set_volume_popup_open(true);
+                        audio.send(Command::SetVolume(volume));
+                        popup_hide_timer.restart();
+                    }
+                    FileEvent::CloseRequest => {
+                        // 保存设置并退出（拦截了系统 WM_CLOSE）。
+                        let ui = ui_weak.upgrade();
+                        if let Some(ui) = ui {
+                            do_close(&ui, &playlist, &mode_cell);
+                        }
+                    }
                 }
             }
             while let Ok(res) = wave_rx.try_recv() {
                 // 只把属于当前曲目的波形立即上屏；其余缓存，等切到该曲再显示。
                 let is_current = current_path.as_ref().map_or(true, |p| *p == res.path);
-                if !waveform_cache.contains_key(&res.path) {
-                    cache_order.push_back(res.path.clone());
-                    if cache_order.len() > WAVE_CACHE_LIMIT {
-                        if let Some(oldest) = cache_order.pop_front() {
-                            waveform_cache.remove(&oldest);
+                {
+                    let mut cache = waveform_cache.borrow_mut();
+                    if !cache.contains_key(&res.path) {
+                        cache_order.borrow_mut().push_back(res.path.clone());
+                        if cache_order.borrow().len() > WAVE_CACHE_LIMIT {
+                            if let Some(oldest) = cache_order.borrow_mut().pop_front() {
+                                cache.remove(&oldest);
+                            }
                         }
                     }
+                    let path = res.path.clone();
+                    cache.insert(path, res);
                 }
-                let path = res.path.clone();
-                waveform_cache.insert(path.clone(), res);
                 if is_current {
-                    if let Some(cached) = waveform_cache.get(&path) {
-                        apply_waveform(&state, cached);
+                    if let Some(path) = &current_path
+                    {
+                        let cache = waveform_cache.borrow();
+                        if let Some(cached) = cache.get(path) {
+                            apply_waveform(&state, cached);
+                            active_loudness = cached.loudness.clone();
+                            last_loudness_idx = None;
+                        }
                     }
                 }
             }

@@ -1,3 +1,11 @@
+[package.metadata.packager]
+before-packaging-command = "cargo build --release"
+name = "zzhmusicplayer"
+publisher = "zzhzhouzhou"
+formats = ["wix"]
+# 如果你有 .ico 文件，取消注释并指定路径
+# icon = "assets/icon.ico"
+
 [package]
 name = "zzhmusicplayer"
 version = "0.1.0"
@@ -24,6 +32,8 @@ rodio = "0.22"
 symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac"] }
 # 系统原生文件选择对话框（双击窗口打开，非应用内窗口）。
 rfd = "0.15"
+# 封面图解码：提取内嵌封面主色调，生成同色系渐变背景（与 Slint 一致，只编 png/jpeg）。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Win32 API：DwmSetWindowAttribute（亚克力/圆角）、SetWindowPos（置顶）、
 # DragAcceptFiles/SetWindowLongPtrW/DefWindowProcW（文件拖拽）。
 windows-sys = { version = "0.61", features = [
