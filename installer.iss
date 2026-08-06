@@ -1,6 +1,6 @@
 [Setup]
 AppName=zzh音乐播放器
-AppVersion=0.1.0
+AppVersion=1.0.0
 AppPublisher=zzhzhouzhou
 DefaultDirName={pf}\zzhMusicPlayer
 DefaultGroupName=zzh音乐播放器
