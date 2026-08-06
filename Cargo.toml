@@ -35,12 +35,16 @@ rfd = "0.15"
 # 封面图解码：提取内嵌封面主色调，生成同色系渐变背景（与 Slint 一致，只编 png/jpeg）。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # Win32 API：DwmSetWindowAttribute（亚克力/圆角）、SetWindowPos（置顶）、
-# DragAcceptFiles/SetWindowLongPtrW/DefWindowProcW（文件拖拽）。
+# DragAcceptFiles/SetWindowLongPtrW/DefWindowProcW（文件拖拽）、
+# CreateMutexW（单例互斥体）、FindWindowW/SendMessageW/COPYDATASTRUCT（文件转发）。
 windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_Security",
     "Win32_Foundation",
 ] }
 

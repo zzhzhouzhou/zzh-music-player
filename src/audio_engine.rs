@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, Player};
 
-/// 位置上报 / 播放结束检测的轮询周期。
-const TICK: Duration = Duration::from_millis(100);
+/// 位置上报 / 播放结束检测的轮询周期（50ms：进度条更流畅）。
+const TICK: Duration = Duration::from_millis(50);
 
 /// 播放模式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -53,6 +53,8 @@ impl PlaybackMode {
 pub enum Command {
     /// 播放列表中的指定曲目。
     PlayAt(usize),
+    /// 从播放列表中移除指定曲目；若移除的正是当前播放曲目，自动切到下一首。
+    RemoveAt(usize),
     /// 整体替换播放列表（保持当前曲目与索引一致）。
     SetPlaylist(Vec<PathBuf>),
     /// 播放/暂停切换。
@@ -73,7 +75,7 @@ pub enum Command {
 pub enum Event {
     /// 新曲目开始播放。
     TrackStarted { path: PathBuf },
-    /// 播放位置更新（约每 100ms 一次）。
+    /// 播放位置更新（约每 50ms 一次）。
     Position(Duration),
     /// 顺序模式播完列表，播放停止。
     Finished,
@@ -111,7 +113,7 @@ impl AudioEngine {
     }
 }
 
-/// 音频线程主循环：处理命令 + 每 100ms 上报位置、检测播放结束。
+/// 音频线程主循环：处理命令 + 每 50ms 上报位置、检测播放结束。
 fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let device_sink = match DeviceSinkBuilder::open_default_sink() {
         Ok(sink) => sink,
@@ -136,7 +138,14 @@ fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     loop {
         match rx.recv_timeout(TICK) {
             Ok(command) => handle_command(
-                &player, &mut playlist, &mut index, &mut paused, &mut mode, &mut rng, command, &tx,
+                &player,
+                &mut playlist,
+                &mut index,
+                &mut paused,
+                &mut mode,
+                &mut rng,
+                command,
+                &tx,
             ),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // 周期性 tick：播放中上报位置，播完则按模式切歌或结束。
@@ -172,6 +181,28 @@ fn handle_command(
             if i < playlist.len() {
                 *index = Some(i);
                 start_and_notify(player, playlist, index, paused, tx);
+            }
+        }
+        Command::RemoveAt(i) => {
+            if i >= playlist.len() {
+                return;
+            }
+            let was_current = *index == Some(i);
+            let current_path = index.and_then(|ci| playlist.get(ci)).cloned();
+            playlist.remove(i);
+            // 按路径重新定位当前曲目（被删则 index 置空）。
+            *index = current_path.as_ref().and_then(|p| playlist.iter().position(|q| q == p));
+            if was_current {
+                if playlist.is_empty() {
+                    // 列表已空：停止播放。
+                    *index = None;
+                    let _ = tx.send(Event::Finished);
+                } else {
+                    // 正在播放的曲目被删除：自动切到下一首（末尾则回到开头）。
+                    let next = index.map_or(0, |ci| (ci + 1) % playlist.len());
+                    *index = Some(next);
+                    start_and_notify(player, playlist, index, paused, tx);
+                }
             }
         }
         Command::SetPlaylist(paths) => {
@@ -217,11 +248,11 @@ fn handle_command(
         Command::SetVolume(volume) => player.set_volume(volume),
         Command::SetMode(m) => *mode = m,
         Command::Next => {
-            if let Some(i) = *index {
-                if let Some(ni) = next_index(i, playlist.len(), *mode, rng) {
-                    *index = Some(ni);
-                    start_and_notify(player, playlist, index, paused, tx);
-                }
+            if let Some(i) = *index
+                && let Some(ni) = next_index(i, playlist.len(), *mode, rng)
+            {
+                *index = Some(ni);
+                start_and_notify(player, playlist, index, paused, tx);
             }
         }
         Command::Prev => {
@@ -233,7 +264,7 @@ fn handle_command(
     }
 }
 
-/// 按模式计算下一首索引。
+/// 手动“下一首”的索引：任何模式下都切换到相邻曲目（单曲循环只影响播完自动循环）。
 fn next_index(i: usize, len: usize, mode: PlaybackMode, rng: &mut u64) -> Option<usize> {
     if len == 0 {
         return None;
@@ -246,26 +277,25 @@ fn next_index(i: usize, len: usize, mode: PlaybackMode, rng: &mut u64) -> Option
             }
             i + 1
         }
-        PlaybackMode::ListLoop => (i + 1) % len,
-        PlaybackMode::SingleLoop => i,
+        PlaybackMode::ListLoop | PlaybackMode::SingleLoop => (i + 1) % len,
         PlaybackMode::Random => random_other(rng, i, len),
     })
 }
 
-/// 按模式计算上一首索引。
+/// 手动“上一首”的索引：任何模式下都切换到相邻曲目。
 fn prev_index(i: usize, len: usize, mode: PlaybackMode, rng: &mut u64) -> Option<usize> {
     if len == 0 {
         return None;
     }
     Some(match mode {
         PlaybackMode::Sequential => i.saturating_sub(1),
-        PlaybackMode::ListLoop => (i + len - 1) % len,
-        PlaybackMode::SingleLoop => i,
+        PlaybackMode::ListLoop | PlaybackMode::SingleLoop => (i + len - 1) % len,
         PlaybackMode::Random => random_other(rng, i, len),
     })
 }
 
 /// 播放结束后按模式切歌或结束。
+#[allow(clippy::too_many_arguments)]
 fn advance_on_finish(
     player: &Player,
     playlist: &[PathBuf],

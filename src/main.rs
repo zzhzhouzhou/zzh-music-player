@@ -20,16 +20,19 @@ use audio_engine::{AudioEngine, Command, Event, PlaybackMode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
 use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
+use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetCursorPos, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC,
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_CLOSE, WM_DROPFILES,
-    WM_MOUSEWHEEL,
+    DefWindowProcW, FindWindowW, GetCursorPos, GetWindowLongPtrW, MessageBoxW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, SW_RESTORE, WM_CLOSE,
+    WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL, GWLP_WNDPROC, HWND_NOTOPMOST, HWND_TOPMOST,
+    MB_ICONWARNING, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
 };
 
 slint::include_modules!();
@@ -39,7 +42,15 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// 双击判定的位置容差（逻辑像素）。
 const DOUBLE_CLICK_TOLERANCE: f32 = 8.0;
 /// 波形结果缓存上限：拖入大量文件时只保留最近若干份，避免内存无限增长。
-const WAVE_CACHE_LIMIT: usize = 8;
+/// 数值越小越省内存；切换回旧曲目时波形需重新生成。
+const WAVE_CACHE_LIMIT: usize = 4;
+/// 单例互斥体名（Local 前缀：互斥范围限当前登录会话）。
+const SINGLE_INSTANCE_MUTEX: windows_sys::core::PCWSTR =
+    windows_sys::core::w!("Local\\zzhMusicPlayer_SingleInstance");
+/// WM_COPYDATA 自定义数据标识（转发“用本播放器打开”的文件路径列表）。
+const WM_COPYDATA_OPEN_FILES: usize = 0x5A1E;
+/// 等待已有实例窗口就绪的重试次数与间隔（窗口由 winit 惰性创建）。
+const SINGLE_INSTANCE_RETRIES: u32 = 20;
 
 /// 波形生成结果（后台线程产出，UI 线程消费；SharedPixelBuffer 为 Send）。
 struct WaveformResult {
@@ -50,12 +61,13 @@ struct WaveformResult {
     title: Option<String>,
     artist: Option<String>,
     theme: [u8; 3],
-    loudness: Vec<u8>,
 }
 
-/// 文件相关外部事件（OS 拖拽 / 双击 / 滚轮），经通道由 UI 线程统一处理。
+/// 文件相关外部事件（OS 拖拽 / 双击 / 滚轮 / 单例转发），经通道由 UI 线程统一处理。
 enum FileEvent {
     Dropped(Vec<PathBuf>),
+    /// 已运行实例通过 WM_COPYDATA 转发的“用本播放器打开”文件。
+    OpenFiles(Vec<PathBuf>),
     DoubleClick,
     Wheel(i32),
     /// 关闭请求（右上角按钮或系统 WM_CLOSE）。
@@ -195,7 +207,6 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
                         title: wf.title,
                         artist: wf.artist,
                         theme: wf.theme,
-                        loudness: wf.loudness,
                     }
                 });
                 match result {
@@ -292,30 +303,8 @@ fn apply_waveform(state: &UIState, res: &WaveformResult) {
     state.set_bg_image(Image::from_rgba8(render_background(res.theme)));
 }
 
-/// 播放位置变化时按当前曲目响度数组更新 UI（底部光带呼吸）。
-fn update_loudness(
-    state: &UIState,
-    loudness: &[u8],
-    last_idx: &mut Option<usize>,
-    pos: Duration,
-) {
-    if loudness.is_empty() {
-        return;
-    }
-    let duration = state.get_duration();
-    let frac = if duration > 0.0 {
-        (pos.as_secs_f32() / duration).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let idx = ((frac * loudness.len() as f32) as usize).min(loudness.len() - 1);
-    if *last_idx != Some(idx) {
-        *last_idx = Some(idx);
-        state.set_loudness(f32::from(loudness[idx]) / 255.0);
-    }
-}
-
 /// 新文件加入播放列表：去重、同步模型与引擎、空闲时立即播放。
+/// 返回新加入项的索引；已存在则返回 `None`。
 fn add_track(
     path: PathBuf,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
@@ -323,11 +312,15 @@ fn add_track(
     state: &UIState,
     audio: &AudioEngine,
     wave_tx: &Sender<PathBuf>,
-) {
+) -> Option<usize> {
+    // 过滤非文件（不存在的路径 / 目录），静默跳过。
+    if !path.is_file() {
+        return None;
+    }
     {
         let mut list = playlist.borrow_mut();
-        if list.iter().any(|p| *p == path) {
-            return;
+        if list.contains(&path) {
+            return None;
         }
         list.push(path.clone());
         model.push(track_name(&path).into());
@@ -340,6 +333,7 @@ fn add_track(
         state.set_playlist_current(idx as i32);
         audio.send(Command::PlayAt(idx));
     }
+    Some(idx)
 }
 
 /// 播放列表中的指定曲目。
@@ -488,6 +482,65 @@ unsafe fn collect_dropped_files(drop: HDROP) -> Vec<PathBuf> {
     paths
 }
 
+/// 单例模式：创建命名互斥体。若已存在运行实例，把命令行文件转发给
+/// 它的窗口（WM_COPYDATA）后退出本进程；首个实例则保持互斥体句柄。
+fn enforce_single_instance() {
+    unsafe {
+        let mutex = CreateMutexW(std::ptr::null(), 1, SINGLE_INSTANCE_MUTEX);
+        if mutex.is_null() {
+            return; // 互斥体创建失败（罕见）：不阻塞正常启动。
+        }
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let files: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+            forward_to_running_instance(&files);
+            std::process::exit(0);
+        }
+        // 首个实例：互斥体句柄由内核在进程退出时自动释放，此处仅保留变量防提前析构。
+        let _ = mutex;
+    }
+}
+
+/// 把文件路径列表经 WM_COPYDATA 发给已运行实例的窗口，并激活其前台显示。
+fn forward_to_running_instance(files: &[PathBuf]) -> bool {
+    unsafe {
+        // winit 窗口惰性创建：轮询等待就绪（约 1 秒上限）。
+        let mut hwnd: HWND = std::ptr::null_mut();
+        for _ in 0..SINGLE_INSTANCE_RETRIES {
+            hwnd = FindWindowW(std::ptr::null(), windows_sys::core::w!("zzhMusicPlayer"));
+            if !hwnd.is_null() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if hwnd.is_null() {
+            // 极罕见竞态：窗口尚未就绪。提示用户，避免“打开方式”文件被静默丢弃。
+            MessageBoxW(
+                std::ptr::null_mut(),
+                windows_sys::core::w!("无法连接到正在运行的播放器窗口，请稍后重试。"),
+                windows_sys::core::w!("zzhMusicPlayer"),
+                MB_ICONWARNING | MB_OK,
+            );
+            return false;
+        }
+        // 编码为 UTF-16 路径列表：每个路径以 \0 结尾，整体再以 \0 结尾。
+        let mut data: Vec<u16> = Vec::new();
+        for f in files {
+            data.extend(f.to_string_lossy().encode_utf16());
+            data.push(0);
+        }
+        data.push(0);
+        let cd = COPYDATASTRUCT {
+            dwData: WM_COPYDATA_OPEN_FILES,
+            cbData: (data.len() * 2) as u32,
+            lpData: data.as_mut_ptr() as *mut _,
+        };
+        SendMessageW(hwnd, WM_COPYDATA, 0, &cd as *const COPYDATASTRUCT as isize);
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+    true
+}
+
 /// 把消息转发给原始窗口过程。
 unsafe fn forward_to_original(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let original = ORIGINAL_WNDPROC.get().copied().unwrap_or(0);
@@ -500,7 +553,8 @@ unsafe fn forward_to_original(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
     }
 }
 
-/// 子类化窗口过程：拦截文件拖拽与滚轮音量，其余消息转发原过程。
+/// 子类化窗口过程：拦截文件拖拽、滚轮音量、WM_COPYDATA（单例转发）
+/// 与系统关闭，其余消息转发原过程。
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_DROPFILES => {
@@ -526,6 +580,37 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // 拦截系统关闭（Alt+F4 / 任务栏），统一走“保存设置再退出”。
             if let Some(tx) = FILE_EVENTS.get() {
                 let _ = tx.send(FileEvent::CloseRequest);
+            }
+            0
+        }
+        WM_COPYDATA => {
+            // 接收第二个实例转发的文件路径（UTF-16 列表，双重 \0 结尾）。
+            let cd = lparam as *const COPYDATASTRUCT;
+            if !cd.is_null() {
+                let data = unsafe { &*cd };
+                if data.dwData == WM_COPYDATA_OPEN_FILES && !data.lpData.is_null() {
+                    // 上限 64KB，拒绝异常数据；逐元素非对齐读取（消息可来自任意进程）。
+                    let len = (data.cbData as usize / 2).min(32 * 1024);
+                    let base = data.lpData as *const u8;
+                    let mut paths = Vec::new();
+                    let mut cur = Vec::new();
+                    for i in 0..len {
+                        let u = unsafe { std::ptr::read_unaligned(base.add(i * 2) as *const u16) };
+                        if u == 0 {
+                            if !cur.is_empty() {
+                                paths.push(PathBuf::from(String::from_utf16_lossy(&cur)));
+                                cur.clear();
+                            }
+                        } else {
+                            cur.push(u);
+                        }
+                    }
+                    if !paths.is_empty()
+                        && let Some(tx) = FILE_EVENTS.get()
+                    {
+                        let _ = tx.send(FileEvent::OpenFiles(paths));
+                    }
+                }
             }
             0
         }
@@ -565,7 +650,7 @@ fn open_file_dialog(
         .add_filter("音频文件", &["mp3", "flac", "wav", "aac", "m4a", "ogg"])
         .pick_file()
     {
-        add_track(path, playlist, model, state, audio, wave_tx);
+        let _ = add_track(path, playlist, model, state, audio, wave_tx);
     }
 }
 
@@ -598,6 +683,9 @@ fn do_close(
 }
 
 fn main() {
+    // 单例模式：已有实例时转发文件并退出，不创建第二个窗口。
+    enforce_single_instance();
+
     let ui = MainWindow::new().expect("创建窗口失败");
     let audio = Rc::new(AudioEngine::start());
     let (wave_tx, wave_rx) = spawn_waveform_worker();
@@ -664,6 +752,17 @@ fn main() {
                 let state = ui.global::<UIState>();
                 let t = state.get_particle_time() + 0.033;
                 state.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
+                // 工具栏悬停检测：光标进入工具栏矩形范围时让背景变实。
+                if let Some((cx, cy)) = cursor_position() {
+                    let scale = ui.window().scale_factor();
+                    let origin = ui.window().position();
+                    let x0 = origin.x + (210.0 * scale) as i32;
+                    let x1 = origin.x + (510.0 * scale) as i32;
+                    let y0 = origin.y + (120.0 * scale) as i32;
+                    let y1 = origin.y + (160.0 * scale) as i32;
+                    let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+                    state.set_toolbar_hovered(hovered);
+                }
             }
         });
     }
@@ -848,7 +947,8 @@ fn main() {
                 }
                 state.set_playlist(ModelRc::from(model.clone()));
             }
-            audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+            // 引擎侧同步删除；若删的是当前播放曲目，引擎会自动切到下一首。
+            audio.send(Command::RemoveAt(index));
         });
     }
     {
@@ -962,14 +1062,14 @@ fn main() {
         state.set_always_on_top(true);
         set_always_on_top(ui.window(), true);
     }
-    if let Some(cur) = &settings.current {
-        if let Some(idx) = playlist.borrow().iter().position(|p| p == cur) {
-            state.set_playlist_current(idx as i32);
-            audio.send(Command::PlayAt(idx));
-            let _ = wave_tx.send(cur.clone());
-            if settings.position > 1.0 {
-                audio.send(Command::Seek(Duration::from_secs_f32(settings.position)));
-            }
+    if let Some(cur) = &settings.current
+        && let Some(idx) = playlist.borrow().iter().position(|p| p == cur)
+    {
+        state.set_playlist_current(idx as i32);
+        audio.send(Command::PlayAt(idx));
+        let _ = wave_tx.send(cur.clone());
+        if settings.position > 1.0 {
+            audio.send(Command::Seek(Duration::from_secs_f32(settings.position)));
         }
     }
 
@@ -977,7 +1077,7 @@ fn main() {
     for arg in std::env::args().skip(1) {
         let path = PathBuf::from(arg);
         if path.is_file() {
-            add_track(
+            let _ = add_track(
                 path,
                 &playlist,
                 &playlist_model,
@@ -991,8 +1091,6 @@ fn main() {
     // —— 周期性事件泵：音频事件 / 文件事件 / 波形结果 ——
     let timer = slint::Timer::default();
     let mut current_path: Option<PathBuf> = None;
-    let mut active_loudness: Vec<u8> = Vec::new();
-    let mut last_loudness_idx: Option<usize> = None;
     {
         let ui_weak = ui.as_weak();
         let audio = Rc::clone(&audio);
@@ -1018,9 +1116,21 @@ fn main() {
                         let idx = playlist.borrow().iter().position(|p| *p == path);
                         state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
                         if let Some(res) = waveform_cache.borrow().get(&path) {
+                            // 波形已就绪：完整上屏（标题/艺术家/波形图/背景/主题）。
                             apply_waveform(&state, res);
-                            active_loudness = res.loudness.clone();
-                            last_loudness_idx = None;
+                        } else {
+                            // 波形尚未生成：先用文件名即时上屏并清空上一首的波形/背景，
+                            // 保证页面与音频同步，待波形线程完成后（wave_rx）再覆盖完整详情。
+                            let title = path
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            state.set_track_title(title.into());
+                            state.set_track_artist(SharedString::default());
+                            state.set_wave_bg_image(Image::default());
+                            state.set_wave_fg_image(Image::default());
+                            state.set_bg_image(Image::default());
+                            state.set_duration(0.0);
                         }
                         eprintln!("开始播放: {:?}", path);
                     }
@@ -1031,7 +1141,6 @@ fn main() {
                             state.set_dragging(false);
                         }
                         state.set_position(pos.as_secs_f32());
-                        update_loudness(&state, &active_loudness, &mut last_loudness_idx, pos);
                     }
                     Event::Finished => {
                         state.set_playing(false);
@@ -1040,8 +1149,6 @@ fn main() {
                         state.set_dragging(false);
                         current_path = None;
                         state.set_playlist_current(-1);
-                        active_loudness.clear();
-                        state.set_loudness(0.0);
                     }
                     Event::Error(e) => {
                         // 跳转失败时同样解除预览，避免进度条卡在拖拽位置。
@@ -1055,13 +1162,40 @@ fn main() {
                 match evt {
                     FileEvent::Dropped(paths) => {
                         for path in paths {
-                            add_track(
+                            let _ = add_track(
                                 path,
                                 &playlist,
                                 &playlist_model,
                                 &state,
                                 &audio,
                                 &wave_tx,
+                            );
+                        }
+                    }
+                    FileEvent::OpenFiles(paths) => {
+                        // 第二个实例转发的“打开方式”文件：全部加入列表并立即播放首个新文件。
+                        let mut first: Option<usize> = None;
+                        for path in paths {
+                            if let Some(idx) = add_track(
+                                path,
+                                &playlist,
+                                &playlist_model,
+                                &state,
+                                &audio,
+                                &wave_tx,
+                            ) && first.is_none()
+                            {
+                                first = Some(idx);
+                            }
+                        }
+                        if let Some(idx) = first {
+                            play_at(
+                                idx,
+                                &playlist,
+                                &state,
+                                &audio,
+                                &wave_tx,
+                                &waveform_cache,
                             );
                         }
                     }
@@ -1094,29 +1228,24 @@ fn main() {
             }
             while let Ok(res) = wave_rx.try_recv() {
                 // 只把属于当前曲目的波形立即上屏；其余缓存，等切到该曲再显示。
-                let is_current = current_path.as_ref().map_or(true, |p| *p == res.path);
+                let is_current = current_path.as_ref().is_some_and(|p| *p == res.path);
                 {
                     let mut cache = waveform_cache.borrow_mut();
                     if !cache.contains_key(&res.path) {
                         cache_order.borrow_mut().push_back(res.path.clone());
-                        if cache_order.borrow().len() > WAVE_CACHE_LIMIT {
-                            if let Some(oldest) = cache_order.borrow_mut().pop_front() {
-                                cache.remove(&oldest);
-                            }
+                        if cache_order.borrow().len() > WAVE_CACHE_LIMIT
+                            && let Some(oldest) = cache_order.borrow_mut().pop_front()
+                        {
+                            cache.remove(&oldest);
                         }
                     }
                     let path = res.path.clone();
                     cache.insert(path, res);
                 }
                 if is_current {
-                    if let Some(path) = &current_path
-                    {
-                        let cache = waveform_cache.borrow();
-                        if let Some(cached) = cache.get(path) {
-                            apply_waveform(&state, cached);
-                            active_loudness = cached.loudness.clone();
-                            last_loudness_idx = None;
-                        }
+                    let cache = waveform_cache.borrow();
+                    if let Some(cached) = cache.get(current_path.as_ref().unwrap().as_path()) {
+                        apply_waveform(&state, cached);
                     }
                 }
             }

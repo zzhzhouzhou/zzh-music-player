@@ -40,8 +40,6 @@ pub struct Waveform {
     pub artist: Option<String>,
     /// 主题色（来自内嵌封面主色调，或文件名哈希兜底）。
     pub theme: [u8; 3],
-    /// 逐列响度（0~255，用于底部律动光带呼吸）。
-    pub loudness: Vec<u8>,
 }
 
 /// 解码音频文件并生成逐列 min/max 波形点阵，同时读取歌曲元数据。
@@ -89,7 +87,6 @@ pub fn analyze(path: &Path) -> Result<Waveform, String> {
     }
 
     let columns = aggregate(&mut format, &mut decoder, track_id, total_samples)?;
-    let loudness = compute_loudness(&columns);
     let theme = cover
         .as_deref()
         .and_then(theme_from_cover)
@@ -102,7 +99,6 @@ pub fn analyze(path: &Path) -> Result<Waveform, String> {
         title,
         artist,
         theme,
-        loudness,
     })
 }
 
@@ -248,17 +244,6 @@ fn aggregate(
         }
     }
     Ok(mins.into_iter().zip(maxs).collect())
-}
-
-/// 逐列响度：取该列 |min|/|max| 的峰值（0~255），用于底部律动光带呼吸。
-fn compute_loudness(columns: &[(f32, f32)]) -> Vec<u8> {
-    columns
-        .iter()
-        .map(|&(mn, mx)| {
-            let peak = mn.abs().max(mx.abs()).clamp(0.0, 1.0);
-            (peak * 255.0) as u8
-        })
-        .collect()
 }
 
 /// 从内嵌封面提取主色调：解码后缩到 16×16 取平均，再提饱和度/亮度保证渐变好看。
@@ -442,9 +427,8 @@ mod tests {
         // 元数据从 LIST INFO 中读出。
         assert_eq!(wf.title.as_deref(), Some("Test Title"));
         assert_eq!(wf.artist.as_deref(), Some("Test Artist"));
-        // 无封面时主题色来自文件名哈希，响度数组与列数一致。
-        assert_eq!(wf.loudness.len(), WAVE_COLUMNS);
-        assert!(wf.loudness.iter().any(|&v| v > 0), "正弦波应有响度");
+        // 无封面时主题色来自文件名哈希。
+        assert_eq!(wf.columns.len(), WAVE_COLUMNS);
 
         // 全幅正弦波：正峰值应接近 +1，负谷值接近 -1（证明波形来自真实 PCM）。
         let peak = wf.columns.iter().map(|&(_, mx)| mx).fold(f32::MIN, f32::max);
