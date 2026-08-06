@@ -29,4 +29,5 @@ jobs:
       # 4. 推送到 Gitee
       - name: Push to Gitee
         run: |
+          ssh-keyscan -t ed25519 gitee.com >> ~/.ssh/known_hosts
           git push gitee main --force
