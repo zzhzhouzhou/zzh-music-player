@@ -9,7 +9,7 @@
 
 ---
 
-## ## 🖼️ 界面预览
+## 界面预览
 ![播放器截图](screenshots/测试音频.png)
 ![截图展示](screenshots/若把你.png)
 
