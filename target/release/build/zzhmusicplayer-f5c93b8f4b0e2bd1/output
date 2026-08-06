@@ -1,0 +1,37 @@
+cargo:rerun-if-changed=E:\zzhMusicPlayer\src/main.slint
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\删除.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\下一首.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\快进.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\音量.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\播放列表.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\关闭.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\信息圆.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\最小化.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\置顶.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\模式.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\快退.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\上一首.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\播放中.svg
+cargo:rerun-if-changed=E:\zzhMusicPlayer\icons\暂停.svg
+cargo:rerun-if-env-changed=SLINT_STYLE
+cargo:rerun-if-env-changed=SLINT_FONT_SIZES
+cargo:rerun-if-env-changed=SLINT_SCALE_FACTOR
+cargo:rerun-if-env-changed=SLINT_ASSET_SECTION
+cargo:rerun-if-env-changed=SLINT_EMBED_RESOURCES
+cargo:rerun-if-env-changed=SLINT_EMIT_DEBUG_INFO
+cargo:rerun-if-env-changed=SLINT_LIVE_PREVIEW
+cargo:rustc-env=SLINT_INCLUDE_GENERATED=E:\zzhMusicPlayer\target\release\build\zzhmusicplayer-f5c93b8f4b0e2bd1\out\main.rs
+package.metadata.winres does not exist
+"E:\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\rc.exe"
+Selected RC path: 'E:\Windows Kits\10\bin\10.0.26100.0\x64\rc.exe'
+RC Output:
+Microsoft (R) Windows (R) Resource Compiler Version 10.0.10011.16384
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+
+------
+RC Error:
+
+------
+cargo:rustc-link-search=native=E:\zzhMusicPlayer\target\release\build\zzhmusicplayer-f5c93b8f4b0e2bd1\out
+cargo:rustc-link-lib=dylib=resource

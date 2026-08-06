@@ -584,15 +584,35 @@ export component MainWindow inherits Window {
             y: control_bar.y;
             width: 160px;
             height: 40px;
-            border-radius: 20px;
-            background: #131823c9;
-            drop-shadow-offset-y: 3px;
-            drop-shadow-blur: 12px;
-            drop-shadow-color: #00000059;
             opacity: UIState.volume-popup-open ? 1.0 : 0.0;
             visible: UIState.volume-popup-open;
             animate x { duration: 150ms; easing: ease-out; }
             animate opacity { duration: 120ms; easing: ease-out; }
+
+            // 深色玻璃底（与工具栏同款格式）。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                border-radius: 20px;
+                background: #131823;
+                opacity: 0.88;
+                drop-shadow-offset-y: 3px;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: #00000059;
+            }
+
+            // 主题色叠加层（与工具栏同款格式）。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                border-radius: 20px;
+                background: UIState.theme-color;
+                opacity: 0.18;
+            }
 
             HorizontalLayout {
                 height: parent.height;
