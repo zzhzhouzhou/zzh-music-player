@@ -1,0 +1,32 @@
+name: Sync to Gitee
+
+on:
+  push:
+    branches: [ "main" ]        # 当推送到 main 分支时触发
+  workflow_dispatch:            # 也支持手动触发（点按钮）
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 拉取代码（包括所有分支历史）
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. 配置 SSH 密钥（用刚才存的私钥）
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+
+      # 3. 添加 Gitee 为远程仓库
+      - name: Add Gitee remote
+        run: |
+          git remote add gitee git@gitee.com:zzhzhouzhou/zzh-music-player.git
+
+      # 4. 推送到 Gitee
+      - name: Push to Gitee
+        run: |
+          git push gitee main --force
