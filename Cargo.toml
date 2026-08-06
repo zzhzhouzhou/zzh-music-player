@@ -4,7 +4,7 @@ name = "zzhmusicplayer"
 publisher = "zzhzhouzhou"
 formats = ["wix"]
 # 如果你有 .ico 文件，取消注释并指定路径
-# icon = "assets/icon.ico"
+icon = "icons/appicon/zzhmp.ico"
 
 [package]
 name = "zzhmusicplayer"
@@ -51,6 +51,8 @@ windows-sys = { version = "0.61", features = [
 [build-dependencies]
 # 编译 main.slint -> Rust 代码。
 slint-build = "1.17"
+winres = "0.1.12"
+
 
 [profile.release]
 opt-level = 3

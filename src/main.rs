@@ -1121,6 +1121,8 @@ fn main() {
                         } else {
                             // 波形尚未生成：先用文件名即时上屏并清空上一首的波形/背景，
                             // 保证页面与音频同步，待波形线程完成后（wave_rx）再覆盖完整详情。
+                            // 同时把路径交给后台线程生成波形——否则按钮切歌时永远不会生成。
+                            let _ = wave_tx.send(path.clone());
                             let title = path
                                 .file_stem()
                                 .map(|s| s.to_string_lossy().into_owned())
