@@ -10,10 +10,10 @@
 ---
 
 ## ## 🖼️ 界面预览
+![播放器截图](screenshots/测试音频.png)
+![截图展示](screenshots/若把你.png)
 
-![播放器截图](file:///E:/zzhMusicPlayer/screenshots/%E6%B5%8B%E8%AF%95%E9%9F%B3%E9%A2%91.png)
-
-![截图展示](file:///E:/zzhMusicPlayer/screenshots/%E8%8B%A5%E6%8A%8A%E4%BD%A0.png)
+---
 
 ## 特性
 
