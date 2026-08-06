@@ -2,12 +2,18 @@
 
 > 一款简洁、轻量、纯粹的音频播放器
 
-![Rust](https://img.shields.io/badge/Rust-1.85+-orange?logo=rust)
-![Slint](https://img.shields.io/badge/Slint-1.7+-blue?logo=slint)
+![Rust](https://img.shields.io/badge/Rust-1.85%20-orange?logo=rust)
+![Slint](https://img.shields.io/badge/Slint-1.7%20-blue?logo=slint)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2011%20%7C%2010-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
+
+## ## 🖼️ 界面预览
+
+![播放器截图](file:///E:/zzhMusicPlayer/screenshots/%E6%B5%8B%E8%AF%95%E9%9F%B3%E9%A2%91.png)
+
+![截图展示](file:///E:/zzhMusicPlayer/screenshots/%E8%8B%A5%E6%8A%8A%E4%BD%A0.png)
 
 ## 特性
 
@@ -17,8 +23,8 @@
 - **智能视觉**  
   有封面时提取主题色作为渐变背景，无封面时根据文件名哈希生成专属色调。
 
-- **波形进度条 + 示波器**  
-  实时显示音频 PCM 波形，底部点缀微动态示波器。
+- **波形进度条**
+  实时显示音频 PCM 波形。
 
 - **播放列表**  
   支持拖拽添加、列表循环 / 单曲循环 / 随机播放。列表自动持久化。
