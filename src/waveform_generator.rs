@@ -345,14 +345,15 @@ fn aggregate(
 
 /// 把逐列 min/max/rms 点阵降采样为 `bars` 根波形条的相对高度（0.0 ~ 1.0）。
 ///
-/// 每根条取所属桶的 RMS 为主体、峰值少量掺入（保留瞬态冲击感），随后按全曲
-/// 95 分位幅度归一化并钳位（只让最响的约 5% 条顶满）、做感知伽马压缩
-/// （中低电平更可见，轮廓更饱满），最后轻度邻域平滑消除刺状跳变。
+/// 流程：每根条取 RMS 为主体、峰值少量掺入（保留瞬态冲击感）→ 按全曲
+/// 95 分位幅度归一化（只让最响的约 5% 条顶满）→ 动态范围自适应拉伸 →
+/// 感知伽马压缩（中低电平更可见）→ 轻度邻域平滑消除刺状跳变。
 ///
-/// 相比旧的“纯峰值 + 最大值归一化”策略，此策略对响度战音乐（重度削波）友好：
-/// 那类歌曲几乎所有列峰值都贴近 1.0，按最大峰值归一化会让所有条全部顶满成
-/// 一条横线；RMS 在削波音乐中仍保留段落间能量差异，95 分位归一化则让超出
-/// 参考电平的少数条钳位到满高，其余条保留层次起伏。
+/// 动态范围拉伸针对响度战音乐（重度削波）：那类歌曲几乎所有列的峰值都
+/// 贴近 1.0、RMS 也挤在高位窄带（如 0.85 ~ 1.0），归一化后所有条仍然
+/// 全高，整条波形成为一个大长方形。此处以全曲 20 分位为地板，按分布
+/// 压缩程度自适应地把剩余动态拉伸到整个显示高度——地板越高（分布越
+/// 压）拉伸越强；动态正常的歌曲 20 分位很低，几乎不受影响。
 pub fn bars_from_columns(columns: &[WaveColumn], bars: usize) -> Vec<f32> {
     let mut peaks = vec![0f32; bars];
     let mut energies = vec![0f32; bars];
@@ -376,15 +377,27 @@ pub fn bars_from_columns(columns: &[WaveColumn], bars: usize) -> Vec<f32> {
         .zip(&energies)
         .map(|(&p, &e)| e * 0.85 + p * 0.15)
         .collect();
-    // 95 分位归一化：普通音乐电平分布长尾，95 分位接近峰值，观感与旧策略
-    // 基本一致；响度战音乐中只有最响的约 5% 条钳位到满高，其余保留起伏。
+    // 95 / 20 分位（降序表：5% 处即“比 95% 条都响”的电平，80% 处即 20 分位）。
     let mut sorted = amps.clone();
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let ref_idx = ((bars as f32 * 0.05) as usize).min(bars - 1);
-    let ref_amp = sorted[ref_idx];
-    let norm = if ref_amp > 1e-4 { 1.0 / ref_amp } else { 0.0 };
+    let p95 = sorted[((bars as f32 * 0.05) as usize).min(bars - 1)];
+    let p20 = sorted[((bars as f32 * 0.80) as usize).min(bars - 1)];
+    let norm = if p95 > 1e-4 { 1.0 / p95 } else { 0.0 };
     for v in &mut amps {
-        *v = (*v * norm).clamp(0.0, 1.0).powf(0.75);
+        *v = (*v * norm).clamp(0.0, 1.0);
+    }
+    // 动态范围自适应拉伸（详见函数头注释）。
+    let floor = (p20 * norm).clamp(0.0, 1.0);
+    let k = ((floor - 0.5) / 0.4).clamp(0.0, 1.0);
+    let denom = 1.0 - floor * k;
+    if k > 0.0 && denom > 0.05 {
+        for v in &mut amps {
+            *v = ((*v - floor * k) / denom).clamp(0.0, 1.0);
+        }
+    }
+    // 感知伽马压缩：中低电平更可见，轮廓更饱满。
+    for v in &mut amps {
+        *v = v.powf(0.75);
     }
     // 轻度平滑：主体权重保留自身形状，两侧各取 1/4 衔接，避免相邻条生硬跳变。
     (0..bars)
@@ -717,7 +730,7 @@ fn normalize_theme(rgb: [u8; 3]) -> [u8; 3] {
 }
 
 /// RGB -> HSL（h 0~360，s/l 0~1）。
-fn rgb_to_hsl([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
+pub fn rgb_to_hsl([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
     let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
@@ -741,7 +754,7 @@ fn rgb_to_hsl([r, g, b]: [u8; 3]) -> (f32, f32, f32) {
 }
 
 /// HSL -> RGB。
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
     let hp = h.rem_euclid(360.0) / 60.0;
     let x = c * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
@@ -879,6 +892,39 @@ mod tests {
         assert!(
             quiet_mean < loud_mean - 0.15,
             "段落间起伏不足: {quiet_mean} vs {loud_mean}"
+        );
+        assert!(bars.iter().all(|&v| (0.0..=1.0).contains(&v)), "波形条越界");
+    }
+
+    /// 响度战音乐（全曲 RMS 挤在 0.82~1.0 窄带、峰值全部削波）：
+    /// 未拉伸时所有条都在 0.85 以上、看起来是一个大长方形；
+    /// 动态范围拉伸后四段电平应拉开明显差距。
+    #[test]
+    fn bars_loudness_war_stretches_dynamics() {
+        let n = WAVE_COLUMNS;
+        let seg_rms = |i: usize| 0.82 + 0.06 * ((i / (n / 4)) % 4) as f32;
+        let columns: Vec<WaveColumn> = (0..n)
+            .map(|i| WaveColumn {
+                min: -0.99,
+                max: 0.99,
+                rms: seg_rms(i),
+            })
+            .collect();
+        let bars = bars_from_columns(&columns, WAVE_BARS);
+        let seg = |s: usize| -> f32 {
+            let slice: Vec<f32> = bars
+                .iter()
+                .skip(s * WAVE_BARS / 4)
+                .take(WAVE_BARS / 4)
+                .copied()
+                .collect();
+            slice.iter().sum::<f32>() / slice.len() as f32
+        };
+        let (q, l) = (seg(0), seg(3));
+        assert!(l > 0.8, "最响段应接近满高: {l}");
+        assert!(
+            q < l - 0.25,
+            "响度战拉伸失效，段落仍挤在一起: {q} vs {l}"
         );
         assert!(bars.iter().all(|&v| (0.0..=1.0).contains(&v)), "波形条越界");
     }

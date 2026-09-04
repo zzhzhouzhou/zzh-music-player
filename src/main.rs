@@ -44,10 +44,20 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// 双击判定的位置容差（逻辑像素）。
 const DOUBLE_CLICK_TOLERANCE: f32 = 8.0;
 /// 跳转状态：等待引擎确认，或确认后的短暂稳定窗口。
+/// `lock` 表示显示钉在目标上（点击/拖拽跳转）；为 false 时（方向键快进快退）
+/// 显示走 played-frac 的 200ms 插值动画平滑滑向目标，仅过滤陈旧位置事件。
 #[derive(Clone, Copy)]
 enum SeekState {
-    Pending { target: f32, since: Instant },
-    Settling { target: f32, until: Instant },
+    Pending {
+        target: f32,
+        since: Instant,
+        lock: bool,
+    },
+    Settling {
+        target: f32,
+        until: Instant,
+        lock: bool,
+    },
 }
 
 /// 跳转确认超时：异常设备没有回执时也不会永久锁住进度。
@@ -345,13 +355,15 @@ fn push_background(state: &UIState, bg: Image, front_showing: &Cell<bool>) {
     }
 }
 
-/// 主题色补间状态：记录目标色与进行中的过渡（起点色, 目标色, 开始时刻）。
+/// 主题色补间状态：记录目标色与进行中的过渡（起点 HSL, 目标 HSL, 开始时刻）。
 /// Slint 全局组件不支持属性动画，由 33ms 粒子计时器驱动逐步推进，
 /// 让波形高亮 / 按钮 / 控制胶囊叠色随换曲平滑过渡。
+/// 插值在 HSL 空间沿色相环最短弧进行：RGB 插值跨色相过渡会中途发灰
+/// （先变暗再变亮），色相插值则直接经过相邻色相（绿→青→蓝→紫）。
 #[derive(Default)]
 struct ThemeTween {
     target: Cell<[u8; 3]>,
-    active: RefCell<Option<([u8; 3], [u8; 3], Instant)>>,
+    active: RefCell<Option<((f32, f32, f32), (f32, f32, f32), Instant)>>,
 }
 
 impl ThemeTween {
@@ -363,22 +375,24 @@ impl ThemeTween {
             return;
         }
         self.target.set(to);
-        *self.active.borrow_mut() = Some((from, to, Instant::now()));
+        let from_hsl = waveform_generator::rgb_to_hsl(from);
+        let to_hsl = waveform_generator::rgb_to_hsl(to);
+        *self.active.borrow_mut() = Some((from_hsl, to_hsl, Instant::now()));
     }
 
     /// 由周期计时器每 tick 调用：推进过渡并返回是否仍需继续。
     fn tick(&self, state: &UIState, dt_step: f32) -> bool {
-        let Some((from, to, started)) = self.active.borrow().as_ref().copied() else {
+        let Some(((fh, fs, fl), (th, ts, tl), started)) = self.active.borrow().as_ref().copied()
+        else {
             return false;
         };
         let t = (started.elapsed().as_secs_f32() / (dt_step * 12.0)).min(1.0);
         let k = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
-        let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * k).round() as u8;
-        state.set_theme_color(slint::Color::from_rgb_u8(
-            mix(from[0], to[0]),
-            mix(from[1], to[1]),
-            mix(from[2], to[2]),
-        ));
+        // 色相沿环最短弧过渡（-180 ~ +180），饱和度 / 亮度线性插值。
+        let dh = ((th - fh + 540.0).rem_euclid(360.0)) - 180.0;
+        let [r, g, b] =
+            waveform_generator::hsl_to_rgb(fh + dh * k, fs + (ts - fs) * k, fl + (tl - fl) * k);
+        state.set_theme_color(slint::Color::from_rgb_u8(r, g, b));
         if t >= 1.0 {
             self.active.borrow_mut().take();
             false
@@ -893,7 +907,11 @@ fn main() {
     // 背景交叉淡入状态：当前可见层是否为 front。
     let bg_front = Rc::new(Cell::new(true));
     // 主题色补间（换曲时约 400ms 颜色过渡，见 ThemeTween）。
-    let theme_tween = Rc::new(ThemeTween::default());
+    // 初始目标与 main.slint 的默认 theme-color 一致。
+    let theme_tween = Rc::new(ThemeTween {
+        target: Cell::new([0x5a, 0xc8, 0xfa]),
+        ..Default::default()
+    });
 
     ui.show().expect("显示窗口失败");
 
@@ -990,11 +1008,12 @@ fn main() {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
             let target = fraction * state.get_duration();
-            // 记录跳转目标：松手后立即把 UI 位置设到目标并进入锁定态，
-            // 引擎尚未完成 seek 的旧上报由事件泵过滤，显示不参与插值动画。
+            // 点击/拖拽跳转：锁定态，松手后显示立即钉在目标上，
+            // 引擎尚未完成 seek 的旧上报由事件泵过滤。
             *seek_wait.borrow_mut() = Some(SeekState::Pending {
                 target,
                 since: Instant::now(),
+                lock: true,
             });
             state.set_seek_lock_frac(fraction);
             state.set_seek_lock(true);
@@ -1014,12 +1033,14 @@ fn main() {
             let duration = state.get_duration();
             let target = (state.get_position() + delta)
                 .clamp(0.0, if duration > 0.0 { duration } else { f32::MAX });
+            // 方向键快进快退：不进入锁定态，位置属性直接更新到目标，
+            // 由 played-frac 的 200ms 插值动画平滑滑过去；陈旧位置事件
+            // 仍由 seek_wait 过滤（未锁定时只顶替数值，不钉显示）。
             *seek_wait.borrow_mut() = Some(SeekState::Pending {
                 target,
                 since: Instant::now(),
+                lock: false,
             });
-            state.set_seek_lock_frac(if duration > 0.0 { target / duration } else { 0.0 });
-            state.set_seek_lock(true);
             state.set_position(target);
             state.set_position_text(format_time(target));
             audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
@@ -1362,12 +1383,13 @@ fn main() {
                             state.set_duration_text(format_time(seconds));
                         }
                         Event::SeekApplied { position } => {
-                            // rodio 已完成 seek；保持目标位置一个短窗口，吸收已经排队的旧
-                            // Position；锁定期内显示钉在目标上，不参与插值动画。
+                            // rodio 已完成 seek；保持目标一个短窗口，吸收已经排队的旧
+                            // Position。锁定型跳转（点击/拖拽）显示继续钉在目标上；
+                            // 非锁定型（方向键）不钉显示，由插值动画平滑到位。
                             let seconds = position.as_secs_f32();
-                            let target = match *seek_wait.borrow() {
-                                Some(SeekState::Pending { target, .. }) => target,
-                                Some(SeekState::Settling { target, .. }) => target,
+                            let (target, lock) = match *seek_wait.borrow() {
+                                Some(SeekState::Pending { target, lock, .. })
+                                | Some(SeekState::Settling { target, lock, .. }) => (target, lock),
                                 None => {
                                     // 无在途跳转（如启动恢复进度）：按实际落点钉住，
                                     // 避免锁定期间显示回落到默认的 0。
@@ -1377,30 +1399,32 @@ fn main() {
                                         0.0
                                     };
                                     state.set_seek_lock_frac(frac);
-                                    seconds
+                                    (seconds, true)
                                 }
                             };
                             *seek_wait.borrow_mut() = Some(SeekState::Settling {
                                 target,
                                 until: Instant::now() + SEEK_SETTLE_WINDOW,
+                                lock,
                             });
-                            state.set_seek_lock(true);
+                            state.set_seek_lock(lock);
                             state.set_position(target);
                             state.set_position_text(format_time(target));
                         }
                         Event::Position(pos) => {
                             let pos = pos.as_secs_f32();
-                            // seek 生效前与刚生效后的陈旧上报均不覆盖用户选中的目标；
-                            // 锁定结束（确认到位或超时）才恢复真实位置并解除锁定。
+                            // seek 生效前与刚生效后的陈旧上报一律顶替为目标值：
+                            // 锁定型显示钉在目标；非锁定型 position=target 让
+                            // 插值动画从当前位置平滑滑向目标。等待超时则放行真实位置。
                             let applied = {
                                 let mut wait = seek_wait.borrow_mut();
                                 match *wait {
-                                    Some(SeekState::Pending { target, since })
+                                    Some(SeekState::Pending { target, since, .. })
                                         if since.elapsed() <= SEEK_CONFIRM_TIMEOUT =>
                                     {
                                         target
                                     }
-                                    Some(SeekState::Settling { target, until })
+                                    Some(SeekState::Settling { target, until, .. })
                                         if Instant::now() < until =>
                                     {
                                         target
