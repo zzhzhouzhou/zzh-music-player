@@ -1,5 +1,6 @@
 [Setup]
-AppId={{2E05B647-1616-4F5F-A951-5DE650895527}}   ; 固定此 GUID，所有版本保持一致
+; 固定 GUID：所有版本保持一致（分号注释必须独占一行，写在值后面会被当作值的一部分）
+AppId={{2E05B647-1616-4F5F-A951-5DE650895527}
 AppName=zzh音乐播放器
 AppVersion=1.1.0
 AppPublisher=zzhzhouzhou
@@ -19,7 +20,8 @@ SetupIconFile=icons\appicon\zzhmp.ico
 ; UsePreviousAppDir=yes
 
 [Files]
-Source: "target\release\zzhmusicplayer.exe"; DestDir: "{app}"
+; ignoreversion：主程序无版本号变化也要覆盖（否则同版本号会跳过替换）
+Source: "target\release\zzhmusicplayer.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "icons\appicon\zzhmp.ico"; DestDir: "{app}"
 
 [Icons]

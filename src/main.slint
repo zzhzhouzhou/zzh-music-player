@@ -19,9 +19,14 @@ export global UIState {
     // 粒子系统时间（0~1 循环），驱动白色粒子与列表内均衡器动画；暂停时冻结。
     in-out property <float> particle-time: 0.0;
     // 主题色与背景渐变（封面主色调 / 文件名哈希）。
+    // Slint 全局组件不支持属性动画：颜色过渡由 Rust 侧补间驱动
+    // （waveform 结果应用时启动，33ms 粒子计时器逐步推进）。
     in-out property <color> theme-color: #5ac8fa;
-    // 柔和模糊感背景位图（低分辨率渐变 + 主题色光斑放大）。
-    in-out property <image> bg-image;
+    // 柔和模糊感背景位图（低分辨率渐变 + 主题色光斑放大），双层交叉淡入：
+    // 换曲时新背景写入隐藏层并翻转可见层，避免背景突变。
+    in-out property <image> bg-image-front;
+    in-out property <image> bg-image-back;
+    in-out property <bool> bg-front-showing: true;
     // 专辑封面缩略图；无封面时 has-cover 为 false，封面整体隐藏、文字左移。
     in-out property <image> cover-image;
     in-out property <bool> has-cover: false;
@@ -41,6 +46,10 @@ export global UIState {
     in-out property <bool> mode-showing: false;
     // 进度条拖拽中：暂停波形实时推进，跟随手指预览。
     in-out property <bool> dragging: false;
+    // 跳转锁定：seek 发出到确认后的稳定期内为 true，进度显示钉在
+    // seek-lock-frac 上，不参与平滑插值，消除点击跳转的回弹。
+    in-out property <bool> seek-lock: false;
+    in-out property <float> seek-lock-frac: 0.0;
     in-out property <float> drag-fraction: 0.0;
 
     callback toggle-play();
@@ -461,8 +470,11 @@ export component MainWindow inherits Window {
     property <float> played-frac:
         UIState.duration > 0.0 ? min(UIState.position / UIState.duration, 1.0) : 0.0;
     animate played-frac { duration: 200ms; easing: linear; }
-    // 进度比例：拖拽中直接跟随手指（不插值，保证跟手），否则取插值后的播放位置。
-    property <float> progress-frac: UIState.dragging ? UIState.drag-fraction : played-frac;
+    // 进度比例：拖拽中跟随手指（不插值，保证跟手）；seek 锁定期钉在目标上
+    // （点击跳转不回弹）；其余时间取插值后的播放位置（平滑滑动）。
+    property <float> progress-frac:
+        UIState.dragging ? UIState.drag-fraction
+        : (UIState.seek-lock ? UIState.seek-lock-frac : played-frac);
 
     // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
     property <length> bar-x: (root.width - 300px) / 2;
@@ -493,12 +505,25 @@ export component MainWindow inherits Window {
         background: #141924;
 
         // 柔和背景：低分辨率渐变 + 光斑放大后自带高斯模糊观感。
+        // 双层交叉淡入：Rust 侧换曲时把新背景写入隐藏层并翻转 bg-front-showing，
+        // 两层 350ms 透明度动画完成柔和过渡。
         Image {
-            source: UIState.bg-image;
+            source: UIState.bg-image-front;
+            opacity: UIState.bg-front-showing ? 1.0 : 0.0;
             width: 100%;
             height: 100%;
             image-fit: fill;
             image-rendering: smooth;
+            animate opacity { duration: 350ms; easing: ease-in-out; }
+        }
+        Image {
+            source: UIState.bg-image-back;
+            opacity: UIState.bg-front-showing ? 0.0 : 1.0;
+            width: 100%;
+            height: 100%;
+            image-fit: fill;
+            image-rendering: smooth;
+            animate opacity { duration: 350ms; easing: ease-in-out; }
         }
 
         // 顶部 1px 玻璃高光（中间亮、两端淡出）。

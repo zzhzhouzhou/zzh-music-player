@@ -7,7 +7,7 @@
 mod audio_engine;
 mod waveform_generator;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -331,8 +331,71 @@ fn format_time(secs: f32) -> SharedString {
     SharedString::from(format!("{}:{:02}", total / 60, total % 60))
 }
 
+/// 把背景位图交叉淡入到 UI：新图写入当前隐藏层并翻转可见层，
+/// 两层 350ms 透明度动画完成柔和过渡，换曲时背景不再突变。
+fn push_background(state: &UIState, bg: Image, front_showing: &Cell<bool>) {
+    if front_showing.get() {
+        state.set_bg_image_back(bg);
+        state.set_bg_front_showing(false);
+        front_showing.set(false);
+    } else {
+        state.set_bg_image_front(bg);
+        state.set_bg_front_showing(true);
+        front_showing.set(true);
+    }
+}
+
+/// 主题色补间状态：记录目标色与进行中的过渡（起点色, 目标色, 开始时刻）。
+/// Slint 全局组件不支持属性动画，由 33ms 粒子计时器驱动逐步推进，
+/// 让波形高亮 / 按钮 / 控制胶囊叠色随换曲平滑过渡。
+#[derive(Default)]
+struct ThemeTween {
+    target: Cell<[u8; 3]>,
+    active: RefCell<Option<([u8; 3], [u8; 3], Instant)>>,
+}
+
+impl ThemeTween {
+    /// 启动到 `to` 的过渡；颜色相同则直接落定。约 400ms，ease-out。
+    fn start(&self, to: [u8; 3]) {
+        let from = self.target.get();
+        if from == to {
+            self.active.borrow_mut().take();
+            return;
+        }
+        self.target.set(to);
+        *self.active.borrow_mut() = Some((from, to, Instant::now()));
+    }
+
+    /// 由周期计时器每 tick 调用：推进过渡并返回是否仍需继续。
+    fn tick(&self, state: &UIState, dt_step: f32) -> bool {
+        let Some((from, to, started)) = self.active.borrow().as_ref().copied() else {
+            return false;
+        };
+        let t = (started.elapsed().as_secs_f32() / (dt_step * 12.0)).min(1.0);
+        let k = 1.0 - (1.0 - t) * (1.0 - t); // ease-out
+        let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * k).round() as u8;
+        state.set_theme_color(slint::Color::from_rgb_u8(
+            mix(from[0], to[0]),
+            mix(from[1], to[1]),
+            mix(from[2], to[2]),
+        ));
+        if t >= 1.0 {
+            self.active.borrow_mut().take();
+            false
+        } else {
+            true
+        }
+    }
+}
+
 /// 把波形结果应用到 UI：波形条、封面、时长、元数据与主题渐变背景。
-fn apply_waveform(state: &UIState, res: &WaveformResult, bars_model: &Rc<VecModel<f32>>) {
+fn apply_waveform(
+    state: &UIState,
+    res: &WaveformResult,
+    bars_model: &Rc<VecModel<f32>>,
+    bg_front: &Cell<bool>,
+    theme: &ThemeTween,
+) {
     // 行数一致时逐行更新（保留 Slint 行元素复用，波形条平滑过渡到新形状）。
     if bars_model.row_count() == res.bars.len() {
         for (i, v) in res.bars.iter().enumerate() {
@@ -365,10 +428,13 @@ fn apply_waveform(state: &UIState, res: &WaveformResult, bars_model: &Rc<VecMode
         .unwrap_or_default();
     state.set_track_title(title.into());
     state.set_track_artist(res.artist.clone().unwrap_or_default().into());
-    // 主题色 + 柔和模糊感背景。
-    let theme = slint::Color::from_rgb_u8(res.theme[0], res.theme[1], res.theme[2]);
-    state.set_theme_color(theme);
-    state.set_bg_image(Image::from_rgba8(render_background(res.theme)));
+    // 主题色补间（约 400ms 过渡）+ 交叉淡入背景。
+    theme.start(res.theme);
+    push_background(
+        state,
+        Image::from_rgba8(render_background(res.theme)),
+        bg_front,
+    );
 }
 
 /// 新文件加入播放列表：去重、同步模型与引擎、空闲时立即播放。
@@ -824,6 +890,10 @@ fn main() {
     // 跳转等待：Some((目标秒, 发起时刻))。松手后 UI 已乐观更新到目标，
     // 期间忽略播放引擎尚未完成 seek 前残留的旧位置上报。
     let seek_wait: Rc<RefCell<Option<SeekState>>> = Rc::new(RefCell::new(None));
+    // 背景交叉淡入状态：当前可见层是否为 front。
+    let bg_front = Rc::new(Cell::new(true));
+    // 主题色补间（换曲时约 400ms 颜色过渡，见 ThemeTween）。
+    let theme_tween = Rc::new(ThemeTween::default());
 
     ui.show().expect("显示窗口失败");
 
@@ -852,18 +922,20 @@ fn main() {
     // 模式提示 / 音量弹层的自动隐藏计时器。
     let mode_hide_timer = Rc::new(slint::Timer::default());
     let popup_hide_timer = Rc::new(slint::Timer::default());
-    // 粒子系统：每 33ms 推进相位，驱动白色粒子与列表均衡器动画。
-    // 暂停时不推进（动画冻结，避免持续重绘）；工具栏悬停检测合并在此计时器中，
-    // 仅在状态变化时写属性，同样避免无谓的重绘。
+    // 粒子系统：每 33ms 推进相位，驱动白色粒子与列表均衡器动画；
+    // 同时推进主题色补间（换曲颜色过渡）。暂停时粒子相位冻结，
+    // 工具栏悬停仅在状态变化时写属性，避免无谓的重绘。
     let particle_timer = Rc::new(slint::Timer::default());
     {
         let ui_weak = ui.as_weak();
+        let theme_tween = Rc::clone(&theme_tween);
         particle_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(33),
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
                     let state = ui.global::<UIState>();
+                    theme_tween.tick(&state, 0.033);
                     if state.get_playing() {
                         let t = state.get_particle_time() + 0.033;
                         state.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
@@ -918,12 +990,14 @@ fn main() {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
             let target = fraction * state.get_duration();
-            // 记录跳转目标：松手后立即把 UI 位置设到目标，
-            // 引擎尚未完成 seek 的旧上报由事件泵过滤。
+            // 记录跳转目标：松手后立即把 UI 位置设到目标并进入锁定态，
+            // 引擎尚未完成 seek 的旧上报由事件泵过滤，显示不参与插值动画。
             *seek_wait.borrow_mut() = Some(SeekState::Pending {
                 target,
                 since: Instant::now(),
             });
+            state.set_seek_lock_frac(fraction);
+            state.set_seek_lock(true);
             state.set_position(target);
             state.set_position_text(format_time(target));
             audio.send(Command::Seek(Duration::from_secs_f32(target)));
@@ -944,6 +1018,8 @@ fn main() {
                 target,
                 since: Instant::now(),
             });
+            state.set_seek_lock_frac(if duration > 0.0 { target / duration } else { 0.0 });
+            state.set_seek_lock(true);
             state.set_position(target);
             state.set_position_text(format_time(target));
             audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
@@ -1236,6 +1312,8 @@ fn main() {
         let mode_cell = Rc::clone(&mode_cell);
         let wave_bars_model = Rc::clone(&wave_bars_model);
         let seek_wait = Rc::clone(&seek_wait);
+        let bg_front = Rc::clone(&bg_front);
+        let theme_tween = Rc::clone(&theme_tween);
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(100),
@@ -1250,17 +1328,19 @@ fn main() {
                             state.set_playing(true);
                             state.set_position(0.0);
                             state.set_position_text(format_time(0.0));
-                            // 新曲目开始：上一首的跳转等待作废。
+                            // 新曲目开始：上一首的跳转等待与锁定作废。
                             *seek_wait.borrow_mut() = None;
+                            state.set_seek_lock(false);
                             state.set_dragging(false);
                             let idx = playlist.borrow().iter().position(|p| *p == path);
                             state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
                             if let Some(res) = waveform_cache.borrow().get(&path) {
                                 // 缓存命中时直接复用，切歌几乎无感。
-                                apply_waveform(&state, res, &wave_bars_model);
+                                apply_waveform(&state, res, &wave_bars_model, &bg_front, &theme_tween);
                             } else {
                                 // 音频已开始播放，波形分析在后台进行。先显示轻量占位波形，
                                 // 不让用户等分析完成才看到可操作的进度区；结果回来后再平滑替换。
+                                // 背景交叉淡出到兜底深色，避免残留上一首的色调。
                                 let _ = wave_tx.send(path.clone());
                                 let title = path
                                     .file_stem()
@@ -1271,7 +1351,7 @@ fn main() {
                                 wave_bars_model.set_vec(placeholder_bars());
                                 state.set_cover_image(Image::default());
                                 state.set_has_cover(false);
-                                state.set_bg_image(Image::default());
+                                push_background(&state, Image::default(), &bg_front);
                             }
                             eprintln!("开始播放: {:?}", path);
                         }
@@ -1282,23 +1362,36 @@ fn main() {
                             state.set_duration_text(format_time(seconds));
                         }
                         Event::SeekApplied { position } => {
-                            // rodio 已完成 seek；保持目标位置一个短窗口，吸收已经排队的旧 Position。
+                            // rodio 已完成 seek；保持目标位置一个短窗口，吸收已经排队的旧
+                            // Position；锁定期内显示钉在目标上，不参与插值动画。
                             let seconds = position.as_secs_f32();
                             let target = match *seek_wait.borrow() {
                                 Some(SeekState::Pending { target, .. }) => target,
                                 Some(SeekState::Settling { target, .. }) => target,
-                                None => seconds,
+                                None => {
+                                    // 无在途跳转（如启动恢复进度）：按实际落点钉住，
+                                    // 避免锁定期间显示回落到默认的 0。
+                                    let frac = if state.get_duration() > 0.0 {
+                                        (seconds / state.get_duration()).min(1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    state.set_seek_lock_frac(frac);
+                                    seconds
+                                }
                             };
                             *seek_wait.borrow_mut() = Some(SeekState::Settling {
                                 target,
                                 until: Instant::now() + SEEK_SETTLE_WINDOW,
                             });
+                            state.set_seek_lock(true);
                             state.set_position(target);
                             state.set_position_text(format_time(target));
                         }
                         Event::Position(pos) => {
                             let pos = pos.as_secs_f32();
-                            // seek 生效前与刚生效后的陈旧上报均不覆盖用户选中的目标。
+                            // seek 生效前与刚生效后的陈旧上报均不覆盖用户选中的目标；
+                            // 锁定结束（确认到位或超时）才恢复真实位置并解除锁定。
                             let applied = {
                                 let mut wait = seek_wait.borrow_mut();
                                 match *wait {
@@ -1312,11 +1405,11 @@ fn main() {
                                     {
                                         target
                                     }
-                                    Some(_) => {
+                                    _ => {
                                         *wait = None;
+                                        state.set_seek_lock(false);
                                         pos
                                     }
-                                    None => pos,
                                 }
                             };
                             state.set_position(applied);
@@ -1327,6 +1420,7 @@ fn main() {
                             state.set_position(state.get_duration());
                             state.set_position_text(format_time(state.get_duration()));
                             *seek_wait.borrow_mut() = None;
+                            state.set_seek_lock(false);
                             state.set_dragging(false);
                             current_path = None;
                             state.set_playlist_current(-1);
@@ -1334,6 +1428,7 @@ fn main() {
                         Event::Error(e) => {
                             // 跳转失败：解除预览锁定，进度条回到真实位置。
                             *seek_wait.borrow_mut() = None;
+                            state.set_seek_lock(false);
                             state.set_dragging(false);
                             eprintln!("音频错误: {e}");
                         }
@@ -1405,7 +1500,7 @@ fn main() {
                     if is_current {
                         let cache = waveform_cache.borrow();
                         if let Some(cached) = cache.get(current_path.as_ref().unwrap().as_path()) {
-                            apply_waveform(&state, cached, &wave_bars_model);
+                            apply_waveform(&state, cached, &wave_bars_model, &bg_front, &theme_tween);
                         }
                     }
                 }
