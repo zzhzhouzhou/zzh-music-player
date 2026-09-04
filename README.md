@@ -10,8 +10,10 @@
 ---
 
 ## 界面预览
-![播放器截图](screenshots/测试音频.png)
-![截图展示](screenshots/若把你.png)
+
+![播放器界面](screenshots/测试音频1.png)
+
+![歌曲播放界面](screenshots/七月上.png)
 
 ---
 
@@ -21,10 +23,10 @@
   支持 MP3、FLAC、WAV、OGG、M4A/AAC 等常见格式。
 
 - **智能视觉**  
-  有封面时提取主题色作为渐变背景，无封面时根据文件名哈希生成专属色调。
+  自动提取内嵌专辑封面（MP3 ID3v2 / FLAC / M4A）展示在左侧，并取封面主色作为渐变背景；无封面时根据文件名哈希生成专属色调，封面区域自动隐藏。
 
 - **波形进度条**
-  实时显示音频 PCM 波形。
+  实时解码 PCM 生成圆润镜像波形，已播主题色高亮、白色播放头随进度平滑滑动，点击/拖拽/悬停预览跳转。
 
 - **播放列表**  
   支持拖拽添加、列表循环 / 单曲循环 / 随机播放。列表自动持久化。
@@ -40,11 +42,11 @@
 
 ---
 
-## 📦 安装与使用
+## 安装与使用
 
-### 下载预编译版本（推荐）
+### 下载预编译版本
 
-前往 [Releases](https://github.com/zzhzhouzhou/zzh-music-player/releases) 页面下载最新 `.exe` 文件，双击即可运行。
+前往 [Releases](https://github.com/zzhzhouzhou/zzh-music-player/releases) 页面下载最新的 `zzhMusicPlayer_Setup.exe`，运行安装程序即可。
 
 
 

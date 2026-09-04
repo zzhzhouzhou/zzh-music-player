@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use rodio::{Decoder, DeviceSinkBuilder, Player};
+use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
 
 /// 位置上报 / 播放结束检测的轮询周期（50ms：进度条更流畅）。
 const TICK: Duration = Duration::from_millis(50);
@@ -75,6 +75,10 @@ pub enum Command {
 pub enum Event {
     /// 新曲目开始播放。
     TrackStarted { path: PathBuf },
+    /// 已打开曲目的可用时长（在波形分析完成前立即提供）。
+    Duration { duration: Duration },
+    /// 跳转命令已经在播放源上生效（即使当前处于暂停状态也会发送）。
+    SeekApplied { position: Duration },
     /// 播放位置更新（约每 50ms 一次）。
     Position(Duration),
     /// 顺序模式播完列表，播放停止。
@@ -99,7 +103,11 @@ impl AudioEngine {
             .name("audio-engine".to_string())
             .spawn(move || engine_loop(cmd_rx, evt_tx))
             .expect("无法创建音频线程");
-        Self { tx, rx, _thread: thread }
+        Self {
+            tx,
+            rx,
+            _thread: thread,
+        }
     }
 
     /// 发送一条命令（不阻塞）。
@@ -152,7 +160,13 @@ fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                 if !paused && index.is_some() {
                     if player.empty() {
                         advance_on_finish(
-                            &player, &playlist, &mut index, &mut paused, mode, &mut rng, &tx,
+                            &player,
+                            &playlist,
+                            &mut index,
+                            &mut paused,
+                            mode,
+                            &mut rng,
+                            &tx,
                         );
                     } else {
                         let _ = tx.send(Event::Position(player.get_pos()));
@@ -191,7 +205,9 @@ fn handle_command(
             let current_path = index.and_then(|ci| playlist.get(ci)).cloned();
             playlist.remove(i);
             // 按路径重新定位当前曲目（被删则 index 置空）。
-            *index = current_path.as_ref().and_then(|p| playlist.iter().position(|q| q == p));
+            *index = current_path
+                .as_ref()
+                .and_then(|p| playlist.iter().position(|q| q == p));
             if was_current {
                 if playlist.is_empty() {
                     // 列表已空：停止播放。
@@ -209,7 +225,9 @@ fn handle_command(
             // 保留当前曲目在新列表中的位置；若已被移除，则索引置空（当前播放不受影响）。
             let current = index.and_then(|i| playlist.get(i)).cloned();
             *playlist = paths;
-            *index = current.as_ref().and_then(|p| playlist.iter().position(|q| q == p));
+            *index = current
+                .as_ref()
+                .and_then(|p| playlist.iter().position(|q| q == p));
         }
         Command::Toggle => {
             if *paused {
@@ -225,20 +243,26 @@ fn handle_command(
             if player.empty() {
                 let target = index.or_else(|| (!playlist.is_empty()).then_some(playlist.len() - 1));
                 if let Some(i) = target {
-                    if let Err(e) = start_track(player, &playlist[i]) {
+                    if let Ok(duration) = start_track(player, &playlist[i]) {
+                        *index = Some(i);
+                        *paused = false;
+                        let _ = tx.send(Event::TrackStarted {
+                            path: playlist[i].clone(),
+                        });
+                        let _ = tx.send(Event::Duration { duration });
+                    } else {
                         *index = None;
-                        let _ = tx.send(Event::Error(e));
+                        let _ =
+                            tx.send(Event::Error(format!("无法重新打开音频 {:?}", playlist[i])));
                         return;
                     }
-                    *index = Some(i);
-                    *paused = false;
-                    let _ = tx.send(Event::TrackStarted { path: playlist[i].clone() });
                 }
             }
             match player.try_seek(pos) {
                 Ok(()) => {
-                    // 暂停状态下没有周期 tick，直接上报，保证进度条即时刷新。
-                    let _ = tx.send(Event::Position(pos));
+                    // 直接发送明确的 seek 完成事件。UI 不再把这次操作误判为普通
+                    // Position，从而不会在暂停或异步 seek 期间被旧位置上报拉回。
+                    let _ = tx.send(Event::SeekApplied { position: pos });
                 }
                 Err(e) => {
                     let _ = tx.send(Event::Error(format!("跳转失败: {e}")));
@@ -342,7 +366,7 @@ fn advance_on_finish(
     }
 }
 
-/// 用列表中 `*index` 指向的曲目替换当前播放源；成功则上报 `TrackStarted`。
+/// 用列表中 `*index` 指向的曲目替换当前播放源；成功则上报 `TrackStarted` 与时长。
 fn start_and_notify(
     player: &Player,
     playlist: &[PathBuf],
@@ -354,8 +378,10 @@ fn start_and_notify(
     // 新曲目总是恢复播放状态，避免“暂停中切歌”后实际在放、状态却显示暂停。
     *paused = false;
     match start_track(player, &playlist[i]) {
-        Ok(()) => {
-            let _ = tx.send(Event::TrackStarted { path: playlist[i].clone() });
+        Ok(duration) => {
+            let path = playlist[i].clone();
+            let _ = tx.send(Event::TrackStarted { path });
+            let _ = tx.send(Event::Duration { duration });
         }
         Err(e) => {
             let _ = tx.send(Event::Error(e));
@@ -364,14 +390,15 @@ fn start_and_notify(
     }
 }
 
-/// 替换播放源：清空当前源队列并追加新解码器，随后恢复播放。
-fn start_track(player: &Player, path: &Path) -> Result<(), String> {
+/// 替换播放源：清空当前源队列并追加新解码器，随后恢复播放；返回解码器报告的时长。
+fn start_track(player: &Player, path: &Path) -> Result<Duration, String> {
     let file = File::open(path).map_err(|e| format!("无法打开文件 {:?}: {e}", path))?;
     let decoder = Decoder::try_from(file).map_err(|e| format!("无法解码 {:?}: {e}", path))?;
+    let duration = decoder.total_duration().unwrap_or_default();
     player.clear();
     player.append(decoder);
     player.play();
-    Ok(())
+    Ok(duration)
 }
 
 /// 生成 [0, len-1] 内不等于 current 的随机索引（len>1）。

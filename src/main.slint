@@ -1,6 +1,7 @@
 // zzhMusicPlayer 主界面：无边框、亚克力毛玻璃 + 主题渐变背景。
-// 布局：左上角歌曲信息、右上角窗口控制；中间全宽波形进度条（视觉核心）；
-// 底部半透明控制栏（模式/上一曲/播放暂停/下一曲/音量/播放列表）；
+// 布局：左侧专辑封面（无封面时隐藏）+ 歌曲/艺术家两行信息、右上角窗口控制；
+// 中部圆润镜像波形进度条（视觉核心，已播主题色 / 未播半透明白）；
+// 底部时间标签 + 半透明控制胶囊（模式/上一曲/播放暂停/下一曲/音量/播放列表）；
 // 底部滑出播放列表抽屉。
 
 export global UIState {
@@ -15,12 +16,22 @@ export global UIState {
     in-out property <float> volume: 1.0;
     in-out property <bool> volume-popup-open: false;
     in-out property <string> volume-text: "";
-    // 粒子系统时间（0~1 循环），驱动白色粒子持续生成与飘散。
+    // 粒子系统时间（0~1 循环），驱动白色粒子与列表内均衡器动画；暂停时冻结。
     in-out property <float> particle-time: 0.0;
     // 主题色与背景渐变（封面主色调 / 文件名哈希）。
     in-out property <color> theme-color: #5ac8fa;
     // 柔和模糊感背景位图（低分辨率渐变 + 主题色光斑放大）。
     in-out property <image> bg-image;
+    // 专辑封面缩略图；无封面时 has-cover 为 false，封面整体隐藏、文字左移。
+    in-out property <image> cover-image;
+    in-out property <bool> has-cover: false;
+    // 波形条相对高度（0~1），由后台线程解码真实 PCM 聚合而成。
+    in-out property <[float]> wave-bars;
+    in-out property <string> track-title: "";
+    in-out property <string> track-artist: "";
+    // 底部时间标签（m:ss）。
+    in-out property <string> position-text: "0:00";
+    in-out property <string> duration-text: "0:00";
     // 播放列表。
     in-out property <[string]> playlist: [];
     in-out property <int> playlist-current: -1;
@@ -31,12 +42,6 @@ export global UIState {
     // 进度条拖拽中：暂停波形实时推进，跟随手指预览。
     in-out property <bool> dragging: false;
     in-out property <float> drag-fraction: 0.0;
-    // 跳转已发出、等待播放位置确认（防止进度条回弹）。
-    in-out property <bool> seek-pending: false;
-    in-out property <image> wave-bg-image;
-    in-out property <image> wave-fg-image;
-    in-out property <string> track-title: "";
-    in-out property <string> track-artist: "";
 
     callback toggle-play();
     callback next();
@@ -70,11 +75,12 @@ component IconButton inherits Rectangle {
     height: button-size;
     border-radius: button-size / 2;
     // 半透明深底：hover 时由 opacity 提亮，保持毛玻璃透出。
-    background: active ? #3d4150cc : #262b3680;
-    transform-scale: ta.pressed ? 0.92 : (ta.has-hover ? 1.05 : 1.0);
-    opacity: ta.has-hover ? 0.95 : 1.0;
+    background: active ? UIState.theme-color.with-alpha(0.30) : #20262f80;
+    transform-scale: ta.pressed ? 0.92 : (ta.has-hover ? 1.06 : 1.0);
+    opacity: ta.has-hover ? 0.98 : 1.0;
     animate transform-scale { duration: 100ms; easing: ease-out; }
     animate opacity { duration: 100ms; easing: ease-out; }
+    animate background { duration: 120ms; easing: ease-out; }
 
     Rectangle {
         x: 0px;
@@ -84,7 +90,7 @@ component IconButton inherits Rectangle {
         border-radius: parent.border-radius;
         background: UIState.theme-color;
         // 空闲时透明度很低，几乎不可见；悬停时稍明显
-        opacity: ta.has-hover ? 0.20 : 0.12;
+        opacity: ta.has-hover ? 0.22 : 0.10;
         animate opacity { duration: 150ms; easing: ease-out; }
     }
 
@@ -118,7 +124,7 @@ component PlayButton inherits Rectangle {
     border-radius: button-size / 2;
     // 半透明深底（透明度与控制栏图标按钮一致）。
     background: #2c3240b3;
-    transform-scale: ta.pressed ? 0.92 : (ta.has-hover ? 1.05 : 1.0);
+    transform-scale: ta.pressed ? 0.90 : (ta.has-hover ? 1.08 : 1.0);
     animate transform-scale { duration: 100ms; easing: ease-out; }
 
     Rectangle {
@@ -128,7 +134,7 @@ component PlayButton inherits Rectangle {
         height: parent.height;
         border-radius: parent.border-radius;
         background: UIState.theme-color;
-        opacity: ta.has-hover ? 0.20 : 0.12;
+        opacity: ta.has-hover ? 0.30 : 0.16;
         animate opacity { duration: 150ms; easing: ease-out; }
     }
 
@@ -165,23 +171,43 @@ component PlayButton inherits Rectangle {
     }
 }
 
-// 横向音量条：自左向右按百分比填充。
+// 横向音量条：细轨道 + 主题色填充 + 白色滑块圆点。
 component VolumeBar inherits Rectangle {
     in property <float> volume: 1.0;
     callback changed(float);
 
     width: 110px;
     height: 16px;
-    border-radius: 8px;
-    background: #ffffff1c;
+    background: transparent;
 
+    // 轨道。
     Rectangle {
-        x: 2px;
-        y: 2px;
-        width: max((parent.width - 4px) * clamp(root.volume, 0.0, 1.0), 0px);
-        height: parent.height - 4px;
-        border-radius: 6px;
+        y: (parent.height - 5px) / 2;
+        width: 100%;
+        height: 5px;
+        border-radius: 2.5px;
+        background: #ffffff24;
+    }
+    // 已填充部分。
+    Rectangle {
+        x: 0px;
+        y: (parent.height - 5px) / 2;
+        width: max(parent.width * clamp(root.volume, 0.0, 1.0), 0px);
+        height: 5px;
+        border-radius: 2.5px;
         background: UIState.theme-color;
+    }
+    // 滑块圆点。
+    Rectangle {
+        x: clamp(parent.width * clamp(root.volume, 0.0, 1.0) - 4px, 0px, parent.width - 8px);
+        y: (parent.height - 8px) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: #ffffff;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-blur: 3px;
+        drop-shadow-color: #00000073;
     }
 
     TouchArea {
@@ -196,44 +222,84 @@ component VolumeBar inherits Rectangle {
     }
 }
 
-// 播放列表行：曲名 + 移除按钮，当前曲目高亮。
+// 播放列表行：曲名 + 当前曲目迷你均衡器 + 移除按钮。
 component PlaylistRow inherits Rectangle {
     in property <string> text;
     in property <int> index;
     callback clicked();
     callback remove();
 
-    height: 26px;
-    border-radius: 6px;
+    height: 30px;
+    border-radius: 8px;
     background: index == UIState.playlist-current
-        ? UIState.theme-color.with-alpha(0.22)
-        : transparent;
+        ? UIState.theme-color.with-alpha(0.20)
+        : (row-ta.has-hover ? #ffffff0d : transparent);
+    animate background { duration: 100ms; easing: ease-out; }
 
     Text {
         x: 12px;
-        width: parent.width - 40px;
+        width: parent.width - 84px;
         height: 100%;
         text: root.text;
-        color: index == UIState.playlist-current ? #ffffff : #cfd4dd;
+        color: index == UIState.playlist-current ? #ffffff : #c6ccd6;
         font-size: 12px;
         vertical-alignment: center;
         overflow: elide;
     }
 
-    TouchArea {
+    // 正在播放的迷你均衡器（复用全局粒子时钟；暂停时静止为短柱）。
+    Rectangle {
+        visible: index == UIState.playlist-current;
+        x: parent.width - 56px;
+        y: (parent.height - 12px) / 2;
+        width: 13px;
+        height: 12px;
+        property <length> amp: UIState.playing ? 7px : 0px;
+        Rectangle {
+            x: 0px;
+            width: 3px;
+            y: (parent.height - self.height) / 2;
+            height: 5px + (sin(UIState.particle-time * 900deg) * 0.5 + 0.5) * parent.amp;
+            border-radius: 1.5px;
+            background: UIState.theme-color;
+            animate height { duration: 90ms; easing: ease-out; }
+        }
+        Rectangle {
+            x: 5px;
+            width: 3px;
+            y: (parent.height - self.height) / 2;
+            height: 5px + (sin(UIState.particle-time * 900deg + 130deg) * 0.5 + 0.5) * parent.amp;
+            border-radius: 1.5px;
+            background: UIState.theme-color;
+            animate height { duration: 90ms; easing: ease-out; }
+        }
+        Rectangle {
+            x: 10px;
+            width: 3px;
+            y: (parent.height - self.height) / 2;
+            height: 5px + (sin(UIState.particle-time * 900deg + 260deg) * 0.5 + 0.5) * parent.amp;
+            border-radius: 1.5px;
+            background: UIState.theme-color;
+            animate height { duration: 90ms; easing: ease-out; }
+        }
+    }
+
+    row-ta := TouchArea {
         clicked => { root.clicked(); }
         mouse-cursor: pointer;
     }
 
     // 删除按钮放在最后（z 序最上层），避免被整行的 TouchArea 盖住而无法点击。
     Image {
-        x: parent.width - 30px;
+        x: parent.width - 32px;
         y: (parent.height - 14px) / 2;
         width: 14px;
         height: 14px;
         source: @image-url("../icons/删除.svg");
         image-fit: contain;
         image-rendering: smooth;
+        opacity: row-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45;
+        animate opacity { duration: 120ms; }
         TouchArea {
             clicked => { root.remove(); }
             mouse-cursor: pointer;
@@ -241,58 +307,73 @@ component PlaylistRow inherits Rectangle {
     }
 }
 
-// 波形进度区：全宽主题高亮 + 光晕 + 拖尾粒子 + 底部律动光带。
+// 波形进度区：圆润镜像波形条（已播主题色 / 未播半透明白）
+// + 进度竖线光晕 + 拖尾粒子 + 悬停位置指示线。
 component WaveformArea inherits Rectangle {
     in property <float> progress-frac;
 
-    horizontal-stretch: 1;
     background: transparent;
 
-    // 整曲波形（半透明白，作为灰色底）。
-    Image {
-        source: UIState.wave-bg-image;
-        width: 100%;
-        height: 100%;
-        image-rendering: smooth;
-    }
+    property <int> bar-count: UIState.wave-bars.length;
+    property <length> step: bar-count > 0 ? self.width / bar-count : 0px;
+    property <length> bar-w: step * 0.62;
 
-    // 已播部分：裁剪容器只露出左侧 progress 宽度，内部波形保持整条宽度，
-    // 因此高亮与原图同比例，从左往右推进，不随进度伸缩。
+    // 无曲目占位：中心细线 + 操作提示。
     Rectangle {
-        // 显式 x=0：未指定 x 的元素会被 Slint 水平居中。
+        visible: root.bar-count == 0;
         x: 0px;
-        clip: true;
-        width: max(parent.width * progress-frac, 0px);
-        height: 100%;
-        Image {
-            x: 0px;
-            source: UIState.wave-fg-image;
-            width: root.width;
-            height: root.height;
-            image-fit: fill;
-            image-rendering: smooth;
-        }
+        y: root.height / 2 - 1px;
+        width: 100%;
+        height: 2px;
+        border-radius: 1px;
+        background: #ffffff14;
+    }
+    Text {
+        visible: root.bar-count == 0;
+        y: root.height / 2 + 8px;
+        width: 100%;
+        height: 14px;
+        text: "双击窗口或拖入音频文件开始播放";
+        font-size: 10px;
+        color: #ffffff38;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 
-    // 进度竖线（主题色）。
-    Rectangle {
-        x: max(parent.width * progress-frac - 1px, 0px);
-        width: 2px;
-        height: 100%;
-        background: UIState.theme-color;
-        opacity: 0.95;
+    // 波形条：居中镜像，高度来自真实 PCM 峰值；换曲时整排平滑过渡。
+    for b[i] in UIState.wave-bars: Rectangle {
+        x: i * root.step + (root.step - root.bar-w) / 2;
+        y: (root.height - self.height) / 2;
+        width: root.bar-w;
+        height: max(root.height * b, 3px);
+        border-radius: self.width / 2;
+        background: ((i + 0.5) * root.step) < root.width * root.progress-frac
+            ? UIState.theme-color
+            : #ffffff2e;
+        animate height { duration: 280ms; easing: ease-out; }
     }
 
-    // 进度线径向渐变光晕（中心亮、向外透明）。
+    // 播放头：一根全高白色圆角条随进度连续平移（高度与波形包络最高点对齐）。
     Rectangle {
-        x: max(parent.width * progress-frac - 38px, 0px);
-        y: max(parent.height / 2 - 38px, 0px);
-        width: 76px;
-        height: 76px;
+        visible: root.bar-count > 0;
+        x: max(root.width * root.progress-frac - self.width / 2, 0px);
+        y: 0px;
+        width: max(root.bar-w, 3px);
+        height: 100%;
+        border-radius: self.width / 2;
+        background: #f5f7fa;
+    }
+
+    // 播放头光晕（径向渐变，中心亮、向外透明；作用在播放头条上）。
+    Rectangle {
+        x: max(root.width * root.progress-frac - 24px, 0px);
+        y: root.height / 2 - 24px;
+        width: 48px;
+        height: 48px;
         background: @radial-gradient(
             circle,
-            UIState.theme-color.with-alpha(0.38) 0%,
-            UIState.theme-color.with-alpha(0.12) 45%,
+            UIState.theme-color.with-alpha(0.34) 0%,
+            UIState.theme-color.with-alpha(0.10) 45%,
             transparent 100%
         );
     }
@@ -301,22 +382,33 @@ component WaveformArea inherits Rectangle {
     // 向左后方飘散、随年龄缩小并逐渐消失（伪随机取模确定外观，非正弦排布）。
     for p[i] in [0.0, 0.23, 0.11, 0.47, 0.05, 0.62, 0.34, 0.81]: Rectangle {
         property <float> age: mod(UIState.particle-time + p, 1.0);
-        // 随机散布高度：伪随机取模，范围约 ±25% 波形高度。
-        property <length> yoff: ((mod(i * 31, 7) * 2 + mod(i * 17, 5) - 8) * parent.height) / 30;
+        // 随机散布高度：伪随机取模，范围约 ±22% 波形高度。
+        property <length> yoff: ((mod(i * 31, 7) * 2 + mod(i * 17, 5) - 8) * parent.height) / 34;
         // 随机横向飘散速度（68 / 88 / 108 像素每周期）。
         property <length> speed: 68px + mod(i, 3) * 20px;
-        x: max(parent.width * progress-frac - age * speed, 0px);
+        x: max(root.width * root.progress-frac - age * speed, 0px);
         // 主高度随机 + 微小幅值抖动（0.05），不形成正弦形状。
-        y: max(parent.height / 2 + yoff + sin(age * 360deg + i * 77deg) * parent.height * 0.05 - 1.5px, 0px);
+        y: max(root.height / 2 + yoff + sin(age * 360deg + i * 77deg) * parent.height * 0.05 - 1.5px, 0px);
         width: max(2px, 3px - age * (1px + mod(i, 2) * 1px));
         height: max(2px, 3px - age * (1px + mod(i, 2) * 1px));
         border-radius: 1.5px;
         background: #ffffff;
-        opacity: pow(1.0 - age, 1.4 + mod(i, 3) * 0.4);
+        opacity: UIState.playing ? pow(1.0 - age, 1.4 + mod(i, 3) * 0.4) : 0.0;
+        animate opacity { duration: 200ms; }
+    }
+
+    // 悬停指示线（鼠标在波形区移动时预览落点）。
+    Rectangle {
+        visible: ta.has-hover;
+        x: clamp(ta.mouse-x - 0.5px, 0px, root.width - 1px);
+        y: root.height * 0.14;
+        width: 1px;
+        height: root.height * 0.72;
+        background: #ffffff59;
     }
 
     // 点击/拖拽跳转（按下后 Slint 捕获指针，mouse-x 持续跟随）。
-    TouchArea {
+    ta := TouchArea {
         property <float> preview: min(max(self.mouse-x / root.width, 0.0), 1.0);
         pointer-event(e) => {
             if e.kind == PointerEventKind.down {
@@ -328,9 +420,10 @@ component WaveformArea inherits Rectangle {
                 }
             } else if e.kind == PointerEventKind.up {
                 if UIState.dragging {
+                    UIState.drag-fraction = preview;
+                    // 先同步提交目标位置，再结束 dragging，避免中间一帧回到旧进度。
                     UIState.seek-requested(preview);
-                    // 保持预览位置，等播放位置确认后再复位，避免回弹。
-                    UIState.seek-pending = true;
+                    UIState.dragging = false;
                 }
             }
         }
@@ -343,7 +436,7 @@ export component MainWindow inherits Window {
     background: transparent;
     title: "zzhMusicPlayer";
     width: 720px;
-    height: 170px;
+    height: 178px;
     default-font-family: "HarmonyOS Sans SC";
 
     // 全局快捷键：空格 播放/暂停，左右方向键 快退/快进 5 秒。
@@ -363,10 +456,17 @@ export component MainWindow inherits Window {
         }
     }
 
-    // 进度比例：拖拽中跟随手指，否则由播放位置决定。
-    property <float> progress-frac:
-        UIState.dragging ? UIState.drag-fraction
-        : (UIState.duration > 0.0 ? min(UIState.position / UIState.duration, 1.0) : 0.0);
+    // 播放位置比例：播放引擎每 ~100ms 上报一次，这里用 200ms 线性动画在
+    // 两次上报之间插值，让播放头连续平移（“平滑滑动”）而非一格格跳动。
+    property <float> played-frac:
+        UIState.duration > 0.0 ? min(UIState.position / UIState.duration, 1.0) : 0.0;
+    animate played-frac { duration: 200ms; easing: linear; }
+    // 进度比例：拖拽中直接跟随手指（不插值，保证跟手），否则取插值后的播放位置。
+    property <float> progress-frac: UIState.dragging ? UIState.drag-fraction : played-frac;
+
+    // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
+    property <length> bar-x: (root.width - 300px) / 2;
+    property <length> bar-y: root.height - 46px;
 
     // 最底层：空白区域拖动窗口（含双击打开文件检测）。
     TouchArea {
@@ -401,23 +501,77 @@ export component MainWindow inherits Window {
             image-rendering: smooth;
         }
 
-        // 左上：歌曲信息。
-        Text {
+        // 顶部 1px 玻璃高光（中间亮、两端淡出）。
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 1px;
+            background: @linear-gradient(90deg, transparent 0%, #ffffff2b 50%, transparent 100%);
+        }
+
+        // —— 左上：专辑封面（无封面时整体隐藏）——
+        Rectangle {
             x: 16px;
-            y: 10px;
-            width: root.width - 210px;
+            y: 14px;
+            width: 48px;
+            height: 48px;
+            border-radius: 10px;
+            clip: true;
+            visible: UIState.has-cover;
+            background: #ffffff0d;
+            Image {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                source: UIState.cover-image;
+                image-fit: cover;
+                image-rendering: smooth;
+            }
+            // 发丝描边，让封面在深色背景上有边界感。
+            Rectangle {
+                width: 100%;
+                height: 100%;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #ffffff2b;
+                background: transparent;
+            }
+            drop-shadow-offset-y: 2px;
+            drop-shadow-blur: 8px;
+            drop-shadow-color: #00000066;
+        }
+
+        // 歌曲名 / 艺术家两行；无封面时左移补位（150ms 平滑过渡）。
+        Text {
+            x: UIState.has-cover ? 78px : 18px;
+            y: UIState.track-artist == "" ? 24px : 16px;
+            width: root.width - 240px;
             height: 22px;
-            text: UIState.track-title == ""
-                ? ""
-                : (UIState.track-artist == ""
-                    ? UIState.track-title
-                    : UIState.track-title + " — " + UIState.track-artist);
+            text: UIState.track-title;
             font-size: 15px;
             font-weight: 600;
             color: #f2f4f8;
             horizontal-alignment: left;
             vertical-alignment: center;
             overflow: elide;
+            animate x { duration: 150ms; easing: ease-out; }
+            animate y { duration: 150ms; easing: ease-out; }
+        }
+        Text {
+            x: UIState.has-cover ? 78px : 18px;
+            y: 40px;
+            width: root.width - 240px;
+            height: 16px;
+            text: UIState.track-artist;
+            visible: UIState.track-artist != "";
+            font-size: 11px;
+            color: #ffffff8c;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+            overflow: elide;
+            animate x { duration: 150ms; easing: ease-out; }
         }
 
         // 右上：关于 / 最小化 / 置顶 / 关闭。
@@ -451,19 +605,43 @@ export component MainWindow inherits Window {
             clicked => { UIState.close-window(); }
         }
 
-        // 波形进度条（视觉核心，横贯全宽，约占窗口 55% 高度）。
+        // 波形进度条（视觉核心）。
         WaveformArea {
-            x: 0px;
-            y: 40px;
-            width: root.width;
-            height: root.height * 0.55;
+            x: 20px;
+            y: 70px;
+            width: root.width - 40px;
+            height: 56px;
             progress-frac: root.progress-frac;
+        }
+
+        // 底部时间标签（与控制胶囊同一行，两端对齐）。
+        Text {
+            x: 22px;
+            y: root.bar-y + 10px;
+            width: 60px;
+            height: 18px;
+            text: UIState.position-text;
+            font-size: 11px;
+            color: #aeb6c2;
+            horizontal-alignment: left;
+            vertical-alignment: center;
+        }
+        Text {
+            x: root.width - 82px;
+            y: root.bar-y + 10px;
+            width: 60px;
+            height: 18px;
+            text: UIState.duration-text;
+            font-size: 11px;
+            color: #aeb6c2;
+            horizontal-alignment: right;
+            vertical-alignment: center;
         }
 
         // 模式提示（切换模式时短暂显示，浮于底部控制栏上方居中）。
         Text {
             x: control_bar.x + control_bar.width / 2 - 65px;
-            y: control_bar.y - 22px;
+            y: control_bar.y - 24px;
             width: 130px;
             height: 18px;
             text: UIState.mode-text;
@@ -477,10 +655,10 @@ export component MainWindow inherits Window {
 
         // 底部半透明控制栏：模式 → 快退 → 上一曲 → 播放/暂停 → 下一曲 → 快进 → 音量 → 列表。
         control_bar := Rectangle {
-            x: (root.width - 300px) / 2;
-            y: root.height - 50px;
+            x: root.bar-x;
+            y: root.bar-y;
             width: 300px;
-            height: 40px;
+            height: 38px;
 
             // 玻璃胶囊背景：空闲时很淡，鼠标靠近后变实，保证可读性。
             Rectangle {
@@ -488,7 +666,7 @@ export component MainWindow inherits Window {
                 y: 0px;
                 width: 100%;
                 height: 100%;
-                border-radius: 20px;
+                border-radius: 19px;
                 background: #131823;
                 opacity: UIState.toolbar-hovered ? 0.88 : 0.30;
                 animate opacity { duration: 150ms; easing: ease-out; }
@@ -497,30 +675,18 @@ export component MainWindow inherits Window {
                 drop-shadow-color: #00000059;
             }
 
-            // 新增：主题色叠加层（与底层完全重叠）
+            // 主题色叠加层（与底层完全重叠）。
             Rectangle {
                 x: 0px;
                 y: 0px;
                 width: 100%;
                 height: 100%;
-                border-radius: 20px;
+                border-radius: 19px;
                 background: UIState.theme-color;
                 // 空闲时几乎看不见，鼠标靠近工具栏时微微显现
                 opacity: UIState.toolbar-hovered ? 0.18 : 0.08;
                 animate opacity { duration: 150ms; easing: ease-out; }
             }
-
-            // 玻璃顶部高光（1px 细微反光）。
-            //Rectangle {
-            //    x: 7px;
-            //    y: 1px;
-            //    width: parent.width - 16px;
-            //    height: 1px;
-            //    border-radius: 1px;
-            //    background: #ffffff1c;
-            //    opacity: UIState.toolbar-hovered ? 1.0 : 0.35;
-            //    animate opacity { duration: 150ms; easing: ease-out; }
-            //}
 
             HorizontalLayout {
                 // 显式铺满高度，否则内容会在容器顶部对齐。
@@ -532,43 +698,43 @@ export component MainWindow inherits Window {
                 alignment: center;
 
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     source: @image-url("../icons/模式.svg");
                     clicked => { UIState.cycle-mode(); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     source: @image-url("../icons/快退.svg");
                     clicked => { UIState.seek-relative(-5.0); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     source: @image-url("../icons/上一首.svg");
                     clicked => { UIState.previous(); }
                 }
                 PlayButton {
-                    button-size: 34px;
+                    button-size: 36px;
                     playing: UIState.playing;
                     clicked => { UIState.toggle-play(); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     source: @image-url("../icons/下一首.svg");
                     clicked => { UIState.next(); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     source: @image-url("../icons/快进.svg");
                     clicked => { UIState.seek-relative(5.0); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     active: UIState.volume-popup-open;
                     source: @image-url("../icons/音量.svg");
                     clicked => { UIState.toggle-volume-popup(); }
                 }
                 IconButton {
-                    button-size: 28px;
+                    button-size: 27px;
                     active: UIState.playlist-open;
                     source: @image-url("../icons/播放列表.svg");
                     clicked => { UIState.toggle-playlist(); }
@@ -583,7 +749,7 @@ export component MainWindow inherits Window {
                 : control_bar.x + control_bar.width - 34px;
             y: control_bar.y;
             width: 160px;
-            height: 40px;
+            height: 38px;
             opacity: UIState.volume-popup-open ? 1.0 : 0.0;
             visible: UIState.volume-popup-open;
             animate x { duration: 150ms; easing: ease-out; }
@@ -595,7 +761,7 @@ export component MainWindow inherits Window {
                 y: 0px;
                 width: 100%;
                 height: 100%;
-                border-radius: 20px;
+                border-radius: 19px;
                 background: #131823;
                 opacity: 0.88;
                 drop-shadow-offset-y: 3px;
@@ -609,7 +775,7 @@ export component MainWindow inherits Window {
                 y: 0px;
                 width: 100%;
                 height: 100%;
-                border-radius: 20px;
+                border-radius: 19px;
                 background: UIState.theme-color;
                 opacity: 0.18;
             }
@@ -654,17 +820,27 @@ export component MainWindow inherits Window {
         // 播放列表抽屉：从底部滑出。
         Rectangle {
             x: 0px;
-            y: UIState.playlist-open ? root.height - 156px : root.height;
+            y: UIState.playlist-open ? root.height - 160px : root.height;
             width: root.width;
-            height: 156px;
-            background: #151a23f2;
+            height: 160px;
+            background: #151a23f5;
             border-radius: 14px;
             animate y { duration: 220ms; easing: ease-out; }
+
+            // 顶部拖动把手装饰。
+            Rectangle {
+                x: (parent.width - 32px) / 2;
+                y: 6px;
+                width: 32px;
+                height: 4px;
+                border-radius: 2px;
+                background: #ffffff26;
+            }
 
             // 头部：标题 + 清空 + 收起。
             Text {
                 x: 16px;
-                y: 8px;
+                y: 15px;
                 width: 140px;
                 height: 20px;
                 text: "播放列表";
@@ -675,7 +851,7 @@ export component MainWindow inherits Window {
             }
             Text {
                 x: parent.width - 104px;
-                y: 8px;
+                y: 15px;
                 width: 44px;
                 height: 20px;
                 text: "清空";
@@ -690,19 +866,34 @@ export component MainWindow inherits Window {
             }
             IconButton {
                 x: parent.width - 46px;
-                y: 5px;
+                y: 13px;
                 button-size: 24px;
                 source: @image-url("../icons/关闭.svg");
                 clicked => { UIState.toggle-playlist(); }
             }
 
+            // 空列表提示。
+            Text {
+                x: 0px;
+                y: 46px;
+                width: 100%;
+                height: 40px;
+                text: "列表为空 · 双击窗口或拖入音频文件添加";
+                visible: UIState.playlist.length == 0;
+                font-size: 11px;
+                color: #8b93a3;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
             Flickable {
                 x: 8px;
-                y: 34px;
+                y: 42px;
                 width: parent.width - 16px;
-                height: parent.height - 40px;
-                viewport-height: UIState.playlist.length * 26px;
+                height: parent.height - 48px;
+                viewport-height: UIState.playlist.length * 32px + 2px;
                 VerticalLayout {
+                    spacing: 2px;
                     for item[i] in UIState.playlist: PlaylistRow {
                         text: item;
                         index: i;
@@ -768,7 +959,7 @@ export component MainWindow inherits Window {
                         color: #cfd4dd;
                     }
                     Text {
-                        text: "版本：1.0.0";
+                        text: "版本：1.1.0";
                         font-size: 12px;
                         color: #cfd4dd;
                     }
