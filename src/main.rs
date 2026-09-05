@@ -1413,29 +1413,30 @@ fn main() {
                             state.set_toolbar_hovered(hovered);
                         }
                         // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标；
-                        // 光标贴近列表上下缘时写入自动滚动增量（33ms 一拍）。
+                        // 光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
                         if state.get_reorder_from() >= 0.0 {
                             state.set_reorder_y(local_y);
                             // 列表区：y 60..172；上/下缘 22px 内开始滚动，
                             // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
+                            // 视口范围与 main.slint 一致：[-(vh-112), 0]，vh = 行数*32+2。
                             const EDGE: f32 = 22.0;
                             const MAX_SPEED: f32 = 6.0;
-                            let delta = if state.get_reorder_to() >= 0.0 {
-                                if local_y < 60.0 + EDGE {
-                                    -MAX_SPEED * (1.0 - (local_y - 60.0) / EDGE).max(0.15)
+                            if state.get_reorder_to() >= 0.0 {
+                                let rows = state.get_playlist().row_count() as f32;
+                                let vp_min = 0.0f32.min(112.0 - (rows * 32.0 + 2.0));
+                                let vp = state.get_list_vp_y();
+                                // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
+                                let delta = if local_y < 60.0 + EDGE {
+                                    MAX_SPEED * (1.0 - (local_y - 60.0) / EDGE).max(0.15)
                                 } else if local_y > 172.0 - EDGE {
-                                    MAX_SPEED * (1.0 - (172.0 - local_y) / EDGE).max(0.15)
+                                    -MAX_SPEED * (1.0 - (172.0 - local_y) / EDGE).max(0.15)
                                 } else {
                                     0.0
+                                };
+                                if delta != 0.0 {
+                                    state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
                                 }
-                            } else {
-                                0.0
-                            };
-                            if delta != state.get_scroll_delta() {
-                                state.set_scroll_delta(delta);
                             }
-                        } else if state.get_scroll_delta() != 0.0 {
-                            state.set_scroll_delta(0.0);
                         }
                         // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
                         // 避免覆盖层收不到“离开”事件导致的高亮滞留。

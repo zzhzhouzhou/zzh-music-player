@@ -53,9 +53,9 @@ export global UIState {
     // 由窗口级列表覆盖层驱动。
     in-out property <float> hover-row: -1.0;
     in-out property <float> hover-button: 0.0;
-    // 拖动排序时的边缘自动滚动速度（逻辑 px / 33ms，0 = 不滚动），
-    // Rust 计时器写入，Slint 的 changed 回调应用到 Flickable 视口。
-    in-out property <float> scroll-delta: 0.0;
+    // 列表视口滚动偏移（与 Flickable 的 viewport-y 双向绑定）：
+    // 滚轮（覆盖层 scroll-event）与边缘自动滚动（Rust 计时器）都直接写它。
+    in-out property <length> list-vp-y: 0px;
     // 波形悬停：鼠标在波形区的相对位置（-1 = 未悬停）与时间提示文本
     // （Rust 侧 33ms 计时器按 hover 位置格式化，仅变化时写入）。
     in-out property <float> wave-hover-frac: -1.0;
@@ -1038,6 +1038,8 @@ export component MainWindow inherits Window {
 
             list-flick := Flickable {
                 x: 8px;
+                // 视口偏移暴露给全局：滚轮与自动滚动（覆盖层 / Rust）统一驱动。
+                viewport-y <=> UIState.list-vp-y;
                 // 拖动排序中滚动（滚轮 / 边缘自动滚动）后，目标行跟随新的内容位置。
                 changed viewport-y => {
                     if (UIState.reorder-from >= 0.0 && UIState.reorder-to >= 0.0) {
@@ -1081,23 +1083,6 @@ export component MainWindow inherits Window {
             drop-shadow-blur: 12px;
             drop-shadow-color: #00000088;
 
-            // 边缘自动滚动：Rust 计时器检测光标贴近列表上下缘时写入增量，
-            // 这里应用到 Flickable 视口并同步刷新拖动目标行。
-            property <float> sd <=> UIState.scroll-delta;
-            changed sd => {
-                if (UIState.reorder-from >= 0.0 && UIState.scroll-delta != 0.0) {
-                    list-flick.viewport-y = clamp(
-                        list-flick.viewport-y + UIState.scroll-delta * 1px,
-                        min(0px, 112px - (UIState.playlist.length * 32px + 2px)),
-                        0px
-                    );
-                    UIState.reorder-to = clamp(
-                        list-ta.content-row,
-                        0.0,
-                        UIState.playlist.length * 1.0 - 1.0
-                    );
-                }
-            }
 
             // 主题色调叠加层（淡）。
             Rectangle {
@@ -1208,6 +1193,23 @@ export component MainWindow inherits Window {
                     }
                     armed-handle = false;
                 }
+            }
+            // 滚轮滚动列表（覆盖层是 Flickable 的兄弟节点，滚轮不会自然到达它，
+            // 必须在此手动驱动视口；拖动排序中光标被捕获，同样由此处理）。
+            scroll-event(e) => {
+                UIState.list-vp-y = clamp(
+                    UIState.list-vp-y + e.delta_y,
+                    min(0px, 112px - (UIState.playlist.length * 32px + 2px)),
+                    0px
+                );
+                if (UIState.reorder-from >= 0.0 && UIState.reorder-to >= 0.0) {
+                    UIState.reorder-to = clamp(
+                        content-row,
+                        0.0,
+                        UIState.playlist.length * 1.0 - 1.0
+                    );
+                }
+                accept
             }
             mouse-cursor: UIState.reorder-to >= 0.0 ? grabbing : pointer;
         }
