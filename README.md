@@ -51,7 +51,7 @@ cd zzh-music-player
 cargo build --release
 ```
 
-构建产物在 `targetelease\zzhmusicplayer.exe`。需要安装包的话，用 Inno Setup 编译 `installer.iss` 即可。
+构建产物在 `target\release\zzhmusicplayer.exe`。需要安装包的话，用 Inno Setup 编译 `installer.iss` 即可。
 
 ## 技术栈
 
