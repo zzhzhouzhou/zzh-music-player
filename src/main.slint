@@ -43,8 +43,12 @@ export global UIState {
     in-out property <bool> playlist-open: false;
     // 列表拖动排序：reorder-from >= 0 表示正在拖动 index 行，
     // reorder-to 是当前悬停目标位置（float：Slint 无整数转换，由 Rust 侧取整）。
+    // reorder-text 是被拖行的歌名（浮块显示用）；reorder-y 是指针的窗口
+    // 局部纵坐标（Rust 侧 33ms 计时器随系统光标写入，驱动浮块跟随）。
     in-out property <float> reorder-from: -1.0;
     in-out property <float> reorder-to: -1.0;
+    in-out property <string> reorder-text: "";
+    in-out property <float> reorder-y: 0.0;
     // 波形悬停：鼠标在波形区的相对位置（-1 = 未悬停）与时间提示文本
     // （Rust 侧 33ms 计时器按 hover 位置格式化，仅变化时写入）。
     in-out property <float> wave-hover-frac: -1.0;
@@ -257,12 +261,28 @@ component PlaylistRow inherits Rectangle {
         ? UIState.theme-color.with-alpha(0.32)
         : index == UIState.playlist-current
             ? UIState.theme-color.with-alpha(0.20)
-            : (row-ta.has-hover ? #ffffff0d : transparent);
+            : (drag-ta.has-hover ? #ffffff0d : transparent);
     animate background { duration: 100ms; easing: ease-out; }
+    // 正被拖动的行压暗（浮块代替它显示），松手或点击后恢复。
+    opacity: UIState.reorder-from == index && UIState.reorder-to >= 0.0 ? 0.22 : 1.0;
+    animate opacity { duration: 120ms; easing: ease-out; }
+
+    // 拖动手柄（六点 grip）：拖动排序的视觉锚点。
+    Image {
+        x: 7px;
+        y: (parent.height - 12px) / 2;
+        width: 12px;
+        height: 12px;
+        source: @image-url("../icons/拖动.svg");
+        image-fit: contain;
+        image-rendering: smooth;
+        opacity: drag-ta.has-hover || UIState.reorder-from == index ? 0.95 : 0.4;
+        animate opacity { duration: 120ms; }
+    }
 
     Text {
-        x: 12px;
-        width: parent.width - 118px;
+        x: 26px;
+        width: parent.width - 146px;
         height: 100%;
         text: root.text;
         color: index == UIState.playlist-current ? #ffffff : #c6ccd6;
@@ -308,16 +328,19 @@ component PlaylistRow inherits Rectangle {
         }
     }
 
-    // 整行 TouchArea：普通点击播放；按住纵向拖动（>8px）进入排序预览，
-    // 松手时若目标位置有变化则提交 move-track。鼠标样式随状态切换。
-    row-ta := TouchArea {
+    // 拖动区：仅覆盖“手柄图标 + 歌名”一段。普通点击播放；按住纵向拖动
+    //（>8px）进入排序预览，松手提交 move-track。右侧按钮区不受影响。
+    drag-ta := TouchArea {
+        x: 0px;
+        width: parent.width - 96px;
+        height: 100%;
         property <length> press-y: 0.0;
-        property <bool> dragging: UIState.reorder-from == index;
         pointer-event(e) => {
             if e.kind == PointerEventKind.down {
                 press-y = self.mouse-y;
                 UIState.reorder-from = index;
                 UIState.reorder-to = -1.0;
+                UIState.reorder-text = root.text;
             } else if e.kind == PointerEventKind.move && UIState.reorder-from == index {
                 if UIState.reorder-to < 0.0 {
                     if abs(self.mouse-y - press-y) > 8px {
@@ -341,6 +364,7 @@ component PlaylistRow inherits Rectangle {
                     }
                     UIState.reorder-from = -1.0;
                     UIState.reorder-to = -1.0;
+                    UIState.reorder-text = "";
                 }
             }
         }
@@ -356,7 +380,7 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/文件夹.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: folder-ta.has-hover ? 1.0 : (row-ta.has-hover || index == UIState.playlist-current ? 0.75 : 0.35);
+        opacity: folder-ta.has-hover ? 1.0 : (drag-ta.has-hover || index == UIState.playlist-current ? 0.75 : 0.35);
         animate opacity { duration: 120ms; }
         folder-ta := TouchArea {
             clicked => { root.open-folder(); }
@@ -373,7 +397,7 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/删除.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: del-ta.has-hover ? 1.0 : (row-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45);
+        opacity: del-ta.has-hover ? 1.0 : (drag-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45);
         animate opacity { duration: 120ms; }
         del-ta := TouchArea {
             clicked => { root.remove(); }
@@ -486,7 +510,7 @@ component WaveformArea inherits Rectangle {
         background: #ffffff59;
     }
 
-    // 悬停时间提示：气泡浮在指示线上方，显示“悬停位置 / 总时长”。
+    // 悬停时间提示：深色玻璃底 + 一层主题色调（随换曲过渡），醒目不刺眼。
     Rectangle {
         visible: ta.has-hover && UIState.tooltip-text != "";
         x: clamp(ta.mouse-x - self.width / 2, 2px, root.width - self.width - 2px);
@@ -494,12 +518,23 @@ component WaveformArea inherits Rectangle {
         width: tip-text.preferred-width + 20px;
         height: 22px;
         border-radius: 11px;
-        background: #131823ee;
+        background: #131823f0;
         border-width: 1px;
-        border-color: #ffffff1c;
+        border-color: UIState.theme-color.with-alpha(0.45);
         drop-shadow-offset-y: 2px;
         drop-shadow-blur: 6px;
         drop-shadow-color: #00000066;
+
+        // 主题色调叠加层（淡）。
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            border-radius: 11px;
+            background: UIState.theme-color;
+            opacity: 0.28;
+        }
 
         tip-text := Text {
             x: 10px;
@@ -507,7 +542,8 @@ component WaveformArea inherits Rectangle {
             height: 100%;
             text: UIState.tooltip-text;
             font-size: 11px;
-            color: #eef1f6;
+            font-weight: 600;
+            color: #ffffff;
             horizontal-alignment: center;
             vertical-alignment: center;
         }
@@ -940,6 +976,7 @@ export component MainWindow inherits Window {
         }
 
         // 播放列表抽屉：从底部滑出。半透明深底透出下层渐变，呈现毛玻璃观感；
+        // 其上叠一层极淡的主题色（全局补间自动随换曲过渡），保持整体色调统一；
         // 顶部 1px 高光勾边增强玻璃质感。
         Rectangle {
             x: 0px;
@@ -949,6 +986,17 @@ export component MainWindow inherits Window {
             background: #10141cd9;
             border-radius: 14px;
             animate y { duration: 220ms; easing: ease-out; }
+
+            // 极淡主题色叠加层。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                border-radius: 14px;
+                background: UIState.theme-color;
+                opacity: 0.08;
+            }
 
             // 玻璃顶缘高光。
             Rectangle {
@@ -1034,6 +1082,56 @@ export component MainWindow inherits Window {
                         open-folder => { UIState.open-folder(i); }
                     }
                 }
+            }
+        }
+
+        // 拖动排序浮块：跟随系统光标纵向移动，代替被压暗的原行；
+        // y 由 Rust 侧计时器按窗口局部坐标写入并钳制在列表区域内。
+        // 底色与 Tooltip 同款：深色玻璃 + 主题色调叠加，避免纯黑生硬。
+        Rectangle {
+            visible: UIState.reorder-from >= 0.0 && UIState.reorder-text != "";
+            x: 8px;
+            y: clamp(UIState.reorder-y * 1px - 15px, 60px, root.height - 32px);
+            width: root.width - 16px;
+            height: 30px;
+            border-radius: 8px;
+            background: #131823f2;
+            border-width: 1px;
+            border-color: UIState.theme-color.with-alpha(0.6);
+            drop-shadow-offset-y: 4px;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000088;
+
+            // 主题色调叠加层（淡）。
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: 100%;
+                border-radius: 8px;
+                background: UIState.theme-color;
+                opacity: 0.3;
+            }
+
+            Image {
+                x: 10px;
+                y: (parent.height - 12px) / 2;
+                width: 12px;
+                height: 12px;
+                source: @image-url("../icons/拖动.svg");
+                image-fit: contain;
+                image-rendering: smooth;
+                opacity: 0.9;
+            }
+            Text {
+                x: 30px;
+                width: parent.width - 44px;
+                height: 100%;
+                text: UIState.reorder-text;
+                color: #f2f4f8;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
             }
         }
 

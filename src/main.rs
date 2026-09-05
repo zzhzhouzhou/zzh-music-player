@@ -1400,6 +1400,11 @@ fn main() {
                         if hovered != state.get_toolbar_hovered() {
                             state.set_toolbar_hovered(hovered);
                         }
+                        // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标。
+                        if state.get_reorder_from() >= 0.0 {
+                            let local_y = (cy - origin.y) as f32 / scale;
+                            state.set_reorder_y(local_y);
+                        }
                     }
                 }
             },
@@ -1776,6 +1781,11 @@ fn main() {
     if settings.pin {
         state.set_always_on_top(true);
         set_always_on_top(ui.window(), true);
+    }
+    // 测试辅助：ZZH_OPEN_PLAYLIST=1 启动时直接展开播放列表抽屉。
+    if std::env::var("ZZH_OPEN_PLAYLIST").as_deref() == Ok("1") {
+        state.set_playlist_open(true);
+        PLAYLIST_OPEN.store(true, Ordering::Relaxed);
     }
     if let Some(cur) = &settings.current
         && let Some(idx) = playlist.borrow().iter().position(|p| p == cur)
