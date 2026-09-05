@@ -53,6 +53,9 @@ export global UIState {
     // 由窗口级列表覆盖层驱动。
     in-out property <float> hover-row: -1.0;
     in-out property <float> hover-button: 0.0;
+    // 拖动排序时的边缘自动滚动速度（逻辑 px / 33ms，0 = 不滚动），
+    // Rust 计时器写入，Slint 的 changed 回调应用到 Flickable 视口。
+    in-out property <float> scroll-delta: 0.0;
     // 波形悬停：鼠标在波形区的相对位置（-1 = 未悬停）与时间提示文本
     // （Rust 侧 33ms 计时器按 hover 位置格式化，仅变化时写入）。
     in-out property <float> wave-hover-frac: -1.0;
@@ -78,6 +81,7 @@ export global UIState {
     callback open-folder(float);
     // 拖动开始时按行索引取歌名（Slint 不支持动态模型下标，由 Rust 填充）。
     callback set-reorder-text(float);
+    callback open-github();
     callback clear-playlist();
     callback toggle-playlist();
     callback seek-requested(float);
@@ -1034,6 +1038,16 @@ export component MainWindow inherits Window {
 
             list-flick := Flickable {
                 x: 8px;
+                // 拖动排序中滚动（滚轮 / 边缘自动滚动）后，目标行跟随新的内容位置。
+                changed viewport-y => {
+                    if (UIState.reorder-from >= 0.0 && UIState.reorder-to >= 0.0) {
+                        UIState.reorder-to = clamp(
+                            list-ta.content-row,
+                            0.0,
+                            UIState.playlist.length * 1.0 - 1.0
+                        );
+                    }
+                }
                 y: 42px;
                 width: parent.width - 16px;
                 height: parent.height - 48px;
@@ -1066,6 +1080,24 @@ export component MainWindow inherits Window {
             drop-shadow-offset-y: 4px;
             drop-shadow-blur: 12px;
             drop-shadow-color: #00000088;
+
+            // 边缘自动滚动：Rust 计时器检测光标贴近列表上下缘时写入增量，
+            // 这里应用到 Flickable 视口并同步刷新拖动目标行。
+            property <float> sd <=> UIState.scroll-delta;
+            changed sd => {
+                if (UIState.reorder-from >= 0.0 && UIState.scroll-delta != 0.0) {
+                    list-flick.viewport-y = clamp(
+                        list-flick.viewport-y + UIState.scroll-delta * 1px,
+                        min(0px, 112px - (UIState.playlist.length * 32px + 2px)),
+                        0px
+                    );
+                    UIState.reorder-to = clamp(
+                        list-ta.content-row,
+                        0.0,
+                        UIState.playlist.length * 1.0 - 1.0
+                    );
+                }
+            }
 
             // 主题色调叠加层（淡）。
             Rectangle {
@@ -1100,17 +1132,20 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 列表全区覆盖层：按住拖动排序、轻点执行行动作（播放/文件夹/删除）。
-        // 放在 Flickable 之上且不属于它的子节点——列表不再响应拖拽滚动
-        // （滚动用滚轮），从根上消除排序与滚动的手势冲突。
+        // 列表全区覆盖层：轻点执行行动作（播放/文件夹/删除），按住手柄图标
+        // 并拖动进行排序（浮块出现前有一段待命位移，轻点歌曲不再弹出浮块）。
+        // 放在 Flickable 之上且不属于它的子节点——列表不响应拖拽滚动
+        // （滚动用滚轮或拖动到上下边缘自动滚动），无排序/滚动手势冲突。
         // 仅抽屉展开时可见可交互；文件夹/删除按钮由点击横坐标路由。
-        TouchArea {
+        list-ta := TouchArea {
             visible: UIState.playlist-open;
             x: 8px;
             y: root.height - 118px;
             width: root.width - 16px;
             height: 112px;
             property <length> press-mouse-y: 0px;
+            // 按下的行是否落在手柄图标上（行首六点 grip，带少量容差）。
+            property <bool> armed-handle: false;
             // 指针对应的列表内容行（浮点）；内容坐标 = 指针 y - 滚动偏移。
             property <float> content-row: Math.floor(
                 (self.mouse-y - list-flick.viewport-y) / (30px + 2px)
@@ -1126,13 +1161,20 @@ export component MainWindow inherits Window {
             pointer-event(e) => {
                 if e.kind == PointerEventKind.down {
                     press-mouse-y = self.mouse-y;
+                    armed-handle = row-valid && self.mouse-x >= 2px && self.mouse-x <= 25px;
                     if row-valid {
+                        // 待命：仅记录来源行，浮块等真正起拖后才出现。
                         UIState.reorder-from = content-row;
                         UIState.reorder-to = -1.0;
-                        UIState.set-reorder-text(content-row);
                     }
                 } else if e.kind == PointerEventKind.move {
-                    if UIState.reorder-from >= 0.0 {
+                    if armed-handle && UIState.reorder-to < 0.0 {
+                        // 位移超过阈值才真正起拖：填充浮块文本并标记起始目标。
+                        if abs(self.mouse-y - press-mouse-y) > 8px {
+                            UIState.reorder-to = UIState.reorder-from;
+                            UIState.set-reorder-text(UIState.reorder-from);
+                        }
+                    } else if UIState.reorder-to >= 0.0 {
                         UIState.reorder-to = clamp(
                             content-row,
                             0.0,
@@ -1164,12 +1206,14 @@ export component MainWindow inherits Window {
                         UIState.reorder-to = -1.0;
                         UIState.reorder-text = "";
                     }
+                    armed-handle = false;
                 }
             }
-            mouse-cursor: UIState.reorder-from >= 0.0 ? grabbing : pointer;
+            mouse-cursor: UIState.reorder-to >= 0.0 ? grabbing : pointer;
         }
 
         // —— “关于”对话框（覆盖在最上层，点击空白处关闭）——
+        // 打开时窗口级屏蔽滚轮调音量（Rust 侧读 about-open 拦截）。
         Rectangle {
             x: 0px;
             y: 0px;
@@ -1181,22 +1225,37 @@ export component MainWindow inherits Window {
                 clicked => { UIState.about-open = false; }
             }
 
+            // 卡片：深色玻璃 + 主题色调叠加（与列表抽屉同款方案，
+            // 但透明度更低、内容更清晰）。
             Rectangle {
                 x: (root.width - 340px) / 2;
-                y: (root.height - 136px) / 2;
+                y: (root.height - 150px) / 2;
                 width: 340px;
-                height: 136px;
+                height: 150px;
                 border-radius: 16px;
-                background: #171c26f5;
+                background: #10141cee;
+                border-width: 1px;
+                border-color: #ffffff1f;
                 drop-shadow-offset-y: 4px;
                 drop-shadow-blur: 20px;
                 drop-shadow-color: #00000088;
+
+                // 主题色调叠加层（淡）。
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 16px;
+                    background: UIState.theme-color;
+                    opacity: 0.10;
+                }
 
                 VerticalLayout {
                     padding-left: 18px;
                     padding-right: 18px;
                     padding-top: 14px;
-                    padding-bottom: 12px;
+                    padding-bottom: 10px;
                     spacing: 5px;
 
                     Text {
@@ -1205,30 +1264,48 @@ export component MainWindow inherits Window {
                         font-weight: 600;
                         color: #f2f4f8;
                     }
-
-                    // ========== 在此编辑“关于”内容（下面五行文字） ==========
+                    Text {
+                        text: "小巧、优雅、美观的音乐播放器";
+                        font-size: 12px;
+                        color: #d6dbe4;
+                    }
                     Text {
                         text: "开发者：zzhzhouzhou";
                         font-size: 12px;
                         color: #cfd4dd;
                     }
                     Text {
-                        text: "简单、轻量、纯粹的音频播放器";
-                        font-size: 12px;
-                        color: #cfd4dd;
-                        wrap: word-wrap;
-                    }
-                    Text {
-                        text: "技术：Rust · Slint · rodio · symphonia";
-                        font-size: 12px;
-                        color: #cfd4dd;
-                    }
-                    Text {
                         text: "版本：1.1.0";
                         font-size: 12px;
-                        color: #cfd4dd;
+                        color: #9aa3b2;
                     }
-                    // ========== 编辑结束 ==========
+
+                    // 底部联系方式：GitHub 项目仓库图标，点击跳转。
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 30px;
+                            height: 28px;
+                            border-radius: 14px;
+                            background: gh-ta.has-hover
+                                ? UIState.theme-color.with-alpha(0.30)
+                                : #ffffff14;
+                            animate background { duration: 120ms; easing: ease-out; }
+                            Image {
+                                x: (parent.width - 16px) / 2;
+                                y: (parent.height - 16px) / 2;
+                                width: 16px;
+                                height: 16px;
+                                source: @image-url("../icons/github.svg");
+                                image-fit: contain;
+                                image-rendering: smooth;
+                            }
+                            gh-ta := TouchArea {
+                                clicked => { UIState.open-github(); }
+                                mouse-cursor: pointer;
+                            }
+                        }
+                    }
                 }
 
                 IconButton {

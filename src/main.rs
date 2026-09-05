@@ -444,6 +444,8 @@ static FILE_EVENTS: OnceLock<Sender<FileEvent>> = OnceLock::new();
 static ORIGINAL_WNDPROC: OnceLock<isize> = OnceLock::new();
 /// 播放列表抽屉是否打开（打开时滚轮交给列表滚动，不调节音量）。
 static PLAYLIST_OPEN: AtomicBool = AtomicBool::new(false);
+/// “关于”对话框是否打开（打开时滚轮不再调整音量）。
+static ABOUT_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// `SetWindowCompositionAttribute`（未文档化 API）的亚克力策略。
 /// 结构布局参考 winapi 的 `ACCENT_POLICY`。
@@ -1135,8 +1137,11 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_MOUSEWHEEL => {
-            // 播放列表打开时交给列表滚动；否则滚轮调节音量。
-            if PLAYLIST_OPEN.load(Ordering::Relaxed) {
+            // 播放列表打开时交给列表滚动；“关于”打开时不响应（防误调音量）；
+            // 否则滚轮调节音量。
+            if ABOUT_OPEN.load(Ordering::Relaxed) {
+                0
+            } else if PLAYLIST_OPEN.load(Ordering::Relaxed) {
                 unsafe { forward_to_original(hwnd, msg, wparam, lparam) }
             } else {
                 let delta = ((wparam >> 16) as u16 as i16) as i32;
@@ -1369,6 +1374,11 @@ fn main() {
                 if let Some(ui) = ui_weak.upgrade() {
                     let state = ui.global::<UIState>();
                     theme_tween.tick(&state, 0.033);
+                    // “关于”打开状态同步给 WndProc（滚轮隔离判断用）。
+                    let about = state.get_about_open();
+                    if ABOUT_OPEN.load(Ordering::Relaxed) != about {
+                        ABOUT_OPEN.store(about, Ordering::Relaxed);
+                    }
                     // 波形悬停时间提示：仅文本变化时写属性，避免逐帧重排。
                     let frac = state.get_wave_hover_frac();
                     let tip = if frac >= 0.0 && state.get_duration() > 0.0 {
@@ -1402,9 +1412,30 @@ fn main() {
                         if hovered != state.get_toolbar_hovered() {
                             state.set_toolbar_hovered(hovered);
                         }
-                        // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标。
+                        // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标；
+                        // 光标贴近列表上下缘时写入自动滚动增量（33ms 一拍）。
                         if state.get_reorder_from() >= 0.0 {
                             state.set_reorder_y(local_y);
+                            // 列表区：y 60..172；上/下缘 22px 内开始滚动，
+                            // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
+                            const EDGE: f32 = 22.0;
+                            const MAX_SPEED: f32 = 6.0;
+                            let delta = if state.get_reorder_to() >= 0.0 {
+                                if local_y < 60.0 + EDGE {
+                                    -MAX_SPEED * (1.0 - (local_y - 60.0) / EDGE).max(0.15)
+                                } else if local_y > 172.0 - EDGE {
+                                    MAX_SPEED * (1.0 - (172.0 - local_y) / EDGE).max(0.15)
+                                } else {
+                                    0.0
+                                }
+                            } else {
+                                0.0
+                            };
+                            if delta != state.get_scroll_delta() {
+                                state.set_scroll_delta(delta);
+                            }
+                        } else if state.get_scroll_delta() != 0.0 {
+                            state.set_scroll_delta(0.0);
                         }
                         // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
                         // 避免覆盖层收不到“离开”事件导致的高亮滞留。
@@ -1614,6 +1645,17 @@ fn main() {
             }
         });
     }
+    // “关于”里的 GitHub 图标：跳转到项目仓库。
+    {
+        ui.global::<UIState>().on_open_github(move || {
+            let _ = std::process::Command::new("rundll32")
+                .args([
+                    "url.dll,FileProtocolHandler",
+                    "https://github.com/zzhzhouzhou/zzh-music-player",
+                ])
+                .spawn();
+        });
+    }
     // 列表拖动排序：把 from 行移动到 to 位置（Slint 传来 float，此处取整钳制）。
     {
         let ui_weak = ui.as_weak();
@@ -1818,6 +1860,11 @@ fn main() {
     if std::env::var("ZZH_OPEN_PLAYLIST").as_deref() == Ok("1") {
         state.set_playlist_open(true);
         PLAYLIST_OPEN.store(true, Ordering::Relaxed);
+    }
+    // 测试辅助：ZZH_OPEN_ABOUT=1 启动时直接打开“关于”对话框。
+    if std::env::var("ZZH_OPEN_ABOUT").as_deref() == Ok("1") {
+        state.set_about_open(true);
+        ABOUT_OPEN.store(true, Ordering::Relaxed);
     }
     if let Some(cur) = &settings.current
         && let Some(idx) = playlist.borrow().iter().position(|p| p == cur)
