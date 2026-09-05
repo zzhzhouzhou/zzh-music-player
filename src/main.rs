@@ -9,12 +9,13 @@ mod waveform_generator;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use audio_engine::{AudioEngine, Command, Event, PlaybackMode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -81,6 +82,7 @@ const SINGLE_INSTANCE_RETRIES: u32 = 20;
 /// 波形生成结果（后台线程产出，UI 线程消费；SharedPixelBuffer 为 Send）。
 /// 相比旧版的两张全宽位图，这里只保存 160 个条形高度与小尺寸封面缩略图，
 /// 单首占用从约 1MB 降到 100KB 以内。
+#[derive(Clone)]
 struct WaveformResult {
     path: PathBuf,
     /// UI 波形条的相对高度（0.0 ~ 1.0）。
@@ -95,12 +97,345 @@ struct WaveformResult {
 /// 文件相关外部事件（OS 拖拽 / 双击 / 滚轮 / 单例转发），经通道由 UI 线程统一处理。
 enum FileEvent {
     Dropped(Vec<PathBuf>),
+    /// 文件夹后台扫描产出的音频文件批次（每 50 个一批，渐进式加入列表）。
+    DroppedBatch(Vec<PathBuf>),
     /// 已运行实例通过 WM_COPYDATA 转发的“用本播放器打开”文件。
     OpenFiles(Vec<PathBuf>),
     DoubleClick,
     Wheel(i32),
     /// 关闭请求（右上角按钮或系统 WM_CLOSE）。
     CloseRequest,
+}
+
+/// 波形磁盘缓存目录大小上限：超过后按“最早使用”优先删除（LRU）。
+/// 每条缓存约 1~2KB（160 根波形条 + 元数据 + 封面缩略图 PNG），
+/// 50MB 足够存放上万首歌曲的缓存。
+const WAVE_CACHE_CAP: u64 = 50 * 1024 * 1024;
+/// 波形磁盘缓存文件魔数与版本。
+const WAVE_CACHE_MAGIC: &[u8; 4] = b"ZWFC";
+const WAVE_CACHE_VERSION: u8 = 1;
+/// 文件夹拖入扫描的单批文件数：搜到一批就交给 UI 渐进式追加。
+const FOLDER_SCAN_BATCH: usize = 50;
+/// 文件夹扫描的单次上限（防止误拖整个盘符导致无限扫描）。
+const FOLDER_SCAN_MAX_FILES: usize = 10000;
+
+/// FNV-1a 64 位哈希（缓存文件名用：源路径 + 修改时间）。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// 波形磁盘缓存目录：%APPDATA%\zzhMusicPlayer\wavecache。
+fn wave_cache_dir() -> PathBuf {
+    settings_path()
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("wavecache")
+}
+
+/// 计算源文件对应的缓存文件路径与当前修改时间（秒）。
+/// 文件名只哈希源路径；修改时间存在文件内部（写入与读取时校验），
+/// 源文件被替换后同键命中即检测过期并就地删除，不会残留孤儿缓存。
+fn wave_cache_key(path: &Path) -> Option<(PathBuf, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = format!(
+        "{:016x}.waveform",
+        fnv1a64(path.to_string_lossy().as_bytes())
+    );
+    Some((wave_cache_dir().join(name), mtime))
+}
+
+/// 小端写辅助。
+struct CacheWriter(Vec<u8>);
+
+impl CacheWriter {
+    fn new() -> Self {
+        Self(Vec::with_capacity(2048))
+    }
+    fn bytes(mut self, b: &[u8]) -> Self {
+        self.0.extend_from_slice(b);
+        self
+    }
+    fn u8v(mut self, v: u8) -> Self {
+        self.0.push(v);
+        self
+    }
+    fn u16v(mut self, v: u16) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn u32v(mut self, v: u32) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn u64v(mut self, v: u64) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    fn f32v(mut self, v: f32) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+    /// 可选字符串：u8 存在标志 + u16 长度 + UTF-8 字节。
+    fn opt_str(self, s: &Option<String>) -> Self {
+        match s {
+            Some(t) => {
+                let bytes = t.as_bytes();
+                let len = bytes.len().min(u16::MAX as usize) as u16;
+                self.u8v(1).u16v(len).bytes(&bytes[..len as usize])
+            }
+            None => self.u8v(0),
+        }
+    }
+}
+
+/// 小端读辅助。
+struct CacheReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CacheReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.pos + n > self.data.len() {
+            return None;
+        }
+        let s = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Some(s)
+    }
+    fn u8v(&mut self) -> Option<u8> {
+        self.take(1).map(|s| s[0])
+    }
+    fn u16v(&mut self) -> Option<u16> {
+        self.take(2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn u32v(&mut self) -> Option<u32> {
+        self.take(4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64v(&mut self) -> Option<u64> {
+        let s = self.take(8)?;
+        Some(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+    fn f32v(&mut self) -> Option<f32> {
+        let s = self.take(4)?;
+        Some(f32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn opt_str(&mut self) -> Option<Option<String>> {
+        match self.u8v()? {
+            0 => Some(None),
+            _ => {
+                let len = self.u16v()? as usize;
+                let bytes = self.take(len)?;
+                Some(Some(String::from_utf8_lossy(bytes).into_owned()))
+            }
+        }
+    }
+}
+
+/// 把波形分析结果写入磁盘缓存（后台线程调用）。
+/// 内容：魔数 + 版本 + 源 mtime + 源路径 + 时长 + 波形条 + 主题色 +
+/// 标题/艺术家 + 封面缩略图（PNG 压缩，几十 KB 内）。
+fn write_wave_cache(res: &WaveformResult) {
+    let Some((cache_path, mtime)) = wave_cache_key(&res.path) else {
+        return;
+    };
+    // 封面缩略图编码为 PNG（RGBA → PNG 通常缩到 1/3 以下）。
+    let cover_png: Option<Vec<u8>> = res.cover.as_ref().and_then(|buf| {
+        let w = buf.width();
+        let h = buf.height();
+        image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()).and_then(|img| {
+            let mut png = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .map(|_| png)
+                .ok()
+        })
+    });
+    let mut w = CacheWriter::new()
+        .bytes(WAVE_CACHE_MAGIC)
+        .u8v(WAVE_CACHE_VERSION)
+        .u64v(mtime);
+    let path_string = res.path.to_string_lossy().into_owned();
+    let path_bytes = path_string.as_bytes();
+    w = w.u16v(path_bytes.len().min(u16::MAX as usize) as u16);
+    w = w.bytes(&path_bytes[..path_bytes.len().min(u16::MAX as usize)]);
+    w = w
+        .f32v(res.duration.as_secs_f32())
+        .u16v(res.bars.len() as u16);
+    for &b in &res.bars {
+        w = w.f32v(b);
+    }
+    w = w.bytes(&res.theme);
+    w = w.opt_str(&res.title).opt_str(&res.artist);
+    match cover_png {
+        Some(png) => w = w.u8v(1).u32v(png.len() as u32).bytes(&png),
+        None => w = w.u8v(0),
+    }
+    let _ = std::fs::create_dir_all(cache_path.parent().unwrap_or(Path::new(".")));
+    let tmp = cache_path.with_extension("tmp");
+    if std::fs::write(&tmp, w.0).is_ok() {
+        // 原子替换：写临时文件再改名，避免读到半截缓存。
+        let _ = std::fs::rename(&tmp, &cache_path);
+    }
+}
+
+/// 读取源文件的波形磁盘缓存（UI 线程调用，命中时免去整曲解码）。
+/// 键含源文件修改时间：内容被替换过的缓存直接作废删除。
+/// 命中时把访问时间刷新到现在（LRU 依据）。
+fn read_wave_cache(path: &Path) -> Option<WaveformResult> {
+    let (cache_path, mtime) = wave_cache_key(path)?;
+    let data = std::fs::read(&cache_path).ok()?;
+    let mut r = CacheReader::new(&data);
+    if r.take(4)? != WAVE_CACHE_MAGIC || r.u8v()? != WAVE_CACHE_VERSION {
+        return None;
+    }
+    if r.u64v()? != mtime {
+        // 源文件已被替换：缓存作废，顺手删除。
+        let _ = std::fs::remove_file(&cache_path);
+        return None;
+    }
+    // 源路径（孤儿清理用，此处跳过）。
+    let path_len = r.u16v()? as usize;
+    let src = String::from_utf8_lossy(r.take(path_len)?).into_owned();
+    let duration = Duration::from_secs_f32(r.f32v()?);
+    let bars_len = r.u16v()? as usize;
+    if bars_len != waveform_generator::WAVE_BARS {
+        return None;
+    }
+    let mut bars = Vec::with_capacity(bars_len);
+    for _ in 0..bars_len {
+        bars.push(r.f32v()?);
+    }
+    let theme_bytes = r.take(3)?;
+    let theme = [theme_bytes[0], theme_bytes[1], theme_bytes[2]];
+    let title = r.opt_str()?;
+    let artist = r.opt_str()?;
+    let cover = match r.u8v()? {
+        0 => None,
+        _ => {
+            let len = r.u32v()? as usize;
+            let png = r.take(len)?;
+            let img = image::load_from_memory(png).ok()?;
+            let rgba = img.to_rgba8();
+            let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(rgba.width(), rgba.height());
+            buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
+            Some(buf)
+        }
+    };
+    // LRU 触碰：把缓存文件修改时间刷到现在。
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&cache_path) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+    let _ = src;
+    Some(WaveformResult {
+        path: path.to_path_buf(),
+        bars,
+        duration,
+        title,
+        artist,
+        theme,
+        cover,
+    })
+}
+
+/// 启动时的缓存维护（后台线程）：
+/// 1. 删除源文件已不存在的孤儿缓存；
+/// 2. 总大小超过上限时按修改时间从旧到新删除（保留约 80% 容量）。
+fn trim_wave_cache() {
+    let dir = wave_cache_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut items: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("waveform") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        // 读文件头里的源路径，源不存在即为孤儿。
+        if let Ok(mut f) = std::fs::File::open(&p) {
+            let mut head = vec![0u8; 512];
+            let n = f.read(&mut head).unwrap_or(0);
+            let mut r = CacheReader::new(&head[..n]);
+            let is_orphan = r.take(4).map(|m| m != WAVE_CACHE_MAGIC).unwrap_or(true) || {
+                (|| {
+                    if r.u8v()? != WAVE_CACHE_VERSION {
+                        return Some(true);
+                    }
+                    let _ = r.u64v()?;
+                    let len = r.u16v()? as usize;
+                    let src = String::from_utf8_lossy(r.take(len)?).into_owned();
+                    Some(!Path::new(&src).is_file())
+                })()
+                .unwrap_or(true)
+            };
+            if is_orphan {
+                let _ = std::fs::remove_file(&p);
+                continue;
+            }
+        }
+        let size = meta.len();
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        total += size;
+        items.push((modified, size, p));
+    }
+    if total <= WAVE_CACHE_CAP {
+        return;
+    }
+    items.sort_by_key(|(t, _, _)| *t);
+    let target = WAVE_CACHE_CAP * 80 / 100;
+    for (_, size, p) in items {
+        if total <= target {
+            break;
+        }
+        if std::fs::remove_file(p).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
+/// 预取播放列表中下一首的波形（当前曲目波形就绪后调用）。
+/// 磁盘或内存已有缓存则跳过；用户切歌时后台取消机制会自动让路。
+fn prefetch_next_track(
+    state: &UIState,
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    waveform_cache: &Rc<RefCell<HashMap<PathBuf, WaveformResult>>>,
+    wave_tx: &Sender<PathBuf>,
+) {
+    let len = playlist.borrow().len();
+    if len <= 1 {
+        return;
+    }
+    let cur = state.get_playlist_current();
+    let next = ((cur + 1).rem_euclid(len as i32)) as usize;
+    let path = playlist.borrow()[next].clone();
+    if waveform_cache.borrow().contains_key(&path) {
+        return;
+    }
+    if let Some((cache_path, _)) = wave_cache_key(&path)
+        && cache_path.is_file()
+    {
+        return;
+    }
+    let _ = wave_tx.send(path);
 }
 
 /// WndProc 与 UI 线程之间的文件事件通道。
@@ -265,6 +600,8 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
                 });
                 match result {
                     Ok(res) => {
+                        // 先落盘缓存（后台线程 IO），再交付 UI；下次播放同曲零解码。
+                        write_wave_cache(&res);
                         if res_tx.send(res).is_err() {
                             break;
                         }
@@ -482,6 +819,84 @@ fn add_track(
         audio.send(Command::PlayAt(idx));
     }
     Some(idx)
+}
+
+/// 批量加入播放列表（文件夹扫描批次用）：全部追加后只发一次 SetPlaylist，
+/// 空闲时自动播放首个新加入的曲目。
+fn add_tracks_batch(
+    paths: &[PathBuf],
+    playlist: &Rc<RefCell<Vec<PathBuf>>>,
+    model: &Rc<VecModel<SharedString>>,
+    state: &UIState,
+    audio: &AudioEngine,
+) {
+    let mut added = 0usize;
+    let mut first: Option<usize> = None;
+    {
+        let mut list = playlist.borrow_mut();
+        for path in paths {
+            if !path.is_file() || list.contains(path) {
+                continue;
+            }
+            list.push(path.clone());
+            model.push(track_name(path).into());
+            if first.is_none() {
+                first = Some(list.len() - 1);
+            }
+            added += 1;
+        }
+    }
+    if added > 0 {
+        audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+        if state.get_playlist_current() < 0
+            && let Some(i) = first
+        {
+            state.set_playlist_current(i as i32);
+            audio.send(Command::PlayAt(i));
+        }
+    }
+}
+
+/// 后台递归扫描文件夹中的音频文件，每凑满一批（50 个）就发回 UI 渐进式追加，
+/// 大文件夹也能立刻看到列表在增长。递归深度上限 6 层，总量上限 1 万个。
+fn spawn_folder_scan(root: PathBuf, tx: Sender<FileEvent>) {
+    let _ = std::thread::Builder::new()
+        .name("folderscan".to_string())
+        .spawn(move || {
+            const AUDIO_EXTS: [&str; 6] = ["mp3", "flac", "wav", "ogg", "m4a", "aac"];
+            let mut stack: Vec<(PathBuf, usize)> = vec![(root, 0)];
+            let mut batch: Vec<PathBuf> = Vec::new();
+            let mut total = 0usize;
+            'outer: while let Some((dir, depth)) = stack.pop() {
+                let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                let mut entries: Vec<_> = read_dir.filter_map(Result::ok).collect();
+                entries.sort_by_key(|e| e.file_name());
+                for entry in entries {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        if depth < 6 {
+                            stack.push((p, depth + 1));
+                        }
+                    } else if p.extension().is_some_and(|ext| {
+                        AUDIO_EXTS.contains(&ext.to_ascii_lowercase().to_string_lossy().as_ref())
+                    }) {
+                        batch.push(p);
+                        total += 1;
+                        if batch.len() >= FOLDER_SCAN_BATCH {
+                            let _ = tx.send(FileEvent::DroppedBatch(std::mem::take(&mut batch)));
+                        }
+                        if total >= FOLDER_SCAN_MAX_FILES {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(FileEvent::DroppedBatch(batch));
+            }
+        });
 }
 
 /// 播放列表中的指定曲目。
@@ -954,6 +1369,20 @@ fn main() {
                 if let Some(ui) = ui_weak.upgrade() {
                     let state = ui.global::<UIState>();
                     theme_tween.tick(&state, 0.033);
+                    // 波形悬停时间提示：仅文本变化时写属性，避免逐帧重排。
+                    let frac = state.get_wave_hover_frac();
+                    let tip = if frac >= 0.0 && state.get_duration() > 0.0 {
+                        slint::SharedString::from(format!(
+                            "{} / {}",
+                            format_time(frac * state.get_duration()),
+                            state.get_duration_text()
+                        ))
+                    } else {
+                        slint::SharedString::from("")
+                    };
+                    if tip != state.get_tooltip_text() {
+                        state.set_tooltip_text(tip);
+                    }
                     if state.get_playing() {
                         let t = state.get_particle_time() + 0.033;
                         state.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
@@ -1148,6 +1577,62 @@ fn main() {
             play_at(index as usize, &playlist, &state, &audio);
         });
     }
+    // 列表拖动排序：把 from 行移动到 to 位置（Slint 传来 float，此处取整钳制）。
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let model = Rc::clone(&playlist_model);
+        let audio = audio.clone();
+        ui.global::<UIState>().on_move_track(move |from, to| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let state = ui.global::<UIState>();
+            let len = playlist.borrow().len();
+            let from = from.round().max(0.0) as usize;
+            let to = (to.round().max(0.0) as usize).min(len.saturating_sub(1));
+            if from >= len || from == to {
+                return;
+            }
+            let item = playlist.borrow_mut().remove(from);
+            playlist.borrow_mut().insert(to, item);
+            let name = model.remove(from);
+            model.insert(to, name);
+            // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
+            let cur = state.get_playlist_current() as i64;
+            let (f, t) = (from as i64, to as i64);
+            let new_cur = if cur == f {
+                t
+            } else if f < cur && cur <= t {
+                cur - 1
+            } else if t <= cur && cur < f {
+                cur + 1
+            } else {
+                cur
+            };
+            state.set_playlist_current(new_cur as i32);
+            state.set_playlist(ModelRc::from(model.clone()));
+            audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+        });
+    }
+    // 在资源管理器中打开曲目所在文件夹并选中文件。
+    {
+        let playlist = Rc::clone(&playlist);
+        ui.global::<UIState>().on_open_folder(move |index| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                if let Some(p) = playlist.borrow().get(index as usize) {
+                    // explorer /select,"路径"：打开文件夹并高亮该文件。
+                    let _ = std::process::Command::new("explorer.exe")
+                        .raw_arg(format!("/select,\"{}\"", p.display()))
+                        .spawn();
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = index;
+            }
+        });
+    }
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
@@ -1313,7 +1798,9 @@ fn main() {
     }
     for arg in args {
         let path = PathBuf::from(arg);
-        if path.is_file() {
+        if path.is_dir() {
+            spawn_folder_scan(path, file_tx.clone());
+        } else if path.is_file() {
             let _ = add_track(path, &playlist, &playlist_model, &state, &audio);
         }
     }
@@ -1356,8 +1843,46 @@ fn main() {
                             let idx = playlist.borrow().iter().position(|p| *p == path);
                             state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
                             if let Some(res) = waveform_cache.borrow().get(&path) {
-                                // 缓存命中时直接复用，切歌几乎无感。
-                                apply_waveform(&state, res, &wave_bars_model, &bg_front, &theme_tween);
+                                // 内存缓存命中时直接复用，切歌几乎无感。
+                                apply_waveform(
+                                    &state,
+                                    res,
+                                    &wave_bars_model,
+                                    &bg_front,
+                                    &theme_tween,
+                                );
+                                prefetch_next_track(&state, &playlist, &waveform_cache, &wave_tx);
+                            } else if let Some(res) = read_wave_cache(&path) {
+                                // 磁盘缓存命中：免整曲解码，元数据/封面/波形一步到位。
+                                {
+                                    let mut cache = waveform_cache.borrow_mut();
+                                    if !cache.contains_key(&path) {
+                                        cache_order.borrow_mut().push_back(path.clone());
+                                        if cache_order.borrow().len() > WAVE_CACHE_LIMIT
+                                            && let Some(oldest) =
+                                                cache_order.borrow_mut().pop_front()
+                                        {
+                                            cache.remove(&oldest);
+                                        }
+                                    }
+                                    cache.insert(path.clone(), res);
+                                }
+                                let res = waveform_cache.borrow().get(&path).cloned();
+                                if let Some(res) = res.as_ref() {
+                                    apply_waveform(
+                                        &state,
+                                        res,
+                                        &wave_bars_model,
+                                        &bg_front,
+                                        &theme_tween,
+                                    );
+                                    prefetch_next_track(
+                                        &state,
+                                        &playlist,
+                                        &waveform_cache,
+                                        &wave_tx,
+                                    );
+                                }
                             } else {
                                 // 音频已开始播放，波形分析在后台进行。先显示轻量占位波形，
                                 // 不让用户等分析完成才看到可操作的进度区；结果回来后再平滑替换。
@@ -1462,8 +1987,18 @@ fn main() {
                     match evt {
                         FileEvent::Dropped(paths) => {
                             for path in paths {
-                                let _ = add_track(path, &playlist, &playlist_model, &state, &audio);
+                                if path.is_dir() {
+                                    // 文件夹：后台线程递归扫描，每 50 个一批渐进式追加，
+                                    // 大文件夹也能立刻看到列表在增长。
+                                    spawn_folder_scan(path, file_tx.clone());
+                                } else {
+                                    let _ =
+                                        add_track(path, &playlist, &playlist_model, &state, &audio);
+                                }
                             }
+                        }
+                        FileEvent::DroppedBatch(paths) => {
+                            add_tracks_batch(&paths, &playlist, &playlist_model, &state, &audio);
                         }
                         FileEvent::OpenFiles(paths) => {
                             // 第二个实例转发的“打开方式”文件：首个立即播放（即使已在列表中），其余仅加入列表。
@@ -1524,7 +2059,15 @@ fn main() {
                     if is_current {
                         let cache = waveform_cache.borrow();
                         if let Some(cached) = cache.get(current_path.as_ref().unwrap().as_path()) {
-                            apply_waveform(&state, cached, &wave_bars_model, &bg_front, &theme_tween);
+                            apply_waveform(
+                                &state,
+                                cached,
+                                &wave_bars_model,
+                                &bg_front,
+                                &theme_tween,
+                            );
+                            drop(cache);
+                            prefetch_next_track(&state, &playlist, &waveform_cache, &wave_tx);
                         }
                     }
                 }
@@ -1532,5 +2075,60 @@ fn main() {
         );
     }
 
+    // 波形磁盘缓存维护（孤儿清理 + LRU 上限）放到后台线程，不阻塞启动。
+    let _ = std::thread::Builder::new()
+        .name("wavecache-trim".to_string())
+        .spawn(trim_wave_cache);
+
     ui.run().expect("UI 事件循环失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 波形磁盘缓存读写回环：写入后应能原样读回（含封面 PNG 往返）。
+    #[test]
+    fn wave_cache_roundtrip() {
+        // 把缓存目录指到临时目录，避免污染真实用户配置。
+        let fake_appdata = std::env::temp_dir().join("zzh_cache_test_env");
+        let _ = std::fs::create_dir_all(&fake_appdata);
+        // Edition 2024 中 set_var 为 unsafe：测试进程内单线程使用此处安全。
+        unsafe { std::env::set_var("APPDATA", &fake_appdata) };
+
+        let src = fake_appdata.join("song.wav");
+        std::fs::write(&src, b"not really audio").unwrap();
+        let cover = SharedPixelBuffer::<Rgba8Pixel>::new(4, 4);
+        let res = WaveformResult {
+            path: src.clone(),
+            bars: (0..waveform_generator::WAVE_BARS)
+                .map(|i| i as f32 / 1000.0)
+                .collect(),
+            duration: Duration::from_secs(95),
+            title: Some("测试曲目".into()),
+            artist: None,
+            theme: [1, 2, 3],
+            cover: Some(cover),
+        };
+        write_wave_cache(&res);
+
+        let (cache_path, _) = wave_cache_key(&src).expect("cache key");
+        assert!(cache_path.is_file(), "缓存文件未生成: {:?}", cache_path);
+        let read = read_wave_cache(&src).expect("缓存读取失败");
+        assert_eq!(read.bars.len(), waveform_generator::WAVE_BARS);
+        assert_eq!(read.theme, [1, 2, 3]);
+        assert_eq!(read.title.as_deref(), Some("测试曲目"));
+        assert!(read.artist.is_none());
+        assert!(read.cover.is_some());
+        assert_eq!(read.cover.as_ref().unwrap().width(), 4);
+
+        // 源文件 mtime 变化后旧缓存应作废并删除。
+        let file = std::fs::OpenOptions::new().append(true).open(&src).unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(5)).unwrap();
+        drop(file);
+        assert!(read_wave_cache(&src).is_none(), "过期缓存应失效");
+        assert!(!cache_path.is_file(), "过期缓存应被删除");
+
+        let _ = std::fs::remove_dir_all(&fake_appdata);
+    }
 }

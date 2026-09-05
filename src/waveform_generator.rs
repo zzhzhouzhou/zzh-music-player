@@ -922,10 +922,7 @@ mod tests {
         };
         let (q, l) = (seg(0), seg(3));
         assert!(l > 0.8, "最响段应接近满高: {l}");
-        assert!(
-            q < l - 0.25,
-            "响度战拉伸失效，段落仍挤在一起: {q} vs {l}"
-        );
+        assert!(q < l - 0.25, "响度战拉伸失效，段落仍挤在一起: {q} vs {l}");
         assert!(bars.iter().all(|&v| (0.0..=1.0).contains(&v)), "波形条越界");
     }
 

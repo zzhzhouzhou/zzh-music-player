@@ -41,6 +41,14 @@ export global UIState {
     in-out property <[string]> playlist: [];
     in-out property <int> playlist-current: -1;
     in-out property <bool> playlist-open: false;
+    // 列表拖动排序：reorder-from >= 0 表示正在拖动 index 行，
+    // reorder-to 是当前悬停目标位置（float：Slint 无整数转换，由 Rust 侧取整）。
+    in-out property <float> reorder-from: -1.0;
+    in-out property <float> reorder-to: -1.0;
+    // 波形悬停：鼠标在波形区的相对位置（-1 = 未悬停）与时间提示文本
+    // （Rust 侧 33ms 计时器按 hover 位置格式化，仅变化时写入）。
+    in-out property <float> wave-hover-frac: -1.0;
+    in-out property <string> tooltip-text: "";
     // 播放模式提示。
     in-out property <string> mode-text: "顺序播放";
     in-out property <bool> mode-showing: false;
@@ -58,6 +66,8 @@ export global UIState {
     callback cycle-mode();
     callback play-at(int);
     callback remove-track(int);
+    callback move-track(float, float);
+    callback open-folder(int);
     callback clear-playlist();
     callback toggle-playlist();
     callback seek-requested(float);
@@ -237,17 +247,22 @@ component PlaylistRow inherits Rectangle {
     in property <int> index;
     callback clicked();
     callback remove();
+    callback open-folder();
 
     height: 30px;
     border-radius: 8px;
-    background: index == UIState.playlist-current
-        ? UIState.theme-color.with-alpha(0.20)
-        : (row-ta.has-hover ? #ffffff0d : transparent);
+    background: Math.abs(index - UIState.reorder-to) < 0.5
+            && UIState.reorder-from >= 0
+            && Math.abs(UIState.reorder-from - UIState.reorder-to) > 0.5
+        ? UIState.theme-color.with-alpha(0.32)
+        : index == UIState.playlist-current
+            ? UIState.theme-color.with-alpha(0.20)
+            : (row-ta.has-hover ? #ffffff0d : transparent);
     animate background { duration: 100ms; easing: ease-out; }
 
     Text {
         x: 12px;
-        width: parent.width - 84px;
+        width: parent.width - 118px;
         height: 100%;
         text: root.text;
         color: index == UIState.playlist-current ? #ffffff : #c6ccd6;
@@ -259,7 +274,7 @@ component PlaylistRow inherits Rectangle {
     // 正在播放的迷你均衡器（复用全局粒子时钟；暂停时静止为短柱）。
     Rectangle {
         visible: index == UIState.playlist-current;
-        x: parent.width - 56px;
+        x: parent.width - 80px;
         y: (parent.height - 12px) / 2;
         width: 13px;
         height: 12px;
@@ -293,9 +308,60 @@ component PlaylistRow inherits Rectangle {
         }
     }
 
+    // 整行 TouchArea：普通点击播放；按住纵向拖动（>8px）进入排序预览，
+    // 松手时若目标位置有变化则提交 move-track。鼠标样式随状态切换。
     row-ta := TouchArea {
-        clicked => { root.clicked(); }
-        mouse-cursor: pointer;
+        property <length> press-y: 0.0;
+        property <bool> dragging: UIState.reorder-from == index;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                press-y = self.mouse-y;
+                UIState.reorder-from = index;
+                UIState.reorder-to = -1.0;
+            } else if e.kind == PointerEventKind.move && UIState.reorder-from == index {
+                if UIState.reorder-to < 0.0 {
+                    if abs(self.mouse-y - press-y) > 8px {
+                        UIState.reorder-to = index;
+                    }
+                } else {
+                    UIState.reorder-to = clamp(
+                        index + (self.mouse-y - press-y) / (30px + 2px),
+                        0.0,
+                        UIState.playlist.length * 1.0 - 1.0
+                    );
+                }
+            } else if e.kind == PointerEventKind.up {
+                if UIState.reorder-from == index {
+                    if UIState.reorder-to >= 0.0
+                        && Math.abs(UIState.reorder-to - index) > 0.5
+                    {
+                        UIState.move-track(UIState.reorder-from, UIState.reorder-to);
+                    } else if UIState.reorder-to < 0.0 {
+                        root.clicked();
+                    }
+                    UIState.reorder-from = -1.0;
+                    UIState.reorder-to = -1.0;
+                }
+            }
+        }
+        mouse-cursor: UIState.reorder-from >= 0 ? grabbing : pointer;
+    }
+
+    // 打开所在文件夹按钮（删除按钮左侧）。
+    Image {
+        x: parent.width - 54px;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        source: @image-url("../icons/文件夹.svg");
+        image-fit: contain;
+        image-rendering: smooth;
+        opacity: folder-ta.has-hover ? 1.0 : (row-ta.has-hover || index == UIState.playlist-current ? 0.75 : 0.35);
+        animate opacity { duration: 120ms; }
+        folder-ta := TouchArea {
+            clicked => { root.open-folder(); }
+            mouse-cursor: pointer;
+        }
     }
 
     // 删除按钮放在最后（z 序最上层），避免被整行的 TouchArea 盖住而无法点击。
@@ -307,9 +373,9 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/删除.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: row-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45;
+        opacity: del-ta.has-hover ? 1.0 : (row-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45);
         animate opacity { duration: 120ms; }
-        TouchArea {
+        del-ta := TouchArea {
             clicked => { root.remove(); }
             mouse-cursor: pointer;
         }
@@ -406,6 +472,10 @@ component WaveformArea inherits Rectangle {
         animate opacity { duration: 200ms; }
     }
 
+    // 悬停位置上报（Rust 侧 33ms 计时器读取并格式化时间提示，仅变化时写入）。
+    property <float> hover-frac: ta.has-hover ? clamp(ta.mouse-x / root.width, 0.0, 1.0) : -1.0;
+    changed hover-frac => { UIState.wave-hover-frac = self.hover-frac; }
+
     // 悬停指示线（鼠标在波形区移动时预览落点）。
     Rectangle {
         visible: ta.has-hover;
@@ -414,6 +484,33 @@ component WaveformArea inherits Rectangle {
         width: 1px;
         height: root.height * 0.72;
         background: #ffffff59;
+    }
+
+    // 悬停时间提示：气泡浮在指示线上方，显示“悬停位置 / 总时长”。
+    Rectangle {
+        visible: ta.has-hover && UIState.tooltip-text != "";
+        x: clamp(ta.mouse-x - self.width / 2, 2px, root.width - self.width - 2px);
+        y: -30px;
+        width: tip-text.preferred-width + 20px;
+        height: 22px;
+        border-radius: 11px;
+        background: #131823ee;
+        border-width: 1px;
+        border-color: #ffffff1c;
+        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 6px;
+        drop-shadow-color: #00000066;
+
+        tip-text := Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: 100%;
+            text: UIState.tooltip-text;
+            font-size: 11px;
+            color: #eef1f6;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     // 点击/拖拽跳转（按下后 Slint 捕获指针，mouse-x 持续跟随）。
@@ -842,15 +939,25 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 播放列表抽屉：从底部滑出。
+        // 播放列表抽屉：从底部滑出。半透明深底透出下层渐变，呈现毛玻璃观感；
+        // 顶部 1px 高光勾边增强玻璃质感。
         Rectangle {
             x: 0px;
             y: UIState.playlist-open ? root.height - 160px : root.height;
             width: root.width;
             height: 160px;
-            background: #151a23f5;
+            background: #10141cd9;
             border-radius: 14px;
             animate y { duration: 220ms; easing: ease-out; }
+
+            // 玻璃顶缘高光。
+            Rectangle {
+                x: 12px;
+                y: 0px;
+                width: parent.width - 24px;
+                height: 1px;
+                background: @linear-gradient(90deg, transparent 0%, #ffffff38 50%, transparent 100%);
+            }
 
             // 顶部拖动把手装饰。
             Rectangle {
@@ -924,6 +1031,7 @@ export component MainWindow inherits Window {
                         index: i;
                         clicked => { UIState.play-at(i); }
                         remove => { UIState.remove-track(i); }
+                        open-folder => { UIState.open-folder(i); }
                     }
                 }
             }

@@ -121,6 +121,26 @@ impl AudioEngine {
     }
 }
 
+/// 音量淡变时长（切歌淡出 / 暂停淡出）。
+const FADE_OUT_MS: u64 = 220;
+/// 音量淡入时长（切歌淡入 / 恢复播放淡入）。
+const FADE_IN_MS: u64 = 320;
+/// 淡变的步进间隔（每步重设一次音量，30ms 步长听感平滑且 CPU 可忽略）。
+const FADE_STEP_MS: u64 = 30;
+
+/// 在 `from` 与 `to` 之间线性淡变播放音量（阻塞音频线程约 ms 毫秒）。
+/// 期间到达的 UI 命令在通道中排队，淡变结束后依次处理。
+fn fade_volume(player: &Player, from: f32, to: f32, ms: u64) {
+    let steps = (ms / FADE_STEP_MS).max(1);
+    let delay = Duration::from_millis(ms / steps);
+    for i in 1..=steps {
+        let t = i as f32 / steps as f32;
+        player.set_volume(from + (to - from) * t);
+        std::thread::sleep(delay);
+    }
+    player.set_volume(to);
+}
+
 /// 音频线程主循环：处理命令 + 每 50ms 上报位置、检测播放结束。
 fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let device_sink = match DeviceSinkBuilder::open_default_sink() {
@@ -137,6 +157,8 @@ fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
     let mut index: Option<usize> = None;
     let mut paused = false;
     let mut mode = PlaybackMode::Sequential;
+    // UI 侧目标音量（0.0~1.0）：淡变在它与 0 之间进行。
+    let mut volume = 1.0f32;
     // 极简 xorshift 随机数状态（随机模式用，避免引入额外依赖）。
     let mut rng = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -151,6 +173,7 @@ fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                 &mut index,
                 &mut paused,
                 &mut mode,
+                &mut volume,
                 &mut rng,
                 command,
                 &tx,
@@ -165,6 +188,7 @@ fn engine_loop(rx: Receiver<Command>, tx: Sender<Event>) {
                             &mut index,
                             &mut paused,
                             mode,
+                            volume,
                             &mut rng,
                             &tx,
                         );
@@ -186,6 +210,7 @@ fn handle_command(
     index: &mut Option<usize>,
     paused: &mut bool,
     mode: &mut PlaybackMode,
+    volume: &mut f32,
     rng: &mut u64,
     command: Command,
     tx: &Sender<Event>,
@@ -194,7 +219,7 @@ fn handle_command(
         Command::PlayAt(i) => {
             if i < playlist.len() {
                 *index = Some(i);
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, *volume, tx);
             }
         }
         Command::RemoveAt(i) => {
@@ -217,7 +242,7 @@ fn handle_command(
                     // 正在播放的曲目被删除：自动切到下一首（末尾则回到开头）。
                     let next = index.map_or(0, |ci| (ci + 1) % playlist.len());
                     *index = Some(next);
-                    start_and_notify(player, playlist, index, paused, tx);
+                    start_and_notify(player, playlist, index, paused, *volume, tx);
                 }
             }
         }
@@ -231,11 +256,16 @@ fn handle_command(
         }
         Command::Toggle => {
             if *paused {
+                // 恢复播放：立即出声，音量从 0 平滑淡入到目标。
                 player.play();
+                *paused = false;
+                fade_volume(player, 0.0, *volume, FADE_IN_MS);
             } else {
+                // 暂停：音量缓缓淡出到 0 再挂起，听感平滑。
+                *paused = true;
+                fade_volume(player, *volume, 0.0, FADE_OUT_MS);
                 player.pause();
             }
-            *paused = !*paused;
         }
         Command::Seek(pos) => {
             // 播放到结尾后播放源已结束（empty）：若此时拖回进度条，
@@ -269,20 +299,25 @@ fn handle_command(
                 }
             }
         }
-        Command::SetVolume(volume) => player.set_volume(volume),
+        Command::SetVolume(v) => {
+            // 记录目标音量（淡变回到的基准）并立即应用；淡变过程中调整音量
+            // 会直接生效，下一次淡变以新值为准。
+            *volume = v;
+            player.set_volume(v);
+        }
         Command::SetMode(m) => *mode = m,
         Command::Next => {
             if let Some(i) = *index
                 && let Some(ni) = next_index(i, playlist.len(), *mode, rng)
             {
                 *index = Some(ni);
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, *volume, tx);
             }
         }
         Command::Prev => {
             if let Some(i) = *index {
                 *index = prev_index(i, playlist.len(), *mode, rng);
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, *volume, tx);
             }
         }
     }
@@ -326,6 +361,7 @@ fn advance_on_finish(
     index: &mut Option<usize>,
     paused: &mut bool,
     mode: PlaybackMode,
+    volume: f32,
     rng: &mut u64,
     tx: &Sender<Event>,
 ) {
@@ -335,7 +371,7 @@ fn advance_on_finish(
         PlaybackMode::Sequential => {
             if i + 1 < len {
                 *index = Some(i + 1);
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, volume, tx);
             } else {
                 *index = None;
                 let _ = tx.send(Event::Finished);
@@ -344,20 +380,20 @@ fn advance_on_finish(
         PlaybackMode::ListLoop => {
             if len > 0 {
                 *index = Some((i + 1) % len);
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, volume, tx);
             }
         }
         PlaybackMode::SingleLoop => {
             if len > 0 {
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, volume, tx);
             }
         }
         PlaybackMode::Random => {
             if len > 1 {
                 *index = Some(random_other(rng, i, len));
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, volume, tx);
             } else if len == 1 {
-                start_and_notify(player, playlist, index, paused, tx);
+                start_and_notify(player, playlist, index, paused, volume, tx);
             } else {
                 *index = None;
                 let _ = tx.send(Event::Finished);
@@ -367,23 +403,34 @@ fn advance_on_finish(
 }
 
 /// 用列表中 `*index` 指向的曲目替换当前播放源；成功则上报 `TrackStarted` 与时长。
+/// 切歌带音量淡变：旧曲正在播时缓缓淡出再装载，新曲从 0 缓缓淡入。
 fn start_and_notify(
     player: &Player,
     playlist: &[PathBuf],
     index: &mut Option<usize>,
     paused: &mut bool,
+    volume: f32,
     tx: &Sender<Event>,
 ) {
     let Some(i) = *index else { return };
     // 新曲目总是恢复播放状态，避免“暂停中切歌”后实际在放、状态却显示暂停。
+    let was_playing = !*paused && !player.empty();
     *paused = false;
+    // 旧曲淡出（播放源自然结束时已无声音，跳过淡出）。
+    if was_playing {
+        fade_volume(player, volume, 0.0, FADE_OUT_MS);
+    }
     match start_track(player, &playlist[i]) {
         Ok(duration) => {
             let path = playlist[i].clone();
             let _ = tx.send(Event::TrackStarted { path });
             let _ = tx.send(Event::Duration { duration });
+            // 新曲淡入：阻塞音频线程约 320ms，期间命令排队，听感优先。
+            fade_volume(player, 0.0, volume, FADE_IN_MS);
         }
         Err(e) => {
+            // 淡出后启动失败：把音量还原，避免下一曲无声。
+            player.set_volume(volume);
             let _ = tx.send(Event::Error(e));
             *index = None;
         }
