@@ -49,6 +49,10 @@ export global UIState {
     in-out property <float> reorder-to: -1.0;
     in-out property <string> reorder-text: "";
     in-out property <float> reorder-y: 0.0;
+    // 鼠标悬停的列表行（-1 = 无）与按钮（0 无 / 1 文件夹 / 2 删除），
+    // 由窗口级列表覆盖层驱动。
+    in-out property <float> hover-row: -1.0;
+    in-out property <float> hover-button: 0.0;
     // 波形悬停：鼠标在波形区的相对位置（-1 = 未悬停）与时间提示文本
     // （Rust 侧 33ms 计时器按 hover 位置格式化，仅变化时写入）。
     in-out property <float> wave-hover-frac: -1.0;
@@ -68,10 +72,12 @@ export global UIState {
     callback next();
     callback previous();
     callback cycle-mode();
-    callback play-at(int);
-    callback remove-track(int);
+    callback play-at(float);
+    callback remove-track(float);
     callback move-track(float, float);
-    callback open-folder(int);
+    callback open-folder(float);
+    // 拖动开始时按行索引取歌名（Slint 不支持动态模型下标，由 Rust 填充）。
+    callback set-reorder-text(float);
     callback clear-playlist();
     callback toggle-playlist();
     callback seek-requested(float);
@@ -245,11 +251,12 @@ component VolumeBar inherits Rectangle {
     }
 }
 
-// 播放列表行：曲名 + 当前曲目迷你均衡器 + 移除按钮。
+// 播放列表行：手柄 + 曲名 + 当前曲目迷你均衡器 + 文件夹/移除按钮。
+// 点击播放与拖动排序由窗口级的列表左区覆盖层统一处理（见 MainWindow），
+// 行内不铺 TouchArea，避免与 Flickable 的滚动手势冲突。
 component PlaylistRow inherits Rectangle {
     in property <string> text;
     in property <int> index;
-    callback clicked();
     callback remove();
     callback open-folder();
 
@@ -261,7 +268,7 @@ component PlaylistRow inherits Rectangle {
         ? UIState.theme-color.with-alpha(0.32)
         : index == UIState.playlist-current
             ? UIState.theme-color.with-alpha(0.20)
-            : (drag-ta.has-hover ? #ffffff0d : transparent);
+            : (UIState.hover-row == index ? #ffffff0d : transparent);
     animate background { duration: 100ms; easing: ease-out; }
     // 正被拖动的行压暗（浮块代替它显示），松手或点击后恢复。
     opacity: UIState.reorder-from == index && UIState.reorder-to >= 0.0 ? 0.22 : 1.0;
@@ -276,7 +283,7 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/拖动.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: drag-ta.has-hover || UIState.reorder-from == index ? 0.95 : 0.4;
+        opacity: UIState.hover-row == index || UIState.reorder-from == index ? 0.95 : 0.4;
         animate opacity { duration: 120ms; }
     }
 
@@ -328,49 +335,6 @@ component PlaylistRow inherits Rectangle {
         }
     }
 
-    // 拖动区：仅覆盖“手柄图标 + 歌名”一段。普通点击播放；按住纵向拖动
-    //（>8px）进入排序预览，松手提交 move-track。右侧按钮区不受影响。
-    drag-ta := TouchArea {
-        x: 0px;
-        width: parent.width - 96px;
-        height: 100%;
-        property <length> press-y: 0.0;
-        pointer-event(e) => {
-            if e.kind == PointerEventKind.down {
-                press-y = self.mouse-y;
-                UIState.reorder-from = index;
-                UIState.reorder-to = -1.0;
-                UIState.reorder-text = root.text;
-            } else if e.kind == PointerEventKind.move && UIState.reorder-from == index {
-                if UIState.reorder-to < 0.0 {
-                    if abs(self.mouse-y - press-y) > 8px {
-                        UIState.reorder-to = index;
-                    }
-                } else {
-                    UIState.reorder-to = clamp(
-                        index + (self.mouse-y - press-y) / (30px + 2px),
-                        0.0,
-                        UIState.playlist.length * 1.0 - 1.0
-                    );
-                }
-            } else if e.kind == PointerEventKind.up {
-                if UIState.reorder-from == index {
-                    if UIState.reorder-to >= 0.0
-                        && Math.abs(UIState.reorder-to - index) > 0.5
-                    {
-                        UIState.move-track(UIState.reorder-from, UIState.reorder-to);
-                    } else if UIState.reorder-to < 0.0 {
-                        root.clicked();
-                    }
-                    UIState.reorder-from = -1.0;
-                    UIState.reorder-to = -1.0;
-                    UIState.reorder-text = "";
-                }
-            }
-        }
-        mouse-cursor: UIState.reorder-from >= 0 ? grabbing : pointer;
-    }
-
     // 打开所在文件夹按钮（删除按钮左侧）。
     Image {
         x: parent.width - 54px;
@@ -380,7 +344,8 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/文件夹.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: folder-ta.has-hover ? 1.0 : (drag-ta.has-hover || index == UIState.playlist-current ? 0.75 : 0.35);
+        opacity: UIState.hover-button == 1.0 && UIState.hover-row == index ? 1.0
+            : (UIState.hover-row == index || index == UIState.playlist-current ? 0.75 : 0.35);
         animate opacity { duration: 120ms; }
         folder-ta := TouchArea {
             clicked => { root.open-folder(); }
@@ -397,7 +362,8 @@ component PlaylistRow inherits Rectangle {
         source: @image-url("../icons/删除.svg");
         image-fit: contain;
         image-rendering: smooth;
-        opacity: del-ta.has-hover ? 1.0 : (drag-ta.has-hover || index == UIState.playlist-current ? 0.9 : 0.45);
+        opacity: UIState.hover-button == 2.0 && UIState.hover-row == index ? 1.0
+            : (UIState.hover-row == index || index == UIState.playlist-current ? 0.9 : 0.45);
         animate opacity { duration: 120ms; }
         del-ta := TouchArea {
             clicked => { root.remove(); }
@@ -1066,7 +1032,7 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
 
-            Flickable {
+            list-flick := Flickable {
                 x: 8px;
                 y: 42px;
                 width: parent.width - 16px;
@@ -1077,7 +1043,6 @@ export component MainWindow inherits Window {
                     for item[i] in UIState.playlist: PlaylistRow {
                         text: item;
                         index: i;
-                        clicked => { UIState.play-at(i); }
                         remove => { UIState.remove-track(i); }
                         open-folder => { UIState.open-folder(i); }
                     }
@@ -1091,7 +1056,7 @@ export component MainWindow inherits Window {
         Rectangle {
             visible: UIState.reorder-from >= 0.0 && UIState.reorder-text != "";
             x: 8px;
-            y: clamp(UIState.reorder-y * 1px - 15px, 60px, root.height - 32px);
+            y: clamp(UIState.reorder-y * 1px - 15px, root.height - 116px, root.height - 32px);
             width: root.width - 16px;
             height: 30px;
             border-radius: 8px;
@@ -1133,6 +1098,75 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
                 overflow: elide;
             }
+        }
+
+        // 列表全区覆盖层：按住拖动排序、轻点执行行动作（播放/文件夹/删除）。
+        // 放在 Flickable 之上且不属于它的子节点——列表不再响应拖拽滚动
+        // （滚动用滚轮），从根上消除排序与滚动的手势冲突。
+        // 仅抽屉展开时可见可交互；文件夹/删除按钮由点击横坐标路由。
+        TouchArea {
+            visible: UIState.playlist-open;
+            x: 8px;
+            y: root.height - 118px;
+            width: root.width - 16px;
+            height: 112px;
+            property <length> press-mouse-y: 0px;
+            // 指针对应的列表内容行（浮点）；内容坐标 = 指针 y - 滚动偏移。
+            property <float> content-row: Math.floor(
+                (self.mouse-y - list-flick.viewport-y) / (30px + 2px)
+            );
+            property <bool> row-valid: (self.mouse-y - list-flick.viewport-y) >= 0px
+                && content-row < UIState.playlist.length * 1.0;
+            // 行内右侧按钮的命中范围（行宽 = root.width - 16px）。
+            property <bool> in-folder-x: self.mouse-x >= root.width - 70px
+                && self.mouse-x <= root.width - 56px;
+            property <bool> in-delete-x: self.mouse-x >= root.width - 48px
+                && self.mouse-x <= root.width - 34px;
+
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.down {
+                    press-mouse-y = self.mouse-y;
+                    if row-valid {
+                        UIState.reorder-from = content-row;
+                        UIState.reorder-to = -1.0;
+                        UIState.set-reorder-text(content-row);
+                    }
+                } else if e.kind == PointerEventKind.move {
+                    if UIState.reorder-from >= 0.0 {
+                        UIState.reorder-to = clamp(
+                            content-row,
+                            0.0,
+                            UIState.playlist.length * 1.0 - 1.0
+                        );
+                    } else {
+                        UIState.hover-row = row-valid ? content-row : -1.0;
+                        UIState.hover-button = row-valid
+                            ? (in-folder-x ? 1.0 : (in-delete-x ? 2.0 : 0.0))
+                            : 0.0;
+                    }
+                } else if e.kind == PointerEventKind.up {
+                    if UIState.reorder-from >= 0.0 {
+                        if UIState.reorder-to >= 0.0
+                            && Math.abs(UIState.reorder-to - UIState.reorder-from) > 0.5
+                        {
+                            UIState.move-track(UIState.reorder-from, UIState.reorder-to);
+                        } else if Math.abs(self.mouse-y - press-mouse-y) < 8px {
+                            // 轻点：按横坐标路由到行动作（删除 / 打开文件夹 / 播放）。
+                            if in-delete-x {
+                                UIState.remove-track(UIState.reorder-from);
+                            } else if in-folder-x {
+                                UIState.open-folder(UIState.reorder-from);
+                            } else {
+                                UIState.play-at(UIState.reorder-from);
+                            }
+                        }
+                        UIState.reorder-from = -1.0;
+                        UIState.reorder-to = -1.0;
+                        UIState.reorder-text = "";
+                    }
+                }
+            }
+            mouse-cursor: UIState.reorder-from >= 0.0 ? grabbing : pointer;
         }
 
         // —— “关于”对话框（覆盖在最上层，点击空白处关闭）——

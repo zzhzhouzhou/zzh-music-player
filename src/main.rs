@@ -1391,6 +1391,8 @@ fn main() {
                     if let Some((cx, cy)) = cursor_position() {
                         let scale = ui.window().scale_factor();
                         let origin = ui.window().position();
+                        let local_x = (cx - origin.x) as f32 / scale;
+                        let local_y = (cy - origin.y) as f32 / scale;
                         // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
                         let x0 = origin.x + (210.0 * scale) as i32;
                         let x1 = origin.x + (510.0 * scale) as i32;
@@ -1402,8 +1404,24 @@ fn main() {
                         }
                         // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标。
                         if state.get_reorder_from() >= 0.0 {
-                            let local_y = (cy - origin.y) as f32 / scale;
                             state.set_reorder_y(local_y);
+                        }
+                        // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
+                        // 避免覆盖层收不到“离开”事件导致的高亮滞留。
+                        // 列表区几何与 main.slint 的覆盖层保持一致（720x178 逻辑窗口）。
+                        let in_list = state.get_playlist_open()
+                            && state.get_reorder_from() < 0.0
+                            && local_x >= 8.0
+                            && local_x <= 712.0
+                            && local_y >= 60.0
+                            && local_y <= 172.0;
+                        if !in_list {
+                            if state.get_hover_row() >= 0.0 {
+                                state.set_hover_row(-1.0);
+                            }
+                            if state.get_hover_button() != 0.0 {
+                                state.set_hover_button(0.0);
+                            }
                         }
                     }
                 }
@@ -1579,7 +1597,21 @@ fn main() {
         ui.global::<UIState>().on_play_at(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
-            play_at(index as usize, &playlist, &state, &audio);
+            let index = index.round().max(0.0) as usize;
+            play_at(index, &playlist, &state, &audio);
+        });
+    }
+    // 拖动开始时按行索引取歌名填充浮块（Slint 不支持动态模型下标）。
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        ui.global::<UIState>().on_set_reorder_text(move |row| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let state = ui.global::<UIState>();
+            let row = row.round().max(0.0) as usize;
+            if let Some(p) = playlist.borrow().get(row) {
+                state.set_reorder_text(track_name(p).into());
+            }
         });
     }
     // 列表拖动排序：把 from 行移动到 to 位置（Slint 传来 float，此处取整钳制）。
@@ -1625,7 +1657,7 @@ fn main() {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                if let Some(p) = playlist.borrow().get(index as usize) {
+                if let Some(p) = playlist.borrow().get(index.round().max(0.0) as usize) {
                     // explorer /select,"路径"：打开文件夹并高亮该文件。
                     let _ = std::process::Command::new("explorer.exe")
                         .raw_arg(format!("/select,\"{}\"", p.display()))
@@ -1644,7 +1676,7 @@ fn main() {
         let model = Rc::clone(&playlist_model);
         let audio = audio.clone();
         ui.global::<UIState>().on_remove_track(move |index| {
-            let index = index as usize;
+            let index = index.round().max(0.0) as usize;
             {
                 let mut list = playlist.borrow_mut();
                 if index >= list.len() {
@@ -2134,7 +2166,8 @@ mod tests {
 
         // 源文件 mtime 变化后旧缓存应作废并删除。
         let file = std::fs::OpenOptions::new().append(true).open(&src).unwrap();
-        file.set_modified(SystemTime::now() + Duration::from_secs(5)).unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
         drop(file);
         assert!(read_wave_cache(&src).is_none(), "过期缓存应失效");
         assert!(!cache_path.is_file(), "过期缓存应被删除");
