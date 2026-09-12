@@ -43,6 +43,8 @@
 
 到 [Releases](https://github.com/zzhzhouzhou/zzh-music-player/releases) 下载 `zzhMusicPlayer_Setup.exe`，双击安装。安装器会注册 .mp3 / .flac / .wav 的打开方式，之后双击音频文件直接播放。
 
+安装后，程序内的「关于」界面可以检查更新：发现新版本会自动下载（GitHub 图标带环形进度），一键静默升级并自动重启，全程无向导界面。启动后也会静默探测一次新版本，仅在关于按钮上以小圆点提示，不打扰使用。
+
 自己构建：
 
 ```
