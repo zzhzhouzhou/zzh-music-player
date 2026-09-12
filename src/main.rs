@@ -114,9 +114,9 @@ enum FileEvent {
 /// 50MB 足够存放上万首歌曲的缓存。
 const WAVE_CACHE_CAP: u64 = 50 * 1024 * 1024;
 /// 波形磁盘缓存文件魔数与版本。
-/// v2：主题色提取算法重做（黑封面不再误判为红）+ 模糊封面背景位图字段。
+/// v3：黑白灰封面主色改为白色、模糊背景不再压暗（保持封面明暗）。
 const WAVE_CACHE_MAGIC: &[u8; 4] = b"ZWFC";
-const WAVE_CACHE_VERSION: u8 = 2;
+const WAVE_CACHE_VERSION: u8 = 3;
 /// 文件夹拖入扫描的单批文件数：搜到一批就交给 UI 渐进式追加。
 const FOLDER_SCAN_BATCH: usize = 50;
 /// 文件夹扫描的单次上限（防止误拖整个盘符导致无限扫描）。
@@ -916,8 +916,20 @@ fn apply_waveform(
     state.set_track_title(title.into());
     state.set_track_artist(res.artist.clone().unwrap_or_default().into());
     // 主题色补间（约 400ms 过渡）+ 交叉淡入背景。
-    // 有封面用高模糊封面位图（真实色彩），无封面回退主题色渐变。
-    theme.start(res.theme);
+    // 有封面用高模糊封面位图（保持封面明暗），无封面回退主题色渐变；
+    // 亮背景（白封面等）时主窗口文字/图标切换为深色内容，此时若主题色
+    // 是无彩色封面的白色中性，替换为深灰，避免白底上隐形。
+    let bright = res
+        .bg
+        .as_ref()
+        .map(|b| waveform_generator::average_luminance(b) > 0.55)
+        .unwrap_or(false);
+    state.set_bg_bright(bright);
+    let mut accent = res.theme;
+    if bright && accent == waveform_generator::NEUTRAL_THEME {
+        accent = [91, 100, 112];
+    }
+    theme.start(accent);
     let bg = match &res.bg {
         Some(buf) => Image::from_rgba8(buf.clone()),
         None => Image::from_rgba8(render_background(res.theme)),
@@ -2031,6 +2043,10 @@ fn main() {
         state.set_playlist_open(true);
         PLAYLIST_OPEN.store(true, Ordering::Relaxed);
     }
+    // 测试辅助：ZZH_OPEN_SEARCH=1 启动时直接展开播放列表搜索框。
+    if std::env::var("ZZH_OPEN_SEARCH").as_deref() == Ok("1") {
+        state.set_search_open(true);
+    }
     // 测试辅助：ZZH_OPEN_ABOUT=1 启动时直接打开“关于”对话框。
     if std::env::var("ZZH_OPEN_ABOUT").as_deref() == Ok("1") {
         state.set_about_open(true);
@@ -2156,6 +2172,7 @@ fn main() {
                                 wave_bars_model.set_vec(placeholder_bars());
                                 state.set_cover_image(Image::default());
                                 state.set_has_cover(false);
+                                state.set_bg_bright(false);
                                 push_background(&state, Image::default(), &bg_front);
                             }
                             eprintln!("开始播放: {:?}", path);
