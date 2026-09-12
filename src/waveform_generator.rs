@@ -711,8 +711,8 @@ fn cover_assets(
 
 /// 由封面生成“高度模糊”的背景位图：缩到 64×64 → 高斯模糊 → 取与窗口比例
 /// 一致的中央横带（放大覆盖而非拉伸，避免方形封面被横向拉糊成“两个”），
-/// 再放大到 324×80。保持封面原有明暗（白封面就是白背景），仅底部轻微加深；
-/// 亮背景下的可读性由 UI 侧切换深色内容解决，不做亮度压缩。
+/// 再放大到 324×80。像素按自身亮度自适应压暗（统一深色 UI：白封面收敛为
+/// 中性灰而不是刺眼白底），底部额外加深给控制栏留对比度。
 fn blurred_background(cover: &image::DynamicImage) -> SharedPixelBuffer<Rgba8Pixel> {
     const W: u32 = 324;
     const H: u32 = 80; // ≈ 窗口 720×178 的宽高比
@@ -727,7 +727,9 @@ fn blurred_background(cover: &image::DynamicImage) -> SharedPixelBuffer<Rgba8Pix
     let bytes = buf.make_mut_bytes();
     for (i, p) in up.pixels().enumerate() {
         let fy = (i as u32 / W) as f32 / (H - 1) as f32;
-        let k = 1.0 - 0.15 * fy;
+        let lum = (f32::from(p[0]) * 0.30 + f32::from(p[1]) * 0.59 + f32::from(p[2]) * 0.11)
+            / 255.0;
+        let k = (0.42 + 0.46 * (1.0 - lum)) * (1.0 - 0.16 * fy);
         bytes[i * 4] = (f32::from(p[0]) * k) as u8;
         bytes[i * 4 + 1] = (f32::from(p[1]) * k) as u8;
         bytes[i * 4 + 2] = (f32::from(p[2]) * k) as u8;
@@ -736,26 +738,8 @@ fn blurred_background(cover: &image::DynamicImage) -> SharedPixelBuffer<Rgba8Pix
     buf
 }
 
-/// 背景平均亮度（0~1）：超过阈值即认为亮背景，UI 切换为深色内容。
-pub fn average_luminance(buf: &SharedPixelBuffer<Rgba8Pixel>) -> f32 {
-    let pixels = (buf.width() as usize) * (buf.height() as usize);
-    if pixels == 0 {
-        return 0.0;
-    }
-    let bytes = buf.as_bytes();
-    let mut sum = 0f64;
-    for i in 0..pixels {
-        let r = u32::from(bytes[i * 4]) as f64;
-        let g = u32::from(bytes[i * 4 + 1]) as f64;
-        let b = u32::from(bytes[i * 4 + 2]) as f64;
-        sum += 0.30 * r + 0.59 * g + 0.11 * b;
-    }
-    (sum / (pixels as f64 * 255.0)) as f32
-}
-
-/// 无彩色封面（黑白灰）的中性主题色：白色。亮背景下由调用方替换为深灰，
-/// 避免白底上的白色主题隐形。
-pub const NEUTRAL_THEME: [u8; 3] = [235, 238, 242];
+/// 无彩色封面（黑白灰）的中性主题色：白色，深色 UI 上最干净。
+const NEUTRAL_THEME: [u8; 3] = [235, 238, 242];
 
 /// 从封面小图提取主题色：HSV 色相直方图投票选出“占主导的鲜艳色”。
 ///
@@ -1233,9 +1217,10 @@ mod tests {
         assert!(h > 190.0 && h < 260.0, "蓝色应为主色相: h={h}");
     }
 
-    /// 模糊背景：中央横带放大覆盖（尺寸为窗口比例），保持封面明暗。
+    /// 模糊背景：中央横带放大覆盖（尺寸为窗口比例），统一深色 UI——
+    /// 白封面压暗为中性灰（不刺眼、白字可读），暗封面基本保持原样。
     #[test]
-    fn blurred_background_keeps_cover_brightness() {
+    fn blurred_background_unified_dark() {
         let white = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
             64,
             64,
@@ -1245,26 +1230,23 @@ mod tests {
         assert_eq!(buf.width(), 324);
         assert_eq!(buf.height(), 80);
         let bytes = buf.as_bytes();
-        // 白封面背景应保持白色（亮度不被压缩），半透明度固定。
+        // 白封面背景压暗至中性灰（约 105），保证深色 UI 一致性与文字可读性。
         let mid = ((40 * 324 + 162) * 4) as usize;
-        assert!(bytes[mid] > 200, "白封面背景应保持白色: {}", bytes[mid]);
-        assert_eq!(bytes[mid + 3], 235);
         assert!(
-            average_luminance(&buf) > 0.55,
-            "白封面背景应判定为亮背景: {}",
-            average_luminance(&buf)
+            (60..140).contains(&bytes[mid]),
+            "白封面背景应压暗为中性灰: {}",
+            bytes[mid]
         );
+        assert_eq!(bytes[mid + 3], 235);
 
         let dark = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
             64,
             64,
             |_, _| image::Rgb([10, 12, 18]),
         ));
-        let dark_buf = blurred_background(&dark);
-        let bytes = dark_buf.as_bytes().to_vec();
+        let bytes = blurred_background(&dark).as_bytes().to_vec();
         let mid = (40 * 324 + 162) * 4;
         assert!(bytes[mid] < 20 && bytes[mid] > 2, "暗封面背景不应被过度改变");
-        assert!(average_luminance(&dark_buf) < 0.2);
     }
 
     /// 视觉辅助：设置 `ZZH_DUMP_BG=1` 时把几种典型封面的模糊背景转储为 PNG，

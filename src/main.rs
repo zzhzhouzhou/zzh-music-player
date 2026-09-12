@@ -114,9 +114,9 @@ enum FileEvent {
 /// 50MB 足够存放上万首歌曲的缓存。
 const WAVE_CACHE_CAP: u64 = 50 * 1024 * 1024;
 /// 波形磁盘缓存文件魔数与版本。
-/// v3：黑白灰封面主色改为白色、模糊背景不再压暗（保持封面明暗）。
+/// v4：背景改中央横带覆盖式模糊并统一压暗（深色 UI），旧缓存自动失效。
 const WAVE_CACHE_MAGIC: &[u8; 4] = b"ZWFC";
-const WAVE_CACHE_VERSION: u8 = 3;
+const WAVE_CACHE_VERSION: u8 = 4;
 /// 文件夹拖入扫描的单批文件数：搜到一批就交给 UI 渐进式追加。
 const FOLDER_SCAN_BATCH: usize = 50;
 /// 文件夹扫描的单次上限（防止误拖整个盘符导致无限扫描）。
@@ -916,20 +916,8 @@ fn apply_waveform(
     state.set_track_title(title.into());
     state.set_track_artist(res.artist.clone().unwrap_or_default().into());
     // 主题色补间（约 400ms 过渡）+ 交叉淡入背景。
-    // 有封面用高模糊封面位图（保持封面明暗），无封面回退主题色渐变；
-    // 亮背景（白封面等）时主窗口文字/图标切换为深色内容，此时若主题色
-    // 是无彩色封面的白色中性，替换为深灰，避免白底上隐形。
-    let bright = res
-        .bg
-        .as_ref()
-        .map(|b| waveform_generator::average_luminance(b) > 0.55)
-        .unwrap_or(false);
-    state.set_bg_bright(bright);
-    let mut accent = res.theme;
-    if bright && accent == waveform_generator::NEUTRAL_THEME {
-        accent = [91, 100, 112];
-    }
-    theme.start(accent);
+    // 有封面用高模糊封面位图（中央横带覆盖 + 统一压暗），无封面回退主题色渐变。
+    theme.start(res.theme);
     let bg = match &res.bg {
         Some(buf) => Image::from_rgba8(buf.clone()),
         None => Image::from_rgba8(render_background(res.theme)),
@@ -2172,7 +2160,6 @@ fn main() {
                                 wave_bars_model.set_vec(placeholder_bars());
                                 state.set_cover_image(Image::default());
                                 state.set_has_cover(false);
-                                state.set_bg_bright(false);
                                 push_background(&state, Image::default(), &bg_front);
                             }
                             eprintln!("开始播放: {:?}", path);

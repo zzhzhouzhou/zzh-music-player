@@ -29,8 +29,6 @@ export global UIState {
     // Slint 全局组件不支持属性动画：颜色过渡由 Rust 侧补间驱动
     // （waveform 结果应用时启动，33ms 粒子计时器逐步推进）。
     in-out property <color> theme-color: #5ac8fa;
-    // 背景是否为亮色（白色封面等）：主窗口的文字 / 图标 / 波形切换为深色内容。
-    in-out property <bool> bg-bright: false;
     // 柔和模糊感背景位图（低分辨率渐变 + 主题色光斑放大），双层交叉淡入：
     // 换曲时新背景写入隐藏层并翻转可见层，避免背景突变。
     in-out property <image> bg-image-front;
@@ -112,11 +110,9 @@ export global UIState {
 }
 
 // 圆形图标按钮：透明玻璃底 + 发丝描边，悬停轻微提亮、按下缩小回弹。
-// dark = 深色内容模式（亮背景上使用深色描边与图标，保持可见）。
 component IconButton inherits Rectangle {
     in property <image> source;
     in property <bool> active: false;
-    in property <bool> dark: false;
     in property <length> button-size: 30px;
     callback clicked();
 
@@ -125,13 +121,9 @@ component IconButton inherits Rectangle {
     border-radius: button-size / 2;
     border-width: 1px;
     // 毛玻璃：近透明底，悬停轻微提亮；active（置顶/弹层/搜索开启）用主题色提示。
-    border-color: ta.has-hover
-        ? (root.dark ? #171b2345 : #ffffff30)
-        : (root.dark ? #171b231f : #ffffff10);
+    border-color: ta.has-hover ? #ffffff30 : #ffffff10;
     background: active ? UIState.theme-color.with-alpha(0.32)
-        : (ta.has-hover
-            ? (root.dark ? #171b231a : #ffffff1f)
-            : (root.dark ? #171b230d : #ffffff0a));
+        : (ta.has-hover ? #ffffff1f : #ffffff0a);
     transform-scale: ta.pressed ? 0.92 : (ta.has-hover ? 1.06 : 1.0);
     animate transform-scale { duration: 100ms; easing: ease-out; }
     animate background { duration: 120ms; easing: ease-out; }
@@ -139,7 +131,6 @@ component IconButton inherits Rectangle {
 
     Image {
         source: root.source;
-        colorize: root.dark ? #171b23 : #ffffff;
         // 显式居中：未指定 y 的元素在 Slint 中会顶部对齐。
         x: (button-size - button-size * 0.56) / 2;
         y: (button-size - button-size * 0.56) / 2;
@@ -222,7 +213,7 @@ component VolumeBar inherits Rectangle {
         width: 100%;
         height: 5px;
         border-radius: 2.5px;
-        background: UIState.bg-bright ? #171b2324 : #ffffff24;
+        background: #ffffff24;
     }
     // 已填充部分。
     Rectangle {
@@ -240,7 +231,7 @@ component VolumeBar inherits Rectangle {
         width: 8px;
         height: 8px;
         border-radius: 4px;
-        background: UIState.bg-bright ? #262c36 : #ffffff;
+        background: #ffffff;
         drop-shadow-offset-y: 1px;
         drop-shadow-blur: 3px;
         drop-shadow-color: #00000073;
@@ -401,7 +392,7 @@ component WaveformArea inherits Rectangle {
         width: 100%;
         height: 2px;
         border-radius: 1px;
-        background: UIState.bg-bright ? #171b2320 : #ffffff14;
+        background: #ffffff14;
     }
     Text {
         visible: root.bar-count == 0;
@@ -410,7 +401,7 @@ component WaveformArea inherits Rectangle {
         height: 14px;
         text: "双击窗口或拖入音频文件开始播放";
         font-size: 10px;
-        color: UIState.bg-bright ? #171b2345 : #ffffff38;
+        color: #ffffff38;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -424,7 +415,7 @@ component WaveformArea inherits Rectangle {
         border-radius: self.width / 2;
         background: ((i + 0.5) * root.step) < root.width * root.progress-frac
             ? UIState.theme-color
-            : (UIState.bg-bright ? #171b2330 : #ffffff2e);
+            : #ffffff2e;
         animate height { duration: 280ms; easing: ease-out; }
     }
 
@@ -436,7 +427,7 @@ component WaveformArea inherits Rectangle {
         width: max(root.bar-w, 3px);
         height: 100%;
         border-radius: self.width / 2;
-        background: UIState.bg-bright ? #262c36 : #f5f7fa;
+        background: #f5f7fa;
     }
 
     // 播放头光晕（径向渐变，中心亮、向外透明；作用在播放头条上）。
@@ -467,7 +458,7 @@ component WaveformArea inherits Rectangle {
         width: max(2px, 3px - age * (1px + mod(i, 2) * 1px));
         height: max(2px, 3px - age * (1px + mod(i, 2) * 1px));
         border-radius: 1.5px;
-        background: UIState.bg-bright ? #171b23 : #ffffff;
+        background: #ffffff;
         opacity: UIState.playing ? pow(1.0 - age, 1.4 + mod(i, 3) * 0.4) : 0.0;
         animate opacity { duration: 200ms; }
     }
@@ -483,7 +474,7 @@ component WaveformArea inherits Rectangle {
         y: root.height * 0.14;
         width: 1px;
         height: root.height * 0.72;
-        background: UIState.bg-bright ? #171b236e : #ffffff59;
+        background: #ffffff59;
     }
 
     // 悬停时间提示：深色玻璃底 + 一层主题色调（随换曲过渡），醒目不刺眼。
@@ -651,16 +642,13 @@ export component MainWindow inherits Window {
             animate opacity { duration: 350ms; easing: ease-in-out; }
         }
 
-        // 可读性压暗层：暗色封面下加深对比，保证白色文字/图标可读；
-        // 亮色封面（白背景）时完全退出，保持背景本来明暗（UI 切深色内容）。
+        // 可读性压暗层：任何封面下加深对比，保证白色文字/图标可读。
         Rectangle {
             x: 0px;
             y: 0px;
             width: 100%;
             height: 100%;
-            opacity: UIState.bg-bright ? 0.0 : 1.0;
             background: @linear-gradient(180deg, #00000030 0%, #00000010 40%, #00000046 100%);
-            animate opacity { duration: 300ms; easing: ease-in-out; }
         }
 
         // 顶部 1px 玻璃高光（中间亮、两端淡出）。
@@ -714,7 +702,7 @@ export component MainWindow inherits Window {
             text: UIState.track-title;
             font-size: 15px;
             font-weight: 600;
-            color: UIState.bg-bright ? #171b23 : #f2f4f8;
+            color: #f2f4f8;
             horizontal-alignment: left;
             vertical-alignment: center;
             overflow: elide;
@@ -729,7 +717,7 @@ export component MainWindow inherits Window {
             text: UIState.track-artist;
             visible: UIState.track-artist != "";
             font-size: 11px;
-            color: UIState.bg-bright ? #171b238c : #ffffff8c;
+            color: #ffffff8c;
             horizontal-alignment: left;
             vertical-alignment: center;
             overflow: elide;
@@ -741,7 +729,6 @@ export component MainWindow inherits Window {
             x: root.width - 138px;
             y: 7px;
             button-size: 26px;
-            dark: UIState.bg-bright;
             source: @image-url("../icons/信息圆.svg");
             clicked => { UIState.about-open = true; }
         }
@@ -749,7 +736,6 @@ export component MainWindow inherits Window {
             x: root.width - 106px;
             y: 7px;
             button-size: 26px;
-            dark: UIState.bg-bright;
             source: @image-url("../icons/最小化.svg");
             clicked => { UIState.minimize-window(); }
         }
@@ -757,7 +743,6 @@ export component MainWindow inherits Window {
             x: root.width - 74px;
             y: 7px;
             button-size: 26px;
-            dark: UIState.bg-bright;
             active: UIState.always-on-top;
             source: @image-url("../icons/置顶.svg");
             clicked => { UIState.toggle-pin(); }
@@ -766,7 +751,6 @@ export component MainWindow inherits Window {
             x: root.width - 42px;
             y: 7px;
             button-size: 26px;
-            dark: UIState.bg-bright;
             source: @image-url("../icons/关闭.svg");
             clicked => { UIState.close-window(); }
         }
@@ -788,7 +772,7 @@ export component MainWindow inherits Window {
             height: 18px;
             text: UIState.position-text;
             font-size: 11px;
-            color: UIState.bg-bright ? #3c4350 : #aeb6c2;
+            color: #aeb6c2;
             horizontal-alignment: left;
             vertical-alignment: center;
         }
@@ -799,7 +783,7 @@ export component MainWindow inherits Window {
             height: 18px;
             text: UIState.duration-text;
             font-size: 11px;
-            color: UIState.bg-bright ? #3c4350 : #aeb6c2;
+            color: #aeb6c2;
             horizontal-alignment: right;
             vertical-alignment: center;
         }
@@ -813,7 +797,7 @@ export component MainWindow inherits Window {
             text: UIState.mode-text;
             opacity: UIState.mode-showing ? 1.0 : 0.0;
             font-size: 11px;
-            color: UIState.bg-bright ? #2a3038 : #e8eaf0;
+            color: #e8eaf0;
             horizontal-alignment: center;
             vertical-alignment: center;
             animate opacity { duration: 120ms; }
@@ -826,8 +810,8 @@ export component MainWindow inherits Window {
             width: 300px;
             height: 38px;
 
-            // 玻璃胶囊背景：亮背景用白玻璃、暗背景用深玻璃；平时几乎隐形
-            //（不显示主题色），鼠标靠近后显现保证可读性。
+            // 玻璃胶囊背景：深色玻璃常驻；平时几乎隐形（不显示主题色），
+            // 鼠标靠近后显现保证可读性。
             Rectangle {
                 x: 0px;
                 y: 0px;
@@ -835,13 +819,10 @@ export component MainWindow inherits Window {
                 height: 100%;
                 border-radius: 19px;
                 border-width: 1px;
-                border-color: UIState.bg-bright
-                    ? (UIState.toolbar-hovered ? #171b2333 : #171b231a) : #ffffff1f;
-                background: UIState.bg-bright ? #f4f5f7 : #0e131d;
-                opacity: UIState.toolbar-hovered
-                    ? (UIState.bg-bright ? 0.88 : 0.78) : 0.15;
+                border-color: UIState.toolbar-hovered ? #ffffff30 : #ffffff1f;
+                background: #0e131d;
+                opacity: UIState.toolbar-hovered ? 0.78 : 0.15;
                 animate opacity { duration: 150ms; easing: ease-out; }
-                animate background { duration: 200ms; easing: ease-in-out; }
                 drop-shadow-offset-y: 3px;
                 drop-shadow-blur: 12px;
                 drop-shadow-color: #00000040;
@@ -855,8 +836,7 @@ export component MainWindow inherits Window {
                 height: 100%;
                 border-radius: 19px;
                 background: UIState.theme-color;
-                opacity: UIState.toolbar-hovered
-                    ? (UIState.bg-bright ? 0.10 : 0.18) : 0.0;
+                opacity: UIState.toolbar-hovered ? 0.18 : 0.0;
                 animate opacity { duration: 150ms; easing: ease-out; }
             }
 
@@ -871,19 +851,16 @@ export component MainWindow inherits Window {
 
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     source: @image-url("../icons/模式.svg");
                     clicked => { UIState.cycle-mode(); }
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     source: @image-url("../icons/快退.svg");
                     clicked => { UIState.seek-relative(-5.0); }
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     source: @image-url("../icons/上一首.svg");
                     clicked => { UIState.previous(); }
                 }
@@ -894,26 +871,22 @@ export component MainWindow inherits Window {
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     source: @image-url("../icons/下一首.svg");
                     clicked => { UIState.next(); }
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     source: @image-url("../icons/快进.svg");
                     clicked => { UIState.seek-relative(5.0); }
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     active: UIState.volume-popup-open;
                     source: @image-url("../icons/音量.svg");
                     clicked => { UIState.toggle-volume-popup(); }
                 }
                 IconButton {
                     button-size: 27px;
-                    dark: UIState.bg-bright;
                     active: UIState.playlist-open;
                     source: @image-url("../icons/播放列表.svg");
                     clicked => { UIState.toggle-playlist(); }
@@ -934,7 +907,7 @@ export component MainWindow inherits Window {
             animate x { duration: 150ms; easing: ease-out; }
             animate opacity { duration: 120ms; easing: ease-out; }
 
-            // 玻璃底（随背景明暗切换浅色/深色玻璃）。
+            // 玻璃底（与工具栏同款深色玻璃）。
             Rectangle {
                 x: 0px;
                 y: 0px;
@@ -942,9 +915,9 @@ export component MainWindow inherits Window {
                 height: 100%;
                 border-radius: 19px;
                 border-width: 1px;
-                border-color: UIState.bg-bright ? #171b2333 : #ffffff26;
-                background: UIState.bg-bright ? #f4f5f7 : #0e131d;
-                opacity: 0.88;
+                border-color: #ffffff26;
+                background: #0e131d;
+                opacity: 0.85;
                 drop-shadow-offset-y: 3px;
                 drop-shadow-blur: 12px;
                 drop-shadow-color: #00000040;
@@ -958,7 +931,7 @@ export component MainWindow inherits Window {
                 height: 100%;
                 border-radius: 19px;
                 background: UIState.theme-color;
-                opacity: UIState.bg-bright ? 0.10 : 0.18;
+                opacity: 0.18;
             }
 
             HorizontalLayout {
@@ -978,7 +951,7 @@ export component MainWindow inherits Window {
                     width: 36px;
                     text: UIState.volume-text;
                     font-size: 11px;
-                    color: UIState.bg-bright ? #2a3038 : #e8eaf0;
+                    color: #e8eaf0;
                     horizontal-alignment: right;
                     vertical-alignment: center;
                 }
@@ -1069,10 +1042,10 @@ export component MainWindow inherits Window {
             // 文本不会随宽度重排。
             Rectangle {
                 x: 84px;
-                y: 11px;
+                y: 14px;
                 width: UIState.search-open ? self.full-w : 0px;
-                height: 30px;
-                property <length> full-w: min(parent.width - 260px, 170px);
+                height: 22px;
+                property <length> full-w: min(parent.width - 240px, 220px);
                 border-radius: self.height / 2;
                 background: #ffffff12;
                 border-width: 1px;
@@ -1095,10 +1068,10 @@ export component MainWindow inherits Window {
                     height: 100%;
 
                     search-input := TextInput {
-                        // 左侧 30px 留给内嵌的搜索图标。
-                        x: 30px;
-                        width: parent.width - 30px
-                            - (UIState.search-text == "" ? 0px : 24px);
+                        // 左侧 26px 留给内嵌的搜索图标。
+                        x: 26px;
+                        width: parent.width - 26px
+                            - (UIState.search-text == "" ? 0px : 20px);
                         height: 100%;
                         text <=> UIState.search-text;
                         font-size: 12px;
@@ -1120,10 +1093,10 @@ export component MainWindow inherits Window {
                     // 占位提示。
                     Text {
                         visible: UIState.search-text == "";
-                        x: 30px;
+                        x: 26px;
                         width: parent.width - 40px;
                         height: 100%;
-                        text: "搜索（支持正则）";
+                        text: "搜索（正则）";
                         font-size: 11px;
                         color: #ffffff59;
                         vertical-alignment: center;
@@ -1132,17 +1105,17 @@ export component MainWindow inherits Window {
                     // 小清除按钮（有输入时出现）。
                     Rectangle {
                         visible: UIState.search-text != "";
-                        x: parent.width - 24px;
-                        y: (parent.height - 16px) / 2;
-                        width: 16px;
-                        height: 16px;
-                        border-radius: 8px;
+                        x: parent.width - 20px;
+                        y: (parent.height - 14px) / 2;
+                        width: 14px;
+                        height: 14px;
+                        border-radius: 7px;
                         background: clr-ta.has-hover ? #ffffff2e : transparent;
                         Text {
                             width: 100%;
                             height: 100%;
                             text: "×";
-                            font-size: 12px;
+                            font-size: 11px;
                             color: #c6ccd6;
                             horizontal-alignment: center;
                             vertical-alignment: center;
@@ -1164,7 +1137,7 @@ export component MainWindow inherits Window {
             IconButton {
                 x: 84px;
                 y: 16px;
-                button-size: 20px;
+                button-size: 18px;
                 active: UIState.search-open;
                 source: @image-url("../icons/搜索.svg");
                 clicked => {
