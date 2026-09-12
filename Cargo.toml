@@ -34,6 +34,9 @@ symphonia = { version = "0.5", features = ["mp3", "isomp4", "aac"] }
 rfd = "0.15"
 # 封面图解码：提取内嵌封面主色调，生成同色系渐变背景（与 Slint 一致，只编 png/jpeg）。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# 播放列表搜索的正则匹配：regex 的精简替代（体积小一个数量级，覆盖常用语法），
+# 非法正则时由调用方退回普通子串匹配。
+regex-lite = "0.1"
 # Win32 API：DwmSetWindowAttribute（亚克力/圆角）、SetWindowPos（置顶）、
 # DragAcceptFiles/SetWindowLongPtrW/DefWindowProcW（文件拖拽）、
 # CreateMutexW（单例互斥体）、FindWindowW/SendMessageW/COPYDATASTRUCT（文件转发）。

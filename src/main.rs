@@ -92,6 +92,8 @@ struct WaveformResult {
     artist: Option<String>,
     theme: [u8; 3],
     cover: Option<SharedPixelBuffer<Rgba8Pixel>>,
+    /// 高度模糊的封面背景位图（无封面时为 None，回退主题色渐变）。
+    bg: Option<SharedPixelBuffer<Rgba8Pixel>>,
 }
 
 /// 文件相关外部事件（OS 拖拽 / 双击 / 滚轮 / 单例转发），经通道由 UI 线程统一处理。
@@ -112,8 +114,9 @@ enum FileEvent {
 /// 50MB 足够存放上万首歌曲的缓存。
 const WAVE_CACHE_CAP: u64 = 50 * 1024 * 1024;
 /// 波形磁盘缓存文件魔数与版本。
+/// v2：主题色提取算法重做（黑封面不再误判为红）+ 模糊封面背景位图字段。
 const WAVE_CACHE_MAGIC: &[u8; 4] = b"ZWFC";
-const WAVE_CACHE_VERSION: u8 = 1;
+const WAVE_CACHE_VERSION: u8 = 2;
 /// 文件夹拖入扫描的单批文件数：搜到一批就交给 UI 渐进式追加。
 const FOLDER_SCAN_BATCH: usize = 50;
 /// 文件夹扫描的单次上限（防止误拖整个盘符导致无限扫描）。
@@ -249,24 +252,24 @@ impl<'a> CacheReader<'a> {
     }
 }
 
+/// 把 SharedPixelBuffer 位图编码为 PNG（缓存落盘用）。
+fn encode_png(buf: &SharedPixelBuffer<Rgba8Pixel>) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(buf.width(), buf.height(), buf.as_bytes().to_vec())?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
+}
+
 /// 把波形分析结果写入磁盘缓存（后台线程调用）。
 /// 内容：魔数 + 版本 + 源 mtime + 源路径 + 时长 + 波形条 + 主题色 +
-/// 标题/艺术家 + 封面缩略图（PNG 压缩，几十 KB 内）。
+/// 标题/艺术家 + 封面缩略图与模糊背景（PNG 压缩，几十 KB 内）。
 fn write_wave_cache(res: &WaveformResult) {
     let Some((cache_path, mtime)) = wave_cache_key(&res.path) else {
         return;
     };
-    // 封面缩略图编码为 PNG（RGBA → PNG 通常缩到 1/3 以下）。
-    let cover_png: Option<Vec<u8>> = res.cover.as_ref().and_then(|buf| {
-        let w = buf.width();
-        let h = buf.height();
-        image::RgbaImage::from_raw(w, h, buf.as_bytes().to_vec()).and_then(|img| {
-            let mut png = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-                .map(|_| png)
-                .ok()
-        })
-    });
+    let cover_png = res.cover.as_ref().and_then(encode_png);
+    let bg_png = res.bg.as_ref().and_then(encode_png);
     let mut w = CacheWriter::new()
         .bytes(WAVE_CACHE_MAGIC)
         .u8v(WAVE_CACHE_VERSION)
@@ -283,15 +286,33 @@ fn write_wave_cache(res: &WaveformResult) {
     }
     w = w.bytes(&res.theme);
     w = w.opt_str(&res.title).opt_str(&res.artist);
-    match cover_png {
-        Some(png) => w = w.u8v(1).u32v(png.len() as u32).bytes(&png),
-        None => w = w.u8v(0),
+    for png in [&cover_png, &bg_png] {
+        match png {
+            Some(data) => w = w.u8v(1).u32v(data.len() as u32).bytes(data),
+            None => w = w.u8v(0),
+        }
     }
     let _ = std::fs::create_dir_all(cache_path.parent().unwrap_or(Path::new(".")));
     let tmp = cache_path.with_extension("tmp");
     if std::fs::write(&tmp, w.0).is_ok() {
         // 原子替换：写临时文件再改名，避免读到半截缓存。
         let _ = std::fs::rename(&tmp, &cache_path);
+    }
+}
+
+/// 从缓存流读取一张可选 PNG 位图（封面缩略图 / 模糊背景共用）。
+fn read_cache_png(r: &mut CacheReader) -> Option<Option<SharedPixelBuffer<Rgba8Pixel>>> {
+    match r.u8v()? {
+        0 => Some(None),
+        _ => {
+            let len = r.u32v()? as usize;
+            let png = r.take(len)?;
+            let img = image::load_from_memory(png).ok()?;
+            let rgba = img.to_rgba8();
+            let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(rgba.width(), rgba.height());
+            buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
+            Some(Some(buf))
+        }
     }
 }
 
@@ -326,18 +347,8 @@ fn read_wave_cache(path: &Path) -> Option<WaveformResult> {
     let theme = [theme_bytes[0], theme_bytes[1], theme_bytes[2]];
     let title = r.opt_str()?;
     let artist = r.opt_str()?;
-    let cover = match r.u8v()? {
-        0 => None,
-        _ => {
-            let len = r.u32v()? as usize;
-            let png = r.take(len)?;
-            let img = image::load_from_memory(png).ok()?;
-            let rgba = img.to_rgba8();
-            let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(rgba.width(), rgba.height());
-            buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
-            Some(buf)
-        }
-    };
+    let cover = read_cache_png(&mut r)?;
+    let bg = read_cache_png(&mut r)?;
     // LRU 触碰：把缓存文件修改时间刷到现在。
     if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&cache_path) {
         let _ = f.set_modified(SystemTime::now());
@@ -351,6 +362,7 @@ fn read_wave_cache(path: &Path) -> Option<WaveformResult> {
         artist,
         theme,
         cover,
+        bg,
     })
 }
 
@@ -557,6 +569,127 @@ fn track_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// 搜索过滤器：优先正则（大小写不敏感），非法正则退回普通子串匹配。
+enum Matcher {
+    Regex(regex_lite::Regex),
+    Substring(String),
+}
+
+impl Matcher {
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(name),
+            Self::Substring(s) => name.to_lowercase().contains(s),
+        }
+    }
+}
+
+fn build_matcher(text: &str) -> Option<Matcher> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match regex_lite::Regex::new(&format!("(?i){t}")) {
+        Ok(re) => Some(Matcher::Regex(re)),
+        Err(_) => Some(Matcher::Substring(t.to_lowercase())),
+    }
+}
+
+/// 播放列表的显示视图：完整列表存于 `playlist`，UI 模型是应用搜索过滤后的
+/// 子集。`display_map[display] = real` 把显示行号映射回真实索引；无过滤时
+/// map 保持为空，`real_of` 按恒等处理，行为与旧版完全一致。
+struct PlaylistView {
+    model: Rc<VecModel<PlaylistEntry>>,
+    display_map: Vec<usize>,
+    matcher: Option<Matcher>,
+}
+
+impl PlaylistView {
+    fn new(model: Rc<VecModel<PlaylistEntry>>) -> Self {
+        Self {
+            model,
+            display_map: Vec::new(),
+            matcher: None,
+        }
+    }
+
+    /// 显示行号 → 完整列表真实索引（无过滤时恒等）。
+    fn real_of(&self, display: usize) -> usize {
+        self.display_map.get(display).copied().unwrap_or(display)
+    }
+
+    /// 按当前过滤器重建显示模型（搜索文本变化 / 过滤中增删曲目时调用）。
+    fn rebuild(&mut self, playlist: &[PathBuf]) {
+        self.display_map.clear();
+        let mut rows = Vec::with_capacity(playlist.len());
+        for (real, p) in playlist.iter().enumerate() {
+            let name = track_name(p);
+            if self.matcher.as_ref().is_none_or(|m| m.matches(&name)) {
+                self.display_map.push(real);
+                rows.push(PlaylistEntry {
+                    name: name.into(),
+                    real: real as i32,
+                });
+            }
+        }
+        self.model.set_vec(rows);
+    }
+
+    fn set_filter(&mut self, text: &str, playlist: &[PathBuf]) {
+        self.matcher = build_matcher(text);
+        self.rebuild(playlist);
+    }
+
+    /// 新增曲目后同步显示模型：过滤中整体重建，否则直接追加。
+    fn push(&mut self, real: usize, name: &str, playlist: &[PathBuf]) {
+        if self.matcher.is_some() {
+            self.rebuild(playlist);
+        } else {
+            self.display_map.push(real);
+            self.model.push(PlaylistEntry {
+                name: name.into(),
+                real: real as i32,
+            });
+        }
+    }
+
+    /// 批量新增后同步（文件夹扫描批次：过滤中只重建一次）。
+    fn push_many(&mut self, items: &[(usize, String)], playlist: &[PathBuf]) {
+        if self.matcher.is_some() {
+            self.rebuild(playlist);
+            return;
+        }
+        for (real, name) in items {
+            self.display_map.push(*real);
+            self.model.push(PlaylistEntry {
+                name: name.into(),
+                real: *real as i32,
+            });
+        }
+    }
+
+    /// 删除显示行后同步：过滤中重建，否则直接移除（恒等映射自动保持）。
+    fn removed(&mut self, display: usize, playlist: &[PathBuf]) {
+        if self.matcher.is_some() {
+            self.rebuild(playlist);
+        } else {
+            self.model.remove(display);
+            self.display_map.clear();
+        }
+    }
+
+    /// 重排后同步（仅在无过滤时调用：过滤状态下 UI 已禁用拖动排序）。
+    fn moved(&mut self, from: usize, to: usize) {
+        let name = self.model.remove(from);
+        self.model.insert(to, name);
+    }
+
+    fn cleared(&mut self) {
+        self.model.set_vec(Vec::new());
+        self.display_map.clear();
+    }
+}
+
 /// 尚未完成分析时立即显示的轻量占位波形。
 fn placeholder_bars() -> Vec<f32> {
     (0..WAVE_PLACEHOLDER_BARS)
@@ -598,6 +731,7 @@ fn spawn_waveform_worker() -> (Sender<PathBuf>, Receiver<WaveformResult>) {
                         artist: wf.artist,
                         theme: wf.theme,
                         cover: wf.cover,
+                        bg: wf.bg,
                     }
                 });
                 match result {
@@ -782,20 +916,21 @@ fn apply_waveform(
     state.set_track_title(title.into());
     state.set_track_artist(res.artist.clone().unwrap_or_default().into());
     // 主题色补间（约 400ms 过渡）+ 交叉淡入背景。
+    // 有封面用高模糊封面位图（真实色彩），无封面回退主题色渐变。
     theme.start(res.theme);
-    push_background(
-        state,
-        Image::from_rgba8(render_background(res.theme)),
-        bg_front,
-    );
+    let bg = match &res.bg {
+        Some(buf) => Image::from_rgba8(buf.clone()),
+        None => Image::from_rgba8(render_background(res.theme)),
+    };
+    push_background(state, bg, bg_front);
 }
 
-/// 新文件加入播放列表：去重、同步模型与引擎、空闲时立即播放。
+/// 新文件加入播放列表：去重、同步显示模型与引擎、空闲时立即播放。
 /// 返回新加入项的索引；已存在则返回 `None`。
 fn add_track(
     path: PathBuf,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
-    model: &Rc<VecModel<SharedString>>,
+    view: &Rc<RefCell<PlaylistView>>,
     state: &UIState,
     audio: &AudioEngine,
 ) -> Option<usize> {
@@ -809,9 +944,10 @@ fn add_track(
             return None;
         }
         list.push(path.clone());
-        model.push(track_name(&path).into());
     }
     let idx = playlist.borrow().len() - 1;
+    let name = track_name(&path);
+    view.borrow_mut().push(idx, &name, &playlist.borrow());
     audio.send(Command::SetPlaylist(playlist.borrow().clone()));
     // 加入播放列表时不预先分析：只在 TrackStarted 后排队当前歌曲，
     // 避免用户连续拖入多首长音频时后台 FIFO 任务阻塞当前歌曲。
@@ -828,11 +964,11 @@ fn add_track(
 fn add_tracks_batch(
     paths: &[PathBuf],
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
-    model: &Rc<VecModel<SharedString>>,
+    view: &Rc<RefCell<PlaylistView>>,
     state: &UIState,
     audio: &AudioEngine,
 ) {
-    let mut added = 0usize;
+    let mut added: Vec<(usize, String)> = Vec::new();
     let mut first: Option<usize> = None;
     {
         let mut list = playlist.borrow_mut();
@@ -841,14 +977,14 @@ fn add_tracks_batch(
                 continue;
             }
             list.push(path.clone());
-            model.push(track_name(path).into());
             if first.is_none() {
                 first = Some(list.len() - 1);
             }
-            added += 1;
+            added.push((list.len() - 1, track_name(path)));
         }
     }
-    if added > 0 {
+    if !added.is_empty() {
+        view.borrow_mut().push_many(&added, &playlist.borrow());
         audio.send(Command::SetPlaylist(playlist.borrow().clone()));
         if state.get_playlist_current() < 0
             && let Some(i) = first
@@ -1218,12 +1354,12 @@ fn setup_drag_drop(window: &slint::Window) {
 fn play_file_now(
     path: &PathBuf,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
-    model: &Rc<VecModel<SharedString>>,
+    view: &Rc<RefCell<PlaylistView>>,
     state: &UIState,
     audio: &AudioEngine,
 ) {
     let was_idle = state.get_playlist_current() < 0;
-    let added = add_track(path.clone(), playlist, model, state, audio);
+    let added = add_track(path.clone(), playlist, view, state, audio);
     let idx = added.or_else(|| playlist.borrow().iter().position(|p| p == path));
     // 新增曲目在空闲时由 add_track 自动播放；已存在曲目或正在播放时，
     // 明确调用 play_at，覆盖“停止后重新打开同一文件”的边界情况。
@@ -1238,7 +1374,7 @@ fn play_file_now(
 /// 选中的文件立即播放，而不是只加入列表继续播旧曲。
 fn open_file_dialog(
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
-    model: &Rc<VecModel<SharedString>>,
+    view: &Rc<RefCell<PlaylistView>>,
     state: &UIState,
     audio: &AudioEngine,
 ) {
@@ -1246,7 +1382,7 @@ fn open_file_dialog(
         .add_filter("音频文件", &["mp3", "flac", "wav", "aac", "m4a", "ogg"])
         .pick_file()
     {
-        play_file_now(&path, playlist, model, state, audio);
+        play_file_now(&path, playlist, view, state, audio);
     }
 }
 
@@ -1307,13 +1443,14 @@ fn main() {
 
     // 播放列表（仅保留仍存在的文件，避免启动后大量报错）。
     let playlist: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
-    let playlist_model: Rc<VecModel<SharedString>> = Rc::new(VecModel::default());
+    let playlist_model: Rc<VecModel<PlaylistEntry>> = Rc::new(VecModel::default());
+    let playlist_view = Rc::new(RefCell::new(PlaylistView::new(Rc::clone(&playlist_model))));
     for path in &settings.playlist {
         if path.is_file() {
             playlist.borrow_mut().push(path.clone());
-            playlist_model.push(track_name(path).into());
         }
     }
+    playlist_view.borrow_mut().rebuild(&playlist.borrow());
     state.set_playlist(ModelRc::from(playlist_model.clone()));
     audio.send(Command::SetPlaylist(playlist.borrow().clone()));
 
@@ -1403,11 +1540,16 @@ fn main() {
                         let origin = ui.window().position();
                         let local_x = (cx - origin.x) as f32 / scale;
                         let local_y = (cy - origin.y) as f32 / scale;
+                        // 窗口逻辑尺寸（布局常量均按逻辑像素与 main.slint 对齐）。
+                        let logical_w = ui.window().size().width as f32 / scale;
+                        let logical_h = ui.window().size().height as f32 / scale;
                         // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
-                        let x0 = origin.x + (210.0 * scale) as i32;
-                        let x1 = origin.x + (510.0 * scale) as i32;
-                        let y0 = origin.y + (132.0 * scale) as i32;
-                        let y1 = origin.y + (170.0 * scale) as i32;
+                        let bar_x = (logical_w - 300.0) / 2.0;
+                        let bar_y = logical_h - 46.0;
+                        let x0 = origin.x + (bar_x * scale) as i32;
+                        let x1 = origin.x + ((bar_x + 300.0) * scale) as i32;
+                        let y0 = origin.y + (bar_y * scale) as i32;
+                        let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
                         let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
                         if hovered != state.get_toolbar_hovered() {
                             state.set_toolbar_hovered(hovered);
@@ -1416,20 +1558,24 @@ fn main() {
                         // 光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
                         if state.get_reorder_from() >= 0.0 {
                             state.set_reorder_y(local_y);
-                            // 列表区：y 60..172；上/下缘 22px 内开始滚动，
+                            // 列表区：y 42..(logical_h - 6)；上/下缘 22px 内开始滚动，
                             // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
-                            // 视口范围与 main.slint 一致：[-(vh-112), 0]，vh = 行数*32+2。
+                            // 视口范围与 main.slint 一致：[-(vh-rows*32-2), 0]。
                             const EDGE: f32 = 22.0;
                             const MAX_SPEED: f32 = 6.0;
+                            const LIST_TOP: f32 = 42.0;
+                            const LIST_BOTTOM_GAP: f32 = 6.0;
                             if state.get_reorder_to() >= 0.0 {
                                 let rows = state.get_playlist().row_count() as f32;
-                                let vp_min = 0.0f32.min(112.0 - (rows * 32.0 + 2.0));
+                                let list_h = logical_h - 48.0;
+                                let vp_min = 0.0f32.min(list_h - (rows * 32.0 + 2.0));
                                 let vp = state.get_list_vp_y();
+                                let bottom = logical_h - LIST_BOTTOM_GAP;
                                 // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
-                                let delta = if local_y < 60.0 + EDGE {
-                                    MAX_SPEED * (1.0 - (local_y - 60.0) / EDGE).max(0.15)
-                                } else if local_y > 172.0 - EDGE {
-                                    -MAX_SPEED * (1.0 - (172.0 - local_y) / EDGE).max(0.15)
+                                let delta = if local_y < LIST_TOP + EDGE {
+                                    MAX_SPEED * (1.0 - (local_y - LIST_TOP) / EDGE).max(0.15)
+                                } else if local_y > bottom - EDGE {
+                                    -MAX_SPEED * (1.0 - (bottom - local_y) / EDGE).max(0.15)
                                 } else {
                                     0.0
                                 };
@@ -1440,13 +1586,13 @@ fn main() {
                         }
                         // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
                         // 避免覆盖层收不到“离开”事件导致的高亮滞留。
-                        // 列表区几何与 main.slint 的覆盖层保持一致（720x178 逻辑窗口）。
+                        // 列表区几何与 main.slint 的覆盖层保持一致。
                         let in_list = state.get_playlist_open()
                             && state.get_reorder_from() < 0.0
                             && local_x >= 8.0
-                            && local_x <= 712.0
-                            && local_y >= 60.0
-                            && local_y <= 172.0;
+                            && local_x <= logical_w - 8.0
+                            && local_y >= 42.0
+                            && local_y <= logical_h - 6.0;
                         if !in_list {
                             if state.get_hover_row() >= 0.0 {
                                 state.set_hover_row(-1.0);
@@ -1625,25 +1771,36 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
+        let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
         ui.global::<UIState>().on_play_at(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
-            let index = index.round().max(0.0) as usize;
+            // 显示行号 → 真实索引（搜索过滤后两者不一致）。
+            let index = playlist_view.borrow().real_of(index.round().max(0.0) as usize);
             play_at(index, &playlist, &state, &audio);
         });
     }
-    // 拖动开始时按行索引取歌名填充浮块（Slint 不支持动态模型下标）。
+    // 拖动开始时按显示行号取歌名填充浮块（Slint 不支持动态模型下标）。
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
+        let playlist_view = Rc::clone(&playlist_view);
         ui.global::<UIState>().on_set_reorder_text(move |row| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
-            let row = row.round().max(0.0) as usize;
+            let row = playlist_view.borrow().real_of(row.round().max(0.0) as usize);
             if let Some(p) = playlist.borrow().get(row) {
                 state.set_reorder_text(track_name(p).into());
             }
+        });
+    }
+    // 搜索框文本变化：重建过滤后的显示模型。
+    {
+        let playlist = Rc::clone(&playlist);
+        let playlist_view = Rc::clone(&playlist_view);
+        ui.global::<UIState>().on_search_edited(move |text| {
+            playlist_view.borrow_mut().set_filter(&text, &playlist.borrow());
         });
     }
     // “关于”里的 GitHub 图标：跳转到项目仓库。
@@ -1658,14 +1815,19 @@ fn main() {
         });
     }
     // 列表拖动排序：把 from 行移动到 to 位置（Slint 传来 float，此处取整钳制）。
+    // 搜索过滤中 UI 已禁用起拖，这里再兜底拒绝，防止行号错位。
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
-        let model = Rc::clone(&playlist_model);
+        let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
         ui.global::<UIState>().on_move_track(move |from, to| {
             let Some(ui) = ui_weak.upgrade() else { return };
             let state = ui.global::<UIState>();
+            let mut view = playlist_view.borrow_mut();
+            if view.matcher.is_some() {
+                return;
+            }
             let len = playlist.borrow().len();
             let from = from.round().max(0.0) as usize;
             let to = (to.round().max(0.0) as usize).min(len.saturating_sub(1));
@@ -1674,8 +1836,7 @@ fn main() {
             }
             let item = playlist.borrow_mut().remove(from);
             playlist.borrow_mut().insert(to, item);
-            let name = model.remove(from);
-            model.insert(to, name);
+            view.moved(from, to);
             // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
             let cur = state.get_playlist_current() as i64;
             let (f, t) = (from as i64, to as i64);
@@ -1689,18 +1850,19 @@ fn main() {
                 cur
             };
             state.set_playlist_current(new_cur as i32);
-            state.set_playlist(ModelRc::from(model.clone()));
             audio.send(Command::SetPlaylist(playlist.borrow().clone()));
         });
     }
     // 在资源管理器中打开曲目所在文件夹并选中文件。
     {
         let playlist = Rc::clone(&playlist);
+        let playlist_view = Rc::clone(&playlist_view);
         ui.global::<UIState>().on_open_folder(move |index| {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                if let Some(p) = playlist.borrow().get(index.round().max(0.0) as usize) {
+                let index = playlist_view.borrow().real_of(index.round().max(0.0) as usize);
+                if let Some(p) = playlist.borrow().get(index) {
                     // explorer /select,"路径"：打开文件夹并高亮该文件。
                     let _ = std::process::Command::new("explorer.exe")
                         .raw_arg(format!("/select,\"{}\"", p.display()))
@@ -1716,45 +1878,44 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
-        let model = Rc::clone(&playlist_model);
+        let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
         ui.global::<UIState>().on_remove_track(move |index| {
-            let index = index.round().max(0.0) as usize;
+            let display = index.round().max(0.0) as usize;
+            let real = playlist_view.borrow().real_of(display);
             {
                 let mut list = playlist.borrow_mut();
-                if index >= list.len() {
+                if real >= list.len() {
                     return;
                 }
-                list.remove(index);
-                model.remove(index);
+                list.remove(real);
             }
+            playlist_view.borrow_mut().removed(display, &playlist.borrow());
             if let Some(ui) = ui_weak.upgrade() {
                 let state = ui.global::<UIState>();
                 let cur = state.get_playlist_current();
-                if cur as usize == index {
+                if cur as usize == real {
                     state.set_playlist_current(-1);
-                } else if cur as usize > index {
+                } else if cur as usize > real {
                     state.set_playlist_current(cur - 1);
                 }
-                state.set_playlist(ModelRc::from(model.clone()));
             }
             // 引擎侧同步删除；若删的是当前播放曲目，引擎会自动切到下一首。
-            audio.send(Command::RemoveAt(index));
+            audio.send(Command::RemoveAt(real));
         });
     }
     {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
-        let model = Rc::clone(&playlist_model);
+        let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
         ui.global::<UIState>().on_clear_playlist(move || {
             playlist.borrow_mut().clear();
-            model.set_vec(Vec::new());
+            playlist_view.borrow_mut().cleared();
             audio.send(Command::SetPlaylist(Vec::new()));
             if let Some(ui) = ui_weak.upgrade() {
                 let state = ui.global::<UIState>();
                 state.set_playlist_current(-1);
-                state.set_playlist(ModelRc::from(model.clone()));
             }
         });
     }
@@ -1883,7 +2044,7 @@ fn main() {
     if args.peek().is_some() {
         let first = PathBuf::from(args.next().unwrap());
         if first.is_file() {
-            play_file_now(&first, &playlist, &playlist_model, &state, &audio);
+            play_file_now(&first, &playlist, &playlist_view, &state, &audio);
         }
     }
     for arg in args {
@@ -1891,7 +2052,7 @@ fn main() {
         if path.is_dir() {
             spawn_folder_scan(path, file_tx.clone());
         } else if path.is_file() {
-            let _ = add_track(path, &playlist, &playlist_model, &state, &audio);
+            let _ = add_track(path, &playlist, &playlist_view, &state, &audio);
         }
     }
 
@@ -1903,7 +2064,7 @@ fn main() {
         let audio = Rc::clone(&audio);
         let wave_tx = wave_tx.clone();
         let playlist = Rc::clone(&playlist);
-        let playlist_model = Rc::clone(&playlist_model);
+        let playlist_view = Rc::clone(&playlist_view);
         let waveform_cache = Rc::clone(&waveform_cache);
         let cache_order = Rc::clone(&cache_order);
         let popup_hide_timer = Rc::clone(&popup_hide_timer);
@@ -2082,32 +2243,37 @@ fn main() {
                                     // 大文件夹也能立刻看到列表在增长。
                                     spawn_folder_scan(path, file_tx.clone());
                                 } else {
-                                    let _ =
-                                        add_track(path, &playlist, &playlist_model, &state, &audio);
+                                    let _ = add_track(
+                                        path,
+                                        &playlist,
+                                        &playlist_view,
+                                        &state,
+                                        &audio,
+                                    );
                                 }
                             }
                         }
                         FileEvent::DroppedBatch(paths) => {
-                            add_tracks_batch(&paths, &playlist, &playlist_model, &state, &audio);
+                            add_tracks_batch(&paths, &playlist, &playlist_view, &state, &audio);
                         }
                         FileEvent::OpenFiles(paths) => {
                             // 第二个实例转发的“打开方式”文件：首个立即播放（即使已在列表中），其余仅加入列表。
                             let mut files = paths.iter();
                             if let Some(first) = files.next() {
-                                play_file_now(first, &playlist, &playlist_model, &state, &audio);
+                                play_file_now(first, &playlist, &playlist_view, &state, &audio);
                             }
                             for path in files {
                                 let _ = add_track(
                                     path.clone(),
                                     &playlist,
-                                    &playlist_model,
+                                    &playlist_view,
                                     &state,
                                     &audio,
                                 );
                             }
                         }
                         FileEvent::DoubleClick => {
-                            open_file_dialog(&playlist, &playlist_model, &state, &audio)
+                            open_file_dialog(&playlist, &playlist_view, &state, &audio)
                         }
                         FileEvent::Wheel(delta) => {
                             let step = (delta as f32 / 120.0) * 0.05;
@@ -2177,6 +2343,62 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// 搜索过滤器：正则优先，非法正则退回子串匹配，大小写不敏感。
+    #[test]
+    fn matcher_regex_and_fallback() {
+        let m = build_matcher("^白.*flac$").unwrap();
+        assert!(m.matches("白色封面.flac"));
+        assert!(!m.matches("黑色封面.mp3"));
+
+        // 非法正则（未闭合分组）应退回普通子串匹配而不是报错：
+        // 字面量 "(白金" 仍能在 "(白金版)" 这类歌名里命中。
+        let m = build_matcher("(白金").unwrap();
+        assert!(matches!(m, Matcher::Substring(_)));
+        assert!(m.matches("歌曲(白金版).mp3"));
+
+        // 大小写不敏感。
+        let m = build_matcher("be what").unwrap();
+        assert!(m.matches("Be What You Wanna Be - Darin.flac"));
+
+        // 纯空白：不过滤。
+        assert!(build_matcher("   ").is_none());
+    }
+
+    /// 显示视图：过滤重建与显示行号 → 真实索引的映射。
+    #[test]
+    fn playlist_view_filter_and_mapping() {
+        let model: Rc<VecModel<PlaylistEntry>> = Rc::new(VecModel::default());
+        let mut view = PlaylistView::new(model.clone());
+        let list = vec![
+            PathBuf::from("E:\\m\\白色封面.flac"),
+            PathBuf::from("E:\\m\\黑色封面.mp3"),
+            PathBuf::from("E:\\m\\无封面.wav"),
+        ];
+        view.rebuild(&list);
+        assert_eq!(view.model.row_count(), 3);
+        assert_eq!(view.real_of(2), 2); // 无过滤：恒等映射
+
+        view.set_filter("黑", &list);
+        assert_eq!(view.model.row_count(), 1);
+        assert_eq!(view.real_of(0), 1); // 显示第 0 行 → 真实第 1 行
+
+        view.set_filter("^白.*flac$", &list);
+        assert_eq!(view.model.row_count(), 1);
+        assert_eq!(view.real_of(0), 0);
+
+        view.set_filter("", &list);
+        assert_eq!(view.model.row_count(), 3);
+
+        // 过滤中删除：以删除后的真实列表重建，映射应保持一致。
+        view.set_filter("色", &list);
+        assert_eq!(view.model.row_count(), 2);
+        let list2: Vec<PathBuf> = list[1..].to_vec(); // 真实列表删掉了第 0 项
+        view.removed(0, &list2);
+        assert_eq!(view.model.row_count(), 1);
+        assert_eq!(view.model.row_data(0).unwrap().name, "黑色封面.mp3");
+        assert_eq!(view.real_of(0), 0);
+    }
+
     /// 波形磁盘缓存读写回环：写入后应能原样读回（含封面 PNG 往返）。
     #[test]
     fn wave_cache_roundtrip() {
@@ -2189,6 +2411,7 @@ mod tests {
         let src = fake_appdata.join("song.wav");
         std::fs::write(&src, b"not really audio").unwrap();
         let cover = SharedPixelBuffer::<Rgba8Pixel>::new(4, 4);
+        let bg = SharedPixelBuffer::<Rgba8Pixel>::new(8, 8);
         let res = WaveformResult {
             path: src.clone(),
             bars: (0..waveform_generator::WAVE_BARS)
@@ -2199,6 +2422,7 @@ mod tests {
             artist: None,
             theme: [1, 2, 3],
             cover: Some(cover),
+            bg: Some(bg),
         };
         write_wave_cache(&res);
 
@@ -2211,6 +2435,7 @@ mod tests {
         assert!(read.artist.is_none());
         assert!(read.cover.is_some());
         assert_eq!(read.cover.as_ref().unwrap().width(), 4);
+        assert_eq!(read.bg.as_ref().map(|b| (b.width(), b.height())), Some((8, 8)));
 
         // 源文件 mtime 变化后旧缓存应作废并删除。
         let file = std::fs::OpenOptions::new().append(true).open(&src).unwrap();

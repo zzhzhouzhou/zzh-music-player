@@ -4,3 +4,6 @@
 *.o
 *.a
 zzhMusicPlayer_Setup.exe
+
+# 本地测试音频与封面
+testmedia/

@@ -53,6 +53,8 @@ pub struct Waveform {
     pub theme: [u8; 3],
     /// 内嵌封面缩略图（无封面时为 `None`）。
     pub cover: Option<SharedPixelBuffer<Rgba8Pixel>>,
+    /// 高度模糊的封面背景位图（无封面时为 `None`，UI 回退到主题色渐变）。
+    pub bg: Option<SharedPixelBuffer<Rgba8Pixel>>,
 }
 
 /// 解码取消令牌：保存"当前有效任务"的代次编号。
@@ -152,11 +154,10 @@ pub fn analyze(path: &Path, cancel: &CancelToken) -> Result<Waveform, String> {
     // 的文本帧：MP3 的标题 / 艺术家 / 封面从文件头手动解析兜底补全。
     let (id3_title, id3_artist, id3_cover) = id3_tags(path);
     let cover = cover.or(id3_cover);
-    // 封面只保留小尺寸缩略图（显示 + 主题色都用它），原始压缩字节随即丢弃。
-    let (cover_thumb, theme) = cover
+    let (cover_thumb, bg, theme) = cover
         .as_deref()
-        .and_then(cover_thumbnail)
-        .unwrap_or_else(|| (None, hash_theme(path)));
+        .and_then(cover_assets)
+        .unwrap_or_else(|| (None, None, hash_theme(path)));
 
     let seconds = total_samples as f64 / (f64::from(rate) * f64::from(channels));
     Ok(Waveform {
@@ -166,6 +167,7 @@ pub fn analyze(path: &Path, cancel: &CancelToken) -> Result<Waveform, String> {
         artist: artist.or(id3_artist),
         theme,
         cover: cover_thumb,
+        bg,
     })
 }
 
@@ -686,27 +688,144 @@ fn deunsync(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// 解码内嵌封面：缩略图（最长边 ≤128px）+ 从 16×16 均值提取主题色。
+/// 解码内嵌封面：缩略图（≤128px）、高斯模糊背景与主题色。
 /// 解码失败返回 `None`，调用方回退到文件名哈希主题色。
-fn cover_thumbnail(data: &[u8]) -> Option<(Option<SharedPixelBuffer<Rgba8Pixel>>, [u8; 3])> {
+fn cover_assets(
+    data: &[u8],
+) -> Option<(
+    Option<SharedPixelBuffer<Rgba8Pixel>>,
+    Option<SharedPixelBuffer<Rgba8Pixel>>,
+    [u8; 3],
+)> {
     let img = image::load_from_memory(data).ok()?;
-    // 主题色：缩到 16×16 取平均，再提饱和度/亮度保证渐变好看。
-    let small = img.thumbnail(16, 16).to_rgb8();
-    let count = small.pixels().count().max(1) as u64;
-    let (mut r, mut g, mut b) = (0u64, 0u64, 0u64);
-    for p in small.pixels() {
-        r += u64::from(p[0]);
-        g += u64::from(p[1]);
-        b += u64::from(p[2]);
-    }
-    let theme = normalize_theme([(r / count) as u8, (g / count) as u8, (b / count) as u8]);
+    let theme = extract_theme(&img.thumbnail(32, 32).to_rgb8());
+    let bg = blurred_background(&img);
 
     // 缩略图：转为 RGBA 后整体拷入可跨线程传递的像素缓冲。
     let rgba = img.thumbnail(COVER_THUMB_SIZE, COVER_THUMB_SIZE).to_rgba8();
     let (w, h) = rgba.dimensions();
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
     buf.make_mut_bytes().copy_from_slice(rgba.as_raw());
-    Some((Some(buf), theme))
+    Some((Some(buf), Some(bg), theme))
+}
+
+/// 由封面生成“高度模糊”的背景位图：缩到 64×64 → 高斯模糊 → 放大到 160×96。
+/// 窗口端以 fill + smooth 方式拉伸显示，小图放大自带柔化，无需大尺寸模糊运算。
+/// 像素按自身亮度自适应压暗（越亮压得越狠，白封面也能保持深色 UI 可读性），
+/// 底部再额外加深给控制栏留对比度。
+fn blurred_background(cover: &image::DynamicImage) -> SharedPixelBuffer<Rgba8Pixel> {
+    const W: u32 = 160;
+    const H: u32 = 96;
+    let small = cover.thumbnail(64, 64).to_rgba8();
+    let blurred = image::imageops::blur(&small, 8.0);
+    let up = image::imageops::resize(&blurred, W, H, image::imageops::FilterType::Triangle);
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(W, H);
+    let bytes = buf.make_mut_bytes();
+    for (i, p) in up.pixels().enumerate() {
+        let fy = (i as u32 / W) as f32 / (H - 1) as f32;
+        let lum = (f32::from(p[0]) * 0.30 + f32::from(p[1]) * 0.59 + f32::from(p[2]) * 0.11)
+            / 255.0;
+        let k = (0.42 + 0.46 * (1.0 - lum)) * (1.0 - 0.16 * fy);
+        bytes[i * 4] = (f32::from(p[0]) * k) as u8;
+        bytes[i * 4 + 1] = (f32::from(p[1]) * k) as u8;
+        bytes[i * 4 + 2] = (f32::from(p[2]) * k) as u8;
+        bytes[i * 4 + 3] = 235; // 约 92% 不透明，轻微透出系统亚克力。
+    }
+    buf
+}
+
+/// 从封面小图提取主题色：HSV 色相直方图投票选出“占主导的鲜艳色”。
+///
+/// 旧算法（全图平均后强制 s=0.72/l=0.58）在黑 / 白 / 灰封面上会得到无意义的
+/// 色相（平均色相≈0 即红色），把黑封面渲染成红色背景。现在先过滤掉低饱和、
+/// 近黑近白的“无色相”像素，对剩余鲜艳像素做色相加权投票；鲜艳像素过少时
+/// 返回中性蓝灰主题，而不是强行给一个随机高饱和色。
+fn extract_theme(small: &image::RgbImage) -> [u8; 3] {
+    const HUE_BINS: usize = 36;
+    const NEUTRAL: [u8; 3] = {
+        // 中性主题：hsl(215, 0.22, 0.60) 的蓝灰，与无封面哈希色系协调。
+        // const 块中无法调用运行时函数，直接写死对应 RGB 值。
+        [131u8, 154, 176]
+    };
+
+    let weight = |s: f32, v: f32| s * s * (0.25 + 0.75 * v);
+    let bin_of = |h: f32| ((h / 360.0) * HUE_BINS as f32) as usize % HUE_BINS;
+    // 无色相像素：低饱和或近黑近白。
+    let colorful = |s: f32, v: f32| s >= 0.16 && v >= 0.08 && v <= 0.97;
+
+    let mut bins = [0f32; HUE_BINS];
+    let mut total = 0f32;
+    for p in small.pixels() {
+        let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
+        let w = weight(s, v);
+        total += w;
+        if colorful(s, v) {
+            bins[bin_of(h)] += w;
+        }
+    }
+
+    // 胜出桶 = 自身 + 两邻居的半权投票（避免色相跨桶边界抖动）。
+    let (best_bin, best_w) = (0..HUE_BINS)
+        .map(|i| {
+            (
+                i,
+                bins[i] + 0.5 * (bins[(i + 1) % HUE_BINS] + bins[(i + HUE_BINS - 1) % HUE_BINS]),
+            )
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0, 0.0));
+    if best_w < total * 0.12 || best_w < 1e-6 {
+        return NEUTRAL;
+    }
+
+    // 对胜出桶 ±1 内的像素做加权统计：色相取圆周平均，饱和度/亮度取加权均值。
+    let (mut sin_sum, mut cos_sum) = (0f32, 0f32);
+    let (mut s_sum, mut l_sum, mut n) = (0f32, 0f32, 0f32);
+    for p in small.pixels() {
+        let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
+        if !colorful(s, v) {
+            continue;
+        }
+        let dist = (bin_of(h) as i32 - best_bin as i32).rem_euclid(HUE_BINS as i32);
+        if dist > 1 {
+            continue;
+        }
+        let w = weight(s, v);
+        let rad = h * std::f32::consts::PI / 180.0;
+        sin_sum += rad.sin() * w;
+        cos_sum += rad.cos() * w;
+        let (_, s_hsl, l_hsl) = rgb_to_hsl([p[0], p[1], p[2]]);
+        s_sum += s_hsl * w;
+        l_sum += l_hsl * w;
+        n += w;
+    }
+    if n <= 0.0 {
+        return NEUTRAL;
+    }
+    let hue = sin_sum.atan2(cos_sum).to_degrees().rem_euclid(360.0);
+    // 保持封面自己的色相，只把饱和度 / 亮度调进适合深色 UI 的区间。
+    let s_out = (s_sum / n * 1.2).clamp(0.45, 0.80);
+    let l_out = (l_sum / n).clamp(0.42, 0.60);
+    hsl_to_rgb(hue, s_out, l_out)
+}
+
+/// RGB -> HSV（h 0~360，s/v 0~1）。
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let (r, g, b) = (f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let s = if max <= 0.0 { 0.0 } else { d / max };
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * (((b - r) / d) + 2.0)
+    } else {
+        60.0 * (((r - g) / d) + 4.0)
+    };
+    (h, s, max)
 }
 
 /// 无封面时用文件名哈希生成固定主题色（同一文件每次启动颜色一致）。
@@ -721,12 +840,6 @@ fn hash_theme(path: &Path) -> [u8; 3] {
     let sat = 0.58 + ((hash >> 8) % 30) as f32 / 100.0; // 0.58 ~ 0.87
     let light = 0.46 + ((hash >> 16) % 24) as f32 / 100.0; // 0.46 ~ 0.69
     hsl_to_rgb(hue, sat, light)
-}
-
-/// 把平均色归一化为饱和、明亮的主题色（HSL 空间调整后转回 RGB）。
-fn normalize_theme(rgb: [u8; 3]) -> [u8; 3] {
-    let (h, _s, _l) = rgb_to_hsl(rgb);
-    hsl_to_rgb(h, 0.72, 0.58)
 }
 
 /// RGB -> HSL（h 0~360，s/l 0~1）。
@@ -1057,6 +1170,125 @@ mod tests {
         let (title, artist, _) = parse_id3_body(&tag[10..], 3, 0);
         assert_eq!(title.as_deref(), Some("星尘"));
         assert_eq!(artist.as_deref(), Some("Artist"));
+    }
+
+    /// 黑色封面（旧算法会因平均色相≈0 被强制拉成红色）应得到中性蓝灰主题。
+    #[test]
+    fn theme_black_cover_is_neutral() {
+        let img = image::RgbImage::from_fn(32, 32, |x, y| {
+            let v = 4 + ((x * 7 + y * 13) % 6) as u8; // 近黑带轻微噪声
+            image::Rgb([v, v, v])
+        });
+        let theme = extract_theme(&img);
+        let (_, s, _) = rgb_to_hsl(theme);
+        assert!(s < 0.35, "黑色封面主题不应是高饱和色: {theme:?} s={s}");
+        let neutral = rgb_to_hsl([131, 154, 176]);
+        let (h, _, l) = rgb_to_hsl(theme);
+        assert!((h - neutral.0).abs() < 30.0 && (l - neutral.2).abs() < 0.2);
+    }
+
+    /// 灰白封面同样应得到中性主题；红色封面应保持红色系。
+    #[test]
+    fn theme_hue_follows_dominant_color() {
+        let gray = image::RgbImage::from_fn(32, 32, |x, y| {
+            let v = 150 + ((x + y) % 40) as u8;
+            image::Rgb([v, v, v])
+        });
+        let (_, s, _) = rgb_to_hsl(extract_theme(&gray));
+        assert!(s < 0.35, "灰白封面主题不应是高饱和色: s={s}");
+
+        let red = image::RgbImage::from_fn(32, 32, |_, _| image::Rgb([180, 30, 40]));
+        let (h, s, _) = rgb_to_hsl(extract_theme(&red));
+        assert!(s > 0.4, "红色封面主题应保持饱和: s={s}");
+        assert!(h < 20.0 || h > 340.0, "红色封面主题色相应在红区: h={h}");
+    }
+
+    /// 混合封面：占多数的蓝色应胜出，而不是被少数橙色平均掉。
+    #[test]
+    fn theme_dominant_hue_wins() {
+        let img = image::RgbImage::from_fn(32, 32, |x, _| {
+            if x < 8 {
+                image::Rgb([230, 120, 20]) // 25% 橙
+            } else {
+                image::Rgb([20, 70, 200]) // 75% 蓝
+            }
+        });
+        let (h, _, _) = rgb_to_hsl(extract_theme(&img));
+        assert!(h > 190.0 && h < 260.0, "蓝色应为主色相: h={h}");
+    }
+
+    /// 模糊背景：尺寸固定、接近不透明、整体被压暗（白封面也不能太亮）。
+    #[test]
+    fn blurred_background_dims_bright_covers() {
+        let white = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            64,
+            64,
+            |_, _| image::Rgb([250, 250, 250]),
+        ));
+        let buf = blurred_background(&white);
+        assert_eq!(buf.width(), 160);
+        assert_eq!(buf.height(), 96);
+        let bytes = buf.as_bytes();
+        // 中心亮度应明显低于 250（压暗生效），保持深色 UI 可读性。
+        let mid = ((48 * 160 + 80) * 4) as usize;
+        assert!(bytes[mid] < 140, "白封面背景过亮: {}", bytes[mid]);
+        assert_eq!(bytes[mid + 3], 235);
+
+        let dark = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+            64,
+            64,
+            |_, _| image::Rgb([10, 12, 18]),
+        ));
+        let bytes = blurred_background(&dark).as_bytes().to_vec();
+        let mid = (48 * 160 + 80) * 4;
+        assert!(bytes[mid] < 20 && bytes[mid] > 2, "暗封面背景不应被过度改变");
+    }
+
+    /// 视觉辅助：设置 `ZZH_DUMP_BG=1` 时把几种典型封面的模糊背景转储为 PNG，
+    /// 供人工检查压暗 / 模糊观感。平时不产生任何文件。
+    #[test]
+    fn dump_backgrounds_for_visual_check() {
+        if std::env::var("ZZH_DUMP_BG").as_deref() != Ok("1") {
+            return;
+        }
+        let covers: Vec<(&str, image::RgbImage)> = vec![
+            (
+                "black",
+                image::RgbImage::from_fn(200, 200, |_, _| image::Rgb([8, 8, 10])),
+            ),
+            (
+                "white",
+                image::RgbImage::from_fn(200, 200, |_, _| image::Rgb([244, 244, 240])),
+            ),
+            (
+                "blue_navy",
+                image::RgbImage::from_fn(200, 200, |x, y| {
+                    image::Rgb([
+                        (20 + x / 8) as u8,
+                        (40 + y / 6) as u8,
+                        (120 + x / 10) as u8,
+                    ])
+                }),
+            ),
+            (
+                "mixed",
+                image::RgbImage::from_fn(200, 200, |x, y| {
+                    if x < 100 {
+                        image::Rgb([(200 - y / 2) as u8, 60, 30])
+                    } else {
+                        image::Rgb([30, (80 - y / 4) as u8, 180])
+                    }
+                }),
+            ),
+        ];
+        for (name, img) in covers {
+            let buf = blurred_background(&image::DynamicImage::ImageRgb8(img));
+            let out =
+                image::RgbaImage::from_raw(buf.width(), buf.height(), buf.as_bytes().to_vec())
+                    .unwrap();
+            out.save(std::env::temp_dir().join(format!("zzh_bg_{name}.png")))
+                .unwrap();
+        }
     }
 
     /// 多格式冒烟验证：设置环境变量 `ZZH_TEST_AUDIO_DIR`（目录内含

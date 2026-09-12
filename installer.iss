@@ -2,7 +2,7 @@
 ; 固定 GUID：所有版本保持一致（分号注释必须独占一行，写在值后面会被当作值的一部分）
 AppId={{2E05B647-1616-4F5F-A951-5DE650895527}
 AppName=zzh音乐播放器
-AppVersion=1.1.0
+AppVersion=1.2.0
 AppPublisher=zzhzhouzhou
 DefaultDirName={autopf}\zzhMusicPlayer
 DefaultGroupName=zzh音乐播放器
