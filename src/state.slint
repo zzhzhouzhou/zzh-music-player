@@ -29,8 +29,6 @@ export global DockState {
     in-out property <int> active: 0;
     // 模块声明的面板高度（逻辑像素）。
     in-out property <length> module-height: 140px;
-    // 开/关切换后调用：Rust 侧据此伸展/收回窗口高度。
-    callback dock-changed();
 }
 
 // 主控域：传输控制、主题色与背景、波形、窗口管理。

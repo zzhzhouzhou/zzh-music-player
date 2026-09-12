@@ -1662,10 +1662,10 @@ fn main() {
                         let logical_w = ui.window().size().width as f32 / scale;
                         let logical_h = ui.window().size().height as f32 / scale;
                         // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
-                        let bar_x = (logical_w - 300.0) / 2.0;
+                        let bar_x = (logical_w - 330.0) / 2.0;
                         let bar_y = logical_h - 46.0;
                         let x0 = origin.x + (bar_x * scale) as i32;
-                        let x1 = origin.x + ((bar_x + 300.0) * scale) as i32;
+                        let x1 = origin.x + ((bar_x + 330.0) * scale) as i32;
                         let y0 = origin.y + (bar_y * scale) as i32;
                         let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
                         let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
@@ -2139,27 +2139,7 @@ fn main() {
             set_always_on_top(ui.window(), on);
         });
     }
-    // 停靠区开关：按 DockState 伸展/收回窗口高度。基准高度保持用户手动
-    // 调整的结果，只在原值上增减停靠占用的部分（100ms 泵不再重复处理）。
-    let dock_extra = Rc::new(Cell::new(0.0f32));
-    {
-        let ui_weak = ui.as_weak();
-        let dock_extra = Rc::clone(&dock_extra);
-        ui.global::<DockState>().on_dock_changed(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let dock = ui.global::<DockState>();
-            let extra = if dock.get_open() { dock.get_module_height() } else { 0.0 };
-            let scale = ui.window().scale_factor();
-            let size = ui.window().size();
-            let cur_h = size.height as f32 / scale;
-            let new_h = cur_h - dock_extra.get() + extra;
-            ui.window().set_size(slint::PhysicalSize::new(
-                size.width,
-                (new_h * scale).round() as u32,
-            ));
-            dock_extra.set(extra);
-        });
-    }
+
     // 窗口拖动（空白区域按下 -> 跟随移动）+ 空白区域双击打开文件。
     let drag_state = Rc::new(RefCell::new(None::<(slint::PhysicalPosition, i32, i32)>));
     let last_press = Rc::new(RefCell::new(None::<(Instant, f32, f32)>));

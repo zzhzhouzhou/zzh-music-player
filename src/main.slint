@@ -251,7 +251,9 @@ export component MainWindow inherits Window {
     background: transparent;
     title: "zzhMusicPlayer";
     width: 720px;
-    height: 178px;
+    // 停靠区打开时窗口向下伸展（Slint 绑定直接管理高度）。
+    height: 178px + (DockState.open ? DockState.module-height : 0px);
+    animate height { duration: 200ms; easing: ease-out; }
     default-font-family: "HarmonyOS Sans SC";
 
     // 全局快捷键：空格 播放/暂停，左右方向键 快退/快进 5 秒，
@@ -299,7 +301,7 @@ export component MainWindow inherits Window {
         : (TransportState.seek-lock ? TransportState.seek-lock-frac : played-frac);
 
     // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
-    property <length> bar-x: (root.width - 300px) / 2;
+    property <length> bar-x: (root.width - 330px) / 2;
     // 主控条跟随停靠区抬升：停靠打开时窗口变高，主控条保持在主区域底部。
     property <length> bar-y: root.height - 46px
         - (DockState.open ? DockState.module-height : 0px);
@@ -529,7 +531,7 @@ export component MainWindow inherits Window {
         control_bar := Rectangle {
             x: root.bar-x;
             y: root.bar-y;
-            width: 300px;
+            width: 330px;
             height: 38px;
 
             // 玻璃胶囊背景：深色玻璃常驻；平时几乎隐形（不显示主题色），
@@ -576,10 +578,7 @@ export component MainWindow inherits Window {
                     button-size: 27px;
                     active: DockState.open;
                     source: @image-url("../icons/模块.svg");
-                    clicked => {
-                        DockState.open = !DockState.open;
-                        DockState.dock-changed();
-                    }
+                    clicked => { DockState.open = !DockState.open; }
                 }
                 IconButton {
                     button-size: 27px;
@@ -758,10 +757,7 @@ export component MainWindow inherits Window {
                 y: 8px;
                 button-size: 20px;
                 source: @image-url("../icons/关闭.svg");
-                clicked => {
-                    DockState.open = false;
-                    DockState.dock-changed();
-                }
+                clicked => { DockState.open = false; }
             }
 
             // 模块内容。
