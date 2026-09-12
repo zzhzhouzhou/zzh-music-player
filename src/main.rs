@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use audio_engine::{AudioEngine, Command, Event, PlaybackMode};
+use audio_engine::{AudioEngine, Command, EqSettings, Event, PlaybackMode};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::ComponentHandle;
 use slint::{Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
@@ -558,6 +558,8 @@ struct Settings {
     mode: PlaybackMode,
     pin: bool,
     current: Option<PathBuf>,
+    /// 均衡器参数（当前版本无 UI，仅前向兼容存储；EQ 模块接入后由界面更新）。
+    eq: EqSettings,
 }
 
 /// 设置文件路径：%APPDATA%\zzhMusicPlayer\settings.txt。
@@ -594,6 +596,16 @@ fn load_settings() -> Settings {
             }
             "pin" => s.pin = value == "1",
             "current" => s.current = Some(PathBuf::from(value)),
+            // eq=启用,增益0,增益1,...,增益9（dB）
+            "eq" => {
+                let mut it = value.split(',').map(|v| v.trim().parse::<f32>().unwrap_or(0.0));
+                s.eq.enabled = it.next().unwrap_or(0.0) > 0.5;
+                for (i, g) in it.enumerate() {
+                    if i < EqSettings::default().gains.len() {
+                        s.eq.gains[i] = g.clamp(-12.0, 12.0);
+                    }
+                }
+            }
             "playlist" => s.playlist.push(PathBuf::from(value)),
             _ => {}
         }
@@ -608,6 +620,7 @@ fn save_settings(
     mode: PlaybackMode,
     pin: bool,
     current: Option<&PathBuf>,
+    eq: &EqSettings,
 ) {
     let path = settings_path();
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
@@ -618,9 +631,17 @@ fn save_settings(
         PlaybackMode::Random => 3,
     };
     let mut out = String::new();
+    let gains = eq
+        .gains
+        .iter()
+        .map(|g| format!("{g:.2}"))
+        .collect::<Vec<_>>()
+        .join(",");
     out.push_str(&format!(
-        "volume={volume}\nposition={position}\nmode={mode}\npin={}\n",
-        u8::from(pin)
+        "volume={volume}\nposition={position}\nmode={mode}\npin={}\neq={},{}\n",
+        u8::from(pin),
+        u8::from(eq.enabled),
+        gains
     ));
     if let Some(cur) = current {
         out.push_str(&format!("current={}\n", cur.display()));
@@ -1456,6 +1477,7 @@ fn do_close(
     ui: &MainWindow,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     mode_cell: &Rc<std::cell::Cell<PlaybackMode>>,
+    eq: &EqSettings,
 ) {
     let transport = ui.global::<TransportState>();
             let playlist_state = ui.global::<PlaylistState>();
@@ -1475,6 +1497,7 @@ fn do_close(
         mode_cell.get(),
         transport.get_always_on_top(),
         current.as_ref(),
+        eq,
     );
     let _ = ui.window().hide();
     let _ = slint::quit_event_loop();
@@ -1505,6 +1528,8 @@ fn main() {
     transport.set_mode_text(settings.mode.label().into());
     audio.send(Command::SetVolume(settings.volume));
     audio.send(Command::SetMode(settings.mode));
+    // 均衡器参数下发（当前无 UI 调整入口，随设置持久化前向兼容）。
+    audio.set_eq(settings.eq.clone());
     // 关于界面展示的版本号（单一来源：Cargo.toml）。
     about_state.set_version(app_version().into());
 
@@ -1927,6 +1952,7 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let mode_cell = Rc::clone(&mode_cell);
+        let eq = settings.eq.clone();
         ui.global::<AboutState>().on_install_update(move || {
             let installer = std::env::temp_dir().join(UPDATE_INSTALLER_NAME);
             if !installer.is_file() {
@@ -1964,7 +1990,7 @@ fn main() {
                     .spawn();
             }
             if let Some(ui) = ui_weak.upgrade() {
-                do_close(&ui, &playlist, &mode_cell);
+                do_close(&ui, &playlist, &mode_cell, &eq);
             }
         });
     }
@@ -2088,9 +2114,10 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let mode_cell = Rc::clone(&mode_cell);
+        let eq = settings.eq.clone();
         ui.global::<TransportState>().on_close_window(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                do_close(&ui, &playlist, &mode_cell);
+                do_close(&ui, &playlist, &mode_cell, &eq);
             }
         });
     }
@@ -2265,6 +2292,7 @@ fn main() {
         let theme_tween = Rc::clone(&theme_tween);
         let update_rx = update_rx;
         let update_tx = update_tx.clone();
+        let eq = settings.eq.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(100),
@@ -2485,7 +2513,7 @@ fn main() {
                             // 保存设置并退出（拦截了系统 WM_CLOSE）。
                             let ui = ui_weak.upgrade();
                             if let Some(ui) = ui {
-                                do_close(&ui, &playlist, &mode_cell);
+                                do_close(&ui, &playlist, &mode_cell, &eq);
                             }
                         }
                     }
