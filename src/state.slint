@@ -1,0 +1,108 @@
+// 全局状态分域（阶段 0 拆分）：每个域对应一个未来可独立的模块。
+// 模块组件只 import 自己需要的域；Slint 全局在同编译单元的多窗口实例间共享，
+// 因此阶段 C 的"模块弹出新窗口"可以直接复用这些全局，通信零成本。
+
+// 播放列表行：name 是显示名，real 是在完整播放列表中的真实索引
+// （搜索过滤后显示行号与真实索引不一致，高亮当前曲目用 real 比较）。
+export struct PlaylistEntry {
+    name: string,
+    real: int,
+}
+
+// 更新流程状态机：idle 未检查 → checking → latest/failed，
+// available（发现新版，未下载）→ downloading → ready。
+export enum UpdateState {
+    idle,
+    checking,
+    latest,
+    available,
+    downloading,
+    ready,
+    failed,
+}
+
+// 主控域：传输控制、主题色与背景、波形、窗口管理。
+// 模块（播放列表/关于）只读此域的主题色与粒子时钟。
+export global TransportState {
+    in-out property <float> duration: 0.0;
+    in-out property <float> position: 0.0;
+    in-out property <bool> playing: false;
+    in-out property <bool> always-on-top: false;
+    in-out property <bool> toolbar-hovered: false;
+    in-out property <float> volume: 1.0;
+    in-out property <bool> volume-popup-open: false;
+    in-out property <string> volume-text: "";
+    in-out property <float> particle-time: 0.0;
+    in-out property <color> theme-color: #5ac8fa;
+in-out property <image> bg-image-front;
+in-out property <image> bg-image-back;
+    in-out property <bool> bg-front-showing: true;
+    in-out property <image> cover-image;
+in-out property <bool> has-cover: false;
+in-out property <[float]> wave-bars;
+    in-out property <string> track-title: "";
+    in-out property <string> track-artist: "";
+    in-out property <string> position-text: "0:00";
+    in-out property <string> duration-text: "0:00";
+    in-out property <float> wave-hover-frac: -1.0;
+    in-out property <string> tooltip-text: "";
+    in-out property <string> mode-text: "顺序播放";
+    in-out property <bool> mode-showing: false;
+    in-out property <bool> dragging: false;
+    in-out property <bool> seek-lock: false;
+    in-out property <float> seek-lock-frac: 0.0;
+    in-out property <float> drag-fraction: 0.0;
+    callback toggle-play();
+    callback next();
+    callback previous();
+    callback cycle-mode();
+    callback seek-requested(float);
+    callback seek-relative(float);
+    callback set-volume(float);
+    callback toggle-volume-popup();
+    callback close-window();
+    callback minimize-window();
+    callback toggle-pin();
+    callback window-drag-down(float, float);
+    callback window-drag-move(float, float);
+    callback window-drag-up();
+}
+
+// 播放列表模块状态：真实列表的过滤视图、当前曲目（真实索引）、
+// 搜索过滤、拖拽排序与悬停。
+export global PlaylistState {
+    in-out property <[PlaylistEntry]> playlist: [];
+    in-out property <int> playlist-current: -1;
+    in-out property <bool> playlist-open: false;
+    in-out property <bool> search-open: false;
+    in-out property <string> search-text: "";
+    in-out property <float> reorder-from: -1.0;
+    in-out property <float> reorder-to: -1.0;
+    in-out property <string> reorder-text: "";
+    in-out property <float> reorder-y: 0.0;
+    in-out property <float> hover-row: -1.0;
+    in-out property <float> hover-button: 0.0;
+    in-out property <length> list-vp-y: 0px;
+    callback play-at(float);
+    callback remove-track(float);
+    callback move-track(float, float);
+    callback open-folder(float);
+    callback set-reorder-text(float);
+    callback clear-playlist();
+    callback toggle-playlist();
+    callback search-edited(string);
+}
+
+// 关于与更新模块状态：关于卡片开关、版本号（Cargo.toml 注入）、
+// 更新状态机与下载进度。
+export global AboutState {
+    in-out property <bool> about-open: false;
+    callback open-github();
+    callback check-updates();
+    callback install-update();
+    in-out property <string> version: "";
+    in-out property <UpdateState> update-state: UpdateState.idle;
+    in-out property <float> update-progress: 0.0;
+    in-out property <string> update-latest-version: "";
+    in-out property <string> update-note: "";
+}

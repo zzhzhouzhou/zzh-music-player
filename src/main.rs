@@ -496,7 +496,7 @@ fn trim_wave_cache() {
 /// 预取播放列表中下一首的波形（当前曲目波形就绪后调用）。
 /// 磁盘或内存已有缓存则跳过；用户切歌时后台取消机制会自动让路。
 fn prefetch_next_track(
-    state: &UIState,
+    playlist_state: &PlaylistState,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     waveform_cache: &Rc<RefCell<HashMap<PathBuf, WaveformResult>>>,
     wave_tx: &Sender<PathBuf>,
@@ -505,7 +505,7 @@ fn prefetch_next_track(
     if len <= 1 {
         return;
     }
-    let cur = state.get_playlist_current();
+    let cur = playlist_state.get_playlist_current();
     let next = ((cur + 1).rem_euclid(len as i32)) as usize;
     let path = playlist.borrow()[next].clone();
     if waveform_cache.borrow().contains_key(&path) {
@@ -881,14 +881,14 @@ fn format_time(secs: f32) -> SharedString {
 
 /// 把背景位图交叉淡入到 UI：新图写入当前隐藏层并翻转可见层，
 /// 两层 350ms 透明度动画完成柔和过渡，换曲时背景不再突变。
-fn push_background(state: &UIState, bg: Image, front_showing: &Cell<bool>) {
+fn push_background(transport: &TransportState, bg: Image, front_showing: &Cell<bool>) {
     if front_showing.get() {
-        state.set_bg_image_back(bg);
-        state.set_bg_front_showing(false);
+        transport.set_bg_image_back(bg);
+        transport.set_bg_front_showing(false);
         front_showing.set(false);
     } else {
-        state.set_bg_image_front(bg);
-        state.set_bg_front_showing(true);
+        transport.set_bg_image_front(bg);
+        transport.set_bg_front_showing(true);
         front_showing.set(true);
     }
 }
@@ -919,7 +919,7 @@ impl ThemeTween {
     }
 
     /// 由周期计时器每 tick 调用：推进过渡并返回是否仍需继续。
-    fn tick(&self, state: &UIState, dt_step: f32) -> bool {
+    fn tick(&self, transport: &TransportState, dt_step: f32) -> bool {
         let Some(((fh, fs, fl), (th, ts, tl), started)) = self.active.borrow().as_ref().copied()
         else {
             return false;
@@ -930,7 +930,7 @@ impl ThemeTween {
         let dh = ((th - fh + 540.0).rem_euclid(360.0)) - 180.0;
         let [r, g, b] =
             waveform_generator::hsl_to_rgb(fh + dh * k, fs + (ts - fs) * k, fl + (tl - fl) * k);
-        state.set_theme_color(slint::Color::from_rgb_u8(r, g, b));
+        transport.set_theme_color(slint::Color::from_rgb_u8(r, g, b));
         if t >= 1.0 {
             self.active.borrow_mut().take();
             false
@@ -942,7 +942,7 @@ impl ThemeTween {
 
 /// 把波形结果应用到 UI：波形条、封面、时长、元数据与主题渐变背景。
 fn apply_waveform(
-    state: &UIState,
+    transport: &TransportState,
     res: &WaveformResult,
     bars_model: &Rc<VecModel<f32>>,
     bg_front: &Cell<bool>,
@@ -958,16 +958,16 @@ fn apply_waveform(
     }
     match &res.cover {
         Some(buf) => {
-            state.set_cover_image(Image::from_rgba8(buf.clone()));
-            state.set_has_cover(true);
+            transport.set_cover_image(Image::from_rgba8(buf.clone()));
+            transport.set_has_cover(true);
         }
         None => {
-            state.set_cover_image(Image::default());
-            state.set_has_cover(false);
+            transport.set_cover_image(Image::default());
+            transport.set_has_cover(false);
         }
     }
-    state.set_duration(res.duration.as_secs_f32());
-    state.set_duration_text(format_time(res.duration.as_secs_f32()));
+    transport.set_duration(res.duration.as_secs_f32());
+    transport.set_duration_text(format_time(res.duration.as_secs_f32()));
     // 元数据缺失时退回文件名作为标题。
     let title = res
         .title
@@ -978,8 +978,8 @@ fn apply_waveform(
                 .map(|s| s.to_string_lossy().into_owned())
         })
         .unwrap_or_default();
-    state.set_track_title(title.into());
-    state.set_track_artist(res.artist.clone().unwrap_or_default().into());
+    transport.set_track_title(title.into());
+    transport.set_track_artist(res.artist.clone().unwrap_or_default().into());
     // 主题色补间（约 400ms 过渡）+ 交叉淡入背景。
     // 有封面用高模糊封面位图（中央横带覆盖 + 统一压暗），无封面回退主题色渐变。
     theme.start(res.theme);
@@ -987,7 +987,7 @@ fn apply_waveform(
         Some(buf) => Image::from_rgba8(buf.clone()),
         None => Image::from_rgba8(render_background(res.theme)),
     };
-    push_background(state, bg, bg_front);
+    push_background(transport, bg, bg_front);
 }
 
 /// 新文件加入播放列表：去重、同步显示模型与引擎、空闲时立即播放。
@@ -996,7 +996,7 @@ fn add_track(
     path: PathBuf,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     view: &Rc<RefCell<PlaylistView>>,
-    state: &UIState,
+    playlist_state: &PlaylistState,
     audio: &AudioEngine,
 ) -> Option<usize> {
     // 过滤非文件（不存在的路径 / 目录），静默跳过。
@@ -1017,8 +1017,8 @@ fn add_track(
     // 加入播放列表时不预先分析：只在 TrackStarted 后排队当前歌曲，
     // 避免用户连续拖入多首长音频时后台 FIFO 任务阻塞当前歌曲。
     // 当前没有在播曲目时，新加入的文件立即开始播放。
-    if state.get_playlist_current() < 0 {
-        state.set_playlist_current(idx as i32);
+    if playlist_state.get_playlist_current() < 0 {
+        playlist_state.set_playlist_current(idx as i32);
         audio.send(Command::PlayAt(idx));
     }
     Some(idx)
@@ -1030,7 +1030,7 @@ fn add_tracks_batch(
     paths: &[PathBuf],
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     view: &Rc<RefCell<PlaylistView>>,
-    state: &UIState,
+    playlist_state: &PlaylistState,
     audio: &AudioEngine,
 ) {
     let mut added: Vec<(usize, String)> = Vec::new();
@@ -1051,10 +1051,10 @@ fn add_tracks_batch(
     if !added.is_empty() {
         view.borrow_mut().push_many(&added, &playlist.borrow());
         audio.send(Command::SetPlaylist(playlist.borrow().clone()));
-        if state.get_playlist_current() < 0
+        if playlist_state.get_playlist_current() < 0
             && let Some(i) = first
         {
-            state.set_playlist_current(i as i32);
+            playlist_state.set_playlist_current(i as i32);
             audio.send(Command::PlayAt(i));
         }
     }
@@ -1106,14 +1106,14 @@ fn spawn_folder_scan(root: PathBuf, tx: Sender<FileEvent>) {
 fn play_at(
     index: usize,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
-    state: &UIState,
+    playlist_state: &PlaylistState,
     audio: &AudioEngine,
 ) {
     let list = playlist.borrow();
     if index >= list.len() {
         return;
     }
-    state.set_playlist_current(index as i32);
+    playlist_state.set_playlist_current(index as i32);
     drop(list);
     audio.send(Command::PlayAt(index));
 }
@@ -1420,18 +1420,18 @@ fn play_file_now(
     path: &PathBuf,
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     view: &Rc<RefCell<PlaylistView>>,
-    state: &UIState,
+    playlist_state: &PlaylistState,
     audio: &AudioEngine,
 ) {
-    let was_idle = state.get_playlist_current() < 0;
-    let added = add_track(path.clone(), playlist, view, state, audio);
+    let was_idle = playlist_state.get_playlist_current() < 0;
+    let added = add_track(path.clone(), playlist, view, playlist_state, audio);
     let idx = added.or_else(|| playlist.borrow().iter().position(|p| p == path));
     // 新增曲目在空闲时由 add_track 自动播放；已存在曲目或正在播放时，
     // 明确调用 play_at，覆盖“停止后重新打开同一文件”的边界情况。
     if let Some(idx) = idx
         && (added.is_none() || !was_idle)
     {
-        play_at(idx, playlist, state, audio);
+        play_at(idx, playlist, playlist_state, audio);
     }
 }
 
@@ -1440,14 +1440,14 @@ fn play_file_now(
 fn open_file_dialog(
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     view: &Rc<RefCell<PlaylistView>>,
-    state: &UIState,
+    playlist_state: &PlaylistState,
     audio: &AudioEngine,
 ) {
     if let Some(path) = rfd::FileDialog::new()
         .add_filter("音频文件", &["mp3", "flac", "wav", "aac", "m4a", "ogg"])
         .pick_file()
     {
-        play_file_now(&path, playlist, view, state, audio);
+        play_file_now(&path, playlist, view, playlist_state, audio);
     }
 }
 
@@ -1457,10 +1457,11 @@ fn do_close(
     playlist: &Rc<RefCell<Vec<PathBuf>>>,
     mode_cell: &Rc<std::cell::Cell<PlaybackMode>>,
 ) {
-    let state = ui.global::<UIState>();
+    let transport = ui.global::<TransportState>();
+            let playlist_state = ui.global::<PlaylistState>();
     let current = {
         let list = playlist.borrow();
-        let idx = state.get_playlist_current();
+        let idx = playlist_state.get_playlist_current();
         if idx >= 0 {
             list.get(idx as usize).cloned()
         } else {
@@ -1469,10 +1470,10 @@ fn do_close(
     };
     save_settings(
         &playlist.borrow(),
-        state.get_position(),
-        state.get_volume(),
+        transport.get_position(),
+        transport.get_volume(),
         mode_cell.get(),
-        state.get_always_on_top(),
+        transport.get_always_on_top(),
         current.as_ref(),
     );
     let _ = ui.window().hide();
@@ -1493,22 +1494,24 @@ fn main() {
 
     // —— 恢复记忆设置 ——
     let settings = load_settings();
-    let state = ui.global::<UIState>();
-    state.set_volume(settings.volume);
-    state.set_volume_text(slint::SharedString::from(format!(
+    let transport = ui.global::<TransportState>();
+            let playlist_state = ui.global::<PlaylistState>();
+            let about_state = ui.global::<AboutState>();
+    transport.set_volume(settings.volume);
+    transport.set_volume_text(slint::SharedString::from(format!(
         "{}%",
         (settings.volume * 100.0).round() as u32
     )));
-    state.set_mode_text(settings.mode.label().into());
+    transport.set_mode_text(settings.mode.label().into());
     audio.send(Command::SetVolume(settings.volume));
     audio.send(Command::SetMode(settings.mode));
     // 关于界面展示的版本号（单一来源：Cargo.toml）。
-    state.set_version(app_version().into());
+    about_state.set_version(app_version().into());
 
     // 波形条模型：整个运行期只建一次，换曲时逐行更新数据，
     // Slint 侧复用行元素并触发高度过渡动画，避免整排重建。
     let wave_bars_model: Rc<VecModel<f32>> = Rc::new(VecModel::from(Vec::new()));
-    state.set_wave_bars(ModelRc::from(Rc::clone(&wave_bars_model)));
+    transport.set_wave_bars(ModelRc::from(Rc::clone(&wave_bars_model)));
 
     // 播放列表（仅保留仍存在的文件，避免启动后大量报错）。
     let playlist: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1520,7 +1523,7 @@ fn main() {
         }
     }
     playlist_view.borrow_mut().rebuild(&playlist.borrow());
-    state.set_playlist(ModelRc::from(playlist_model.clone()));
+    playlist_state.set_playlist(ModelRc::from(playlist_model.clone()));
     audio.send(Command::SetPlaylist(playlist.borrow().clone()));
 
     let waveform_cache: Rc<RefCell<HashMap<PathBuf, WaveformResult>>> =
@@ -1573,8 +1576,8 @@ fn main() {
             slint::TimerMode::SingleShot,
             Duration::from_secs(30),
             move || {
-                let state = probe_ui.global::<UIState>();
-                if state.get_update_state() == UpdateState::Idle {
+                let about_state = probe_ui.global::<AboutState>();
+                if about_state.get_update_state() == UpdateState::Idle {
                     spawn_update_check(probe_tx.clone(), false);
                 }
             },
@@ -1597,30 +1600,32 @@ fn main() {
             Duration::from_millis(33),
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    let state = ui.global::<UIState>();
-                    theme_tween.tick(&state, 0.033);
+                    let transport = ui.global::<TransportState>();
+            let playlist_state = ui.global::<PlaylistState>();
+            let about_state = ui.global::<AboutState>();
+                    theme_tween.tick(&transport, 0.033);
                     // “关于”打开状态同步给 WndProc（滚轮隔离判断用）。
-                    let about = state.get_about_open();
+                    let about = about_state.get_about_open();
                     if ABOUT_OPEN.load(Ordering::Relaxed) != about {
                         ABOUT_OPEN.store(about, Ordering::Relaxed);
                     }
                     // 波形悬停时间提示：仅文本变化时写属性，避免逐帧重排。
-                    let frac = state.get_wave_hover_frac();
-                    let tip = if frac >= 0.0 && state.get_duration() > 0.0 {
+                    let frac = transport.get_wave_hover_frac();
+                    let tip = if frac >= 0.0 && transport.get_duration() > 0.0 {
                         slint::SharedString::from(format!(
                             "{} / {}",
-                            format_time(frac * state.get_duration()),
-                            state.get_duration_text()
+                            format_time(frac * transport.get_duration()),
+                            transport.get_duration_text()
                         ))
                     } else {
                         slint::SharedString::from("")
                     };
-                    if tip != state.get_tooltip_text() {
-                        state.set_tooltip_text(tip);
+                    if tip != transport.get_tooltip_text() {
+                        transport.set_tooltip_text(tip);
                     }
-                    if state.get_playing() {
-                        let t = state.get_particle_time() + 0.033;
-                        state.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
+                    if transport.get_playing() {
+                        let t = transport.get_particle_time() + 0.033;
+                        transport.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
                     }
                     // 工具栏悬停检测：光标进入工具栏矩形范围时让背景变实。
                     if let Some((cx, cy)) = cursor_position() {
@@ -1639,13 +1644,13 @@ fn main() {
                         let y0 = origin.y + (bar_y * scale) as i32;
                         let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
                         let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
-                        if hovered != state.get_toolbar_hovered() {
-                            state.set_toolbar_hovered(hovered);
+                        if hovered != transport.get_toolbar_hovered() {
+                            transport.set_toolbar_hovered(hovered);
                         }
                         // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标；
                         // 光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
-                        if state.get_reorder_from() >= 0.0 {
-                            state.set_reorder_y(local_y);
+                        if playlist_state.get_reorder_from() >= 0.0 {
+                            playlist_state.set_reorder_y(local_y);
                             // 列表区：y 42..(logical_h - 6)；上/下缘 22px 内开始滚动，
                             // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
                             // 视口范围与 main.slint 一致：[-(vh-rows*32-2), 0]。
@@ -1653,11 +1658,11 @@ fn main() {
                             const MAX_SPEED: f32 = 6.0;
                             const LIST_TOP: f32 = 42.0;
                             const LIST_BOTTOM_GAP: f32 = 6.0;
-                            if state.get_reorder_to() >= 0.0 {
-                                let rows = state.get_playlist().row_count() as f32;
+                            if playlist_state.get_reorder_to() >= 0.0 {
+                                let rows = playlist_state.get_playlist().row_count() as f32;
                                 let list_h = logical_h - 48.0;
                                 let vp_min = 0.0f32.min(list_h - (rows * 32.0 + 2.0));
-                                let vp = state.get_list_vp_y();
+                                let vp = playlist_state.get_list_vp_y();
                                 let bottom = logical_h - LIST_BOTTOM_GAP;
                                 // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
                                 let delta = if local_y < LIST_TOP + EDGE {
@@ -1668,25 +1673,25 @@ fn main() {
                                     0.0
                                 };
                                 if delta != 0.0 {
-                                    state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
+                                    playlist_state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
                                 }
                             }
                         }
                         // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
                         // 避免覆盖层收不到“离开”事件导致的高亮滞留。
                         // 列表区几何与 main.slint 的覆盖层保持一致。
-                        let in_list = state.get_playlist_open()
-                            && state.get_reorder_from() < 0.0
+                        let in_list = playlist_state.get_playlist_open()
+                            && playlist_state.get_reorder_from() < 0.0
                             && local_x >= 8.0
                             && local_x <= logical_w - 8.0
                             && local_y >= 42.0
                             && local_y <= logical_h - 6.0;
                         if !in_list {
-                            if state.get_hover_row() >= 0.0 {
-                                state.set_hover_row(-1.0);
+                            if playlist_state.get_hover_row() >= 0.0 {
+                                playlist_state.set_hover_row(-1.0);
                             }
-                            if state.get_hover_button() != 0.0 {
-                                state.set_hover_button(0.0);
+                            if playlist_state.get_hover_button() != 0.0 {
+                                playlist_state.set_hover_button(0.0);
                             }
                         }
                     }
@@ -1699,33 +1704,33 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
-        ui.global::<UIState>().on_toggle_play(move || {
+        ui.global::<TransportState>().on_toggle_play(move || {
             audio.send(Command::Toggle);
             // 本地同步播放状态，供播放/暂停按钮切换对应图标。
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                state.set_playing(!state.get_playing());
+                let transport = ui.global::<TransportState>();
+                transport.set_playing(!transport.get_playing());
             }
         });
     }
     {
         let audio = audio.clone();
-        ui.global::<UIState>()
+        ui.global::<TransportState>()
             .on_next(move || audio.send(Command::Next));
     }
     {
         let audio = audio.clone();
-        ui.global::<UIState>()
+        ui.global::<TransportState>()
             .on_previous(move || audio.send(Command::Prev));
     }
     {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
         let seek_wait = Rc::clone(&seek_wait);
-        ui.global::<UIState>().on_seek_requested(move |fraction| {
+        ui.global::<TransportState>().on_seek_requested(move |fraction| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
-            let target = fraction * state.get_duration();
+            let transport = ui.global::<TransportState>();
+            let target = fraction * transport.get_duration();
             // 点击/拖拽跳转：锁定态，松手后显示立即钉在目标上，
             // 引擎尚未完成 seek 的旧上报由事件泵过滤。
             *seek_wait.borrow_mut() = Some(SeekState::Pending {
@@ -1733,10 +1738,10 @@ fn main() {
                 since: Instant::now(),
                 lock: true,
             });
-            state.set_seek_lock_frac(fraction);
-            state.set_seek_lock(true);
-            state.set_position(target);
-            state.set_position_text(format_time(target));
+            transport.set_seek_lock_frac(fraction);
+            transport.set_seek_lock(true);
+            transport.set_position(target);
+            transport.set_position_text(format_time(target));
             audio.send(Command::Seek(Duration::from_secs_f32(target)));
         });
     }
@@ -1745,11 +1750,11 @@ fn main() {
         let audio = audio.clone();
         let seek_wait = Rc::clone(&seek_wait);
         // 快捷键左右方向键：相对当前播放位置快退/快进 5 秒。
-        ui.global::<UIState>().on_seek_relative(move |delta| {
+        ui.global::<TransportState>().on_seek_relative(move |delta| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
-            let duration = state.get_duration();
-            let target = (state.get_position() + delta)
+            let transport = ui.global::<TransportState>();
+            let duration = transport.get_duration();
+            let target = (transport.get_position() + delta)
                 .clamp(0.0, if duration > 0.0 { duration } else { f32::MAX });
             // 方向键快进快退：不进入锁定态，位置属性直接更新到目标，
             // 由 played-frac 的 200ms 插值动画平滑滑过去；陈旧位置事件
@@ -1759,8 +1764,8 @@ fn main() {
                 since: Instant::now(),
                 lock: false,
             });
-            state.set_position(target);
-            state.set_position_text(format_time(target));
+            transport.set_position(target);
+            transport.set_position_text(format_time(target));
             audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
         });
     }
@@ -1770,14 +1775,14 @@ fn main() {
         let audio = audio.clone();
         let mode_cell = Rc::clone(&mode_cell);
         let mode_hide_timer = Rc::clone(&mode_hide_timer);
-        ui.global::<UIState>().on_cycle_mode(move || {
+        ui.global::<TransportState>().on_cycle_mode(move || {
             let mode = mode_cell.get().cycle();
             mode_cell.set(mode);
             audio.send(Command::SetMode(mode));
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                state.set_mode_text(mode.label().into());
-                state.set_mode_showing(true);
+                let transport = ui.global::<TransportState>();
+                transport.set_mode_text(mode.label().into());
+                transport.set_mode_showing(true);
             }
             mode_hide_timer.restart();
         });
@@ -1790,7 +1795,7 @@ fn main() {
             Duration::from_millis(1600),
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.global::<UIState>().set_mode_showing(false);
+                    ui.global::<TransportState>().set_mode_showing(false);
                 }
             },
         );
@@ -1800,17 +1805,17 @@ fn main() {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
         let popup_hide_timer = Rc::clone(&popup_hide_timer);
-        ui.global::<UIState>().on_set_volume(move |volume| {
+        ui.global::<TransportState>().on_set_volume(move |volume| {
             let volume = volume.clamp(0.0, 1.0);
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                state.set_volume(volume);
-                state.set_volume_text(slint::SharedString::from(format!(
+                let transport = ui.global::<TransportState>();
+                transport.set_volume(volume);
+                transport.set_volume_text(slint::SharedString::from(format!(
                     "{}%",
                     (volume * 100.0).round() as u32
                 )));
                 // 调整音量时保持弹层可见，随后自动收起。
-                state.set_volume_popup_open(true);
+                transport.set_volume_popup_open(true);
             }
             audio.send(Command::SetVolume(volume));
             popup_hide_timer.restart();
@@ -1820,11 +1825,11 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let popup_hide_timer = Rc::clone(&popup_hide_timer);
-        ui.global::<UIState>().on_toggle_volume_popup(move || {
+        ui.global::<TransportState>().on_toggle_volume_popup(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                let open = !state.get_volume_popup_open();
-                state.set_volume_popup_open(open);
+                let transport = ui.global::<TransportState>();
+                let open = !transport.get_volume_popup_open();
+                transport.set_volume_popup_open(open);
                 if open {
                     popup_hide_timer.restart();
                 }
@@ -1839,7 +1844,7 @@ fn main() {
             Duration::from_millis(3000),
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.global::<UIState>().set_volume_popup_open(false);
+                    ui.global::<TransportState>().set_volume_popup_open(false);
                 }
             },
         );
@@ -1849,16 +1854,16 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
-        ui.global::<UIState>().on_toggle_playlist(move || {
+        ui.global::<PlaylistState>().on_toggle_playlist(move || {
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                let open = !state.get_playlist_open();
-                state.set_playlist_open(open);
+            let playlist_state = ui.global::<PlaylistState>();
+                let open = !playlist_state.get_playlist_open();
+                playlist_state.set_playlist_open(open);
                 PLAYLIST_OPEN.store(open, Ordering::Relaxed);
                 if !open {
                     // 收起抽屉时一并清掉搜索过滤，下次展开是完整列表。
-                    state.set_search_open(false);
-                    state.set_search_text(SharedString::default());
+                    playlist_state.set_search_open(false);
+                    playlist_state.set_search_text(SharedString::default());
                     playlist_view.borrow_mut().set_filter("", &playlist.borrow());
                 }
             }
@@ -1869,12 +1874,12 @@ fn main() {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
-        ui.global::<UIState>().on_play_at(move |index| {
+        ui.global::<PlaylistState>().on_play_at(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
+            let playlist_state = ui.global::<PlaylistState>();
             // 显示行号 → 真实索引（搜索过滤后两者不一致）。
             let index = playlist_view.borrow().real_of(index.round().max(0.0) as usize);
-            play_at(index, &playlist, &state, &audio);
+            play_at(index, &playlist, &playlist_state, &audio);
         });
     }
     // 拖动开始时按显示行号取歌名填充浮块（Slint 不支持动态模型下标）。
@@ -1882,12 +1887,12 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
-        ui.global::<UIState>().on_set_reorder_text(move |row| {
+        ui.global::<PlaylistState>().on_set_reorder_text(move |row| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
+            let playlist_state = ui.global::<PlaylistState>();
             let row = playlist_view.borrow().real_of(row.round().max(0.0) as usize);
             if let Some(p) = playlist.borrow().get(row) {
-                state.set_reorder_text(track_name(p).into());
+                playlist_state.set_reorder_text(track_name(p).into());
             }
         });
     }
@@ -1895,7 +1900,7 @@ fn main() {
     {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
-        ui.global::<UIState>().on_search_edited(move |text| {
+        ui.global::<PlaylistState>().on_search_edited(move |text| {
             playlist_view.borrow_mut().set_filter(&text, &playlist.borrow());
         });
     }
@@ -1903,17 +1908,16 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let update_tx = update_tx.clone();
-        ui.global::<UIState>().on_check_updates(move || {
+        ui.global::<AboutState>().on_check_updates(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
+            let about_state = ui.global::<AboutState>();
             // 下载中 / 已就绪 / 检查中不重复触发。
-            if state.get_update_state() == UpdateState::Downloading
-                || state.get_update_state() == UpdateState::Ready
-                || state.get_update_state() == UpdateState::Checking
+            if about_state.get_update_state() == UpdateState::Downloading
+                || about_state.get_update_state() == UpdateState::Ready
+                || about_state.get_update_state() == UpdateState::Checking
             {
                 return;
             }
-            drop(state);
             spawn_update_check(update_tx.clone(), true);
         });
     }
@@ -1923,13 +1927,13 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let mode_cell = Rc::clone(&mode_cell);
-        ui.global::<UIState>().on_install_update(move || {
+        ui.global::<AboutState>().on_install_update(move || {
             let installer = std::env::temp_dir().join(UPDATE_INSTALLER_NAME);
             if !installer.is_file() {
                 if let Some(ui) = ui_weak.upgrade() {
-                    let state = ui.global::<UIState>();
-                    state.set_update_state(UpdateState::Failed);
-                    state.set_update_note("安装包丢失，请重新检查更新".into());
+            let about_state = ui.global::<AboutState>();
+                    about_state.set_update_state(UpdateState::Failed);
+                    about_state.set_update_note("安装包丢失，请重新检查更新".into());
                 }
                 return;
             }
@@ -1944,9 +1948,9 @@ fn main() {
             );
             if std::fs::write(&script_path, script).is_err() {
                 if let Some(ui) = ui_weak.upgrade() {
-                    let state = ui.global::<UIState>();
-                    state.set_update_state(UpdateState::Failed);
-                    state.set_update_note("无法创建安装脚本".into());
+            let about_state = ui.global::<AboutState>();
+                    about_state.set_update_state(UpdateState::Failed);
+                    about_state.set_update_note("无法创建安装脚本".into());
                 }
                 return;
             }
@@ -1966,7 +1970,7 @@ fn main() {
     }
     // “关于”里的 GitHub 图标：跳转到项目仓库。
     {
-        ui.global::<UIState>().on_open_github(move || {
+        ui.global::<AboutState>().on_open_github(move || {
             let _ = std::process::Command::new("rundll32")
                 .args([
                     "url.dll,FileProtocolHandler",
@@ -1982,9 +1986,9 @@ fn main() {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
-        ui.global::<UIState>().on_move_track(move |from, to| {
+        ui.global::<PlaylistState>().on_move_track(move |from, to| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
+            let playlist_state = ui.global::<PlaylistState>();
             let mut view = playlist_view.borrow_mut();
             if view.matcher.is_some() {
                 return;
@@ -1999,7 +2003,7 @@ fn main() {
             playlist.borrow_mut().insert(to, item);
             view.moved(&playlist.borrow());
             // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
-            let cur = state.get_playlist_current() as i64;
+            let cur = playlist_state.get_playlist_current() as i64;
             let (f, t) = (from as i64, to as i64);
             let new_cur = if cur == f {
                 t
@@ -2010,7 +2014,7 @@ fn main() {
             } else {
                 cur
             };
-            state.set_playlist_current(new_cur as i32);
+            playlist_state.set_playlist_current(new_cur as i32);
             audio.send(Command::SetPlaylist(playlist.borrow().clone()));
         });
     }
@@ -2018,7 +2022,7 @@ fn main() {
     {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
-        ui.global::<UIState>().on_open_folder(move |index| {
+        ui.global::<PlaylistState>().on_open_folder(move |index| {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -2041,7 +2045,7 @@ fn main() {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
-        ui.global::<UIState>().on_remove_track(move |index| {
+        ui.global::<PlaylistState>().on_remove_track(move |index| {
             let display = index.round().max(0.0) as usize;
             let real = playlist_view.borrow().real_of(display);
             {
@@ -2053,12 +2057,12 @@ fn main() {
             }
             playlist_view.borrow_mut().removed(&playlist.borrow());
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                let cur = state.get_playlist_current();
+            let playlist_state = ui.global::<PlaylistState>();
+                let cur = playlist_state.get_playlist_current();
                 if cur as usize == real {
-                    state.set_playlist_current(-1);
+                    playlist_state.set_playlist_current(-1);
                 } else if cur as usize > real {
-                    state.set_playlist_current(cur - 1);
+                    playlist_state.set_playlist_current(cur - 1);
                 }
             }
             // 引擎侧同步删除；若删的是当前播放曲目，引擎会自动切到下一首。
@@ -2070,13 +2074,13 @@ fn main() {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
         let audio = audio.clone();
-        ui.global::<UIState>().on_clear_playlist(move || {
+        ui.global::<PlaylistState>().on_clear_playlist(move || {
             playlist.borrow_mut().clear();
             playlist_view.borrow_mut().cleared();
             audio.send(Command::SetPlaylist(Vec::new()));
             if let Some(ui) = ui_weak.upgrade() {
-                let state = ui.global::<UIState>();
-                state.set_playlist_current(-1);
+            let playlist_state = ui.global::<PlaylistState>();
+                playlist_state.set_playlist_current(-1);
             }
         });
     }
@@ -2084,7 +2088,7 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let mode_cell = Rc::clone(&mode_cell);
-        ui.global::<UIState>().on_close_window(move || {
+        ui.global::<TransportState>().on_close_window(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 do_close(&ui, &playlist, &mode_cell);
             }
@@ -2092,7 +2096,7 @@ fn main() {
     }
     {
         let ui_weak = ui.as_weak();
-        ui.global::<UIState>().on_minimize_window(move || {
+        ui.global::<TransportState>().on_minimize_window(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 ui.window().set_minimized(true);
             }
@@ -2100,11 +2104,11 @@ fn main() {
     }
     {
         let ui_weak = ui.as_weak();
-        ui.global::<UIState>().on_toggle_pin(move || {
+        ui.global::<TransportState>().on_toggle_pin(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            let state = ui.global::<UIState>();
-            let on = !state.get_always_on_top();
-            state.set_always_on_top(on);
+            let transport = ui.global::<TransportState>();
+            let on = !transport.get_always_on_top();
+            transport.set_always_on_top(on);
             set_always_on_top(ui.window(), on);
         });
     }
@@ -2116,7 +2120,7 @@ fn main() {
         let drag_state = Rc::clone(&drag_state);
         let last_press = Rc::clone(&last_press);
         let file_tx = file_tx.clone();
-        ui.global::<UIState>().on_window_drag_down(move |x, y| {
+        ui.global::<TransportState>().on_window_drag_down(move |x, y| {
             // 双击检测（窗口类无 CS_DBLCLKS，须自行判定）：两次按下
             // 间隔短且位置接近即视为双击。
             let now = Instant::now();
@@ -2153,7 +2157,7 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let drag_state = Rc::clone(&drag_state);
-        ui.global::<UIState>().on_window_drag_move(move |_, _| {
+        ui.global::<TransportState>().on_window_drag_move(move |_, _| {
             let Some((origin, cx0, cy0)) = *drag_state.borrow() else {
                 return;
             };
@@ -2169,34 +2173,34 @@ fn main() {
     }
     {
         let drag_state = Rc::clone(&drag_state);
-        ui.global::<UIState>().on_window_drag_up(move || {
+        ui.global::<TransportState>().on_window_drag_up(move || {
             *drag_state.borrow_mut() = None;
         });
     }
 
     // 恢复置顶状态与上次播放进度。
     if settings.pin {
-        state.set_always_on_top(true);
+        transport.set_always_on_top(true);
         set_always_on_top(ui.window(), true);
     }
     // 测试辅助：ZZH_OPEN_PLAYLIST=1 启动时直接展开播放列表抽屉。
     if std::env::var("ZZH_OPEN_PLAYLIST").as_deref() == Ok("1") {
-        state.set_playlist_open(true);
+        playlist_state.set_playlist_open(true);
         PLAYLIST_OPEN.store(true, Ordering::Relaxed);
     }
     // 测试辅助：ZZH_OPEN_SEARCH=1 启动时直接展开播放列表搜索框。
     if std::env::var("ZZH_OPEN_SEARCH").as_deref() == Ok("1") {
-        state.set_search_open(true);
+        playlist_state.set_search_open(true);
     }
     // 测试辅助：ZZH_OPEN_ABOUT=1 启动时直接打开“关于”对话框。
     if std::env::var("ZZH_OPEN_ABOUT").as_deref() == Ok("1") {
-        state.set_about_open(true);
+        about_state.set_about_open(true);
         ABOUT_OPEN.store(true, Ordering::Relaxed);
     }
     if let Some(cur) = &settings.current
         && let Some(idx) = playlist.borrow().iter().position(|p| p == cur)
     {
-        state.set_playlist_current(idx as i32);
+        playlist_state.set_playlist_current(idx as i32);
         audio.send(Command::PlayAt(idx));
         if settings.position > 1.0 {
             audio.send(Command::Seek(Duration::from_secs_f32(settings.position)));
@@ -2209,7 +2213,7 @@ fn main() {
     if args.peek().is_some() {
         let first = PathBuf::from(args.next().unwrap());
         if first.is_file() {
-            play_file_now(&first, &playlist, &playlist_view, &state, &audio);
+            play_file_now(&first, &playlist, &playlist_view, &playlist_state, &audio);
         }
     }
     for arg in args {
@@ -2217,7 +2221,7 @@ fn main() {
         if path.is_dir() {
             spawn_folder_scan(path, file_tx.clone());
         } else if path.is_file() {
-            let _ = add_track(path, &playlist, &playlist_view, &state, &audio);
+            let _ = add_track(path, &playlist, &playlist_view, &playlist_state, &audio);
         }
     }
 
@@ -2245,31 +2249,33 @@ fn main() {
             Duration::from_millis(100),
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
-                let state = ui.global::<UIState>();
+                let transport = ui.global::<TransportState>();
+            let playlist_state = ui.global::<PlaylistState>();
+            let about_state = ui.global::<AboutState>();
 
                 while let Some(event) = audio.try_recv_event() {
                     match event {
                         Event::TrackStarted { path } => {
                             current_path = Some(path.clone());
-                            state.set_playing(true);
-                            state.set_position(0.0);
-                            state.set_position_text(format_time(0.0));
+                            transport.set_playing(true);
+                            transport.set_position(0.0);
+                            transport.set_position_text(format_time(0.0));
                             // 新曲目开始：上一首的跳转等待与锁定作废。
                             *seek_wait.borrow_mut() = None;
-                            state.set_seek_lock(false);
-                            state.set_dragging(false);
+                            transport.set_seek_lock(false);
+                            transport.set_dragging(false);
                             let idx = playlist.borrow().iter().position(|p| *p == path);
-                            state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
+                            playlist_state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
                             if let Some(res) = waveform_cache.borrow().get(&path) {
                                 // 内存缓存命中时直接复用，切歌几乎无感。
                                 apply_waveform(
-                                    &state,
+                                    &transport,
                                     res,
                                     &wave_bars_model,
                                     &bg_front,
                                     &theme_tween,
                                 );
-                                prefetch_next_track(&state, &playlist, &waveform_cache, &wave_tx);
+                                prefetch_next_track(&playlist_state, &playlist, &waveform_cache, &wave_tx);
                             } else if let Some(res) = read_wave_cache(&path) {
                                 // 磁盘缓存命中：免整曲解码，元数据/封面/波形一步到位。
                                 {
@@ -2288,14 +2294,14 @@ fn main() {
                                 let res = waveform_cache.borrow().get(&path).cloned();
                                 if let Some(res) = res.as_ref() {
                                     apply_waveform(
-                                        &state,
+                                        &transport,
                                         res,
                                         &wave_bars_model,
                                         &bg_front,
                                         &theme_tween,
                                     );
                                     prefetch_next_track(
-                                        &state,
+                                        &playlist_state,
                                         &playlist,
                                         &waveform_cache,
                                         &wave_tx,
@@ -2310,20 +2316,20 @@ fn main() {
                                     .file_stem()
                                     .map(|s| s.to_string_lossy().into_owned())
                                     .unwrap_or_default();
-                                state.set_track_title(title.into());
-                                state.set_track_artist(SharedString::default());
+                                transport.set_track_title(title.into());
+                                transport.set_track_artist(SharedString::default());
                                 wave_bars_model.set_vec(placeholder_bars());
-                                state.set_cover_image(Image::default());
-                                state.set_has_cover(false);
-                                push_background(&state, Image::default(), &bg_front);
+                                transport.set_cover_image(Image::default());
+                                transport.set_has_cover(false);
+                                push_background(&transport, Image::default(), &bg_front);
                             }
                             eprintln!("开始播放: {:?}", path);
                         }
                         Event::Duration { duration } => {
                             // 解码器可立即提供时长；无需等待完整波形分析。
                             let seconds = duration.as_secs_f32();
-                            state.set_duration(seconds);
-                            state.set_duration_text(format_time(seconds));
+                            transport.set_duration(seconds);
+                            transport.set_duration_text(format_time(seconds));
                         }
                         Event::SeekApplied { position } => {
                             // rodio 已完成 seek；保持目标一个短窗口，吸收已经排队的旧
@@ -2336,12 +2342,12 @@ fn main() {
                                 None => {
                                     // 无在途跳转（如启动恢复进度）：按实际落点钉住，
                                     // 避免锁定期间显示回落到默认的 0。
-                                    let frac = if state.get_duration() > 0.0 {
-                                        (seconds / state.get_duration()).min(1.0)
+                                    let frac = if transport.get_duration() > 0.0 {
+                                        (seconds / transport.get_duration()).min(1.0)
                                     } else {
                                         0.0
                                     };
-                                    state.set_seek_lock_frac(frac);
+                                    transport.set_seek_lock_frac(frac);
                                     (seconds, true)
                                 }
                             };
@@ -2350,9 +2356,9 @@ fn main() {
                                 until: Instant::now() + SEEK_SETTLE_WINDOW,
                                 lock,
                             });
-                            state.set_seek_lock(lock);
-                            state.set_position(target);
-                            state.set_position_text(format_time(target));
+                            transport.set_seek_lock(lock);
+                            transport.set_position(target);
+                            transport.set_position_text(format_time(target));
                         }
                         Event::Position(pos) => {
                             let pos = pos.as_secs_f32();
@@ -2374,29 +2380,29 @@ fn main() {
                                     }
                                     _ => {
                                         *wait = None;
-                                        state.set_seek_lock(false);
+                                        transport.set_seek_lock(false);
                                         pos
                                     }
                                 }
                             };
-                            state.set_position(applied);
-                            state.set_position_text(format_time(applied));
+                            transport.set_position(applied);
+                            transport.set_position_text(format_time(applied));
                         }
                         Event::Finished => {
-                            state.set_playing(false);
-                            state.set_position(state.get_duration());
-                            state.set_position_text(format_time(state.get_duration()));
+                            transport.set_playing(false);
+                            transport.set_position(transport.get_duration());
+                            transport.set_position_text(format_time(transport.get_duration()));
                             *seek_wait.borrow_mut() = None;
-                            state.set_seek_lock(false);
-                            state.set_dragging(false);
+                            transport.set_seek_lock(false);
+                            transport.set_dragging(false);
                             current_path = None;
-                            state.set_playlist_current(-1);
+                            playlist_state.set_playlist_current(-1);
                         }
                         Event::Error(e) => {
                             // 跳转失败：解除预览锁定，进度条回到真实位置。
                             *seek_wait.borrow_mut() = None;
-                            state.set_seek_lock(false);
-                            state.set_dragging(false);
+                            transport.set_seek_lock(false);
+                            transport.set_dragging(false);
                             eprintln!("音频错误: {e}");
                         }
                     }
@@ -2414,43 +2420,43 @@ fn main() {
                                         path,
                                         &playlist,
                                         &playlist_view,
-                                        &state,
+                                        &playlist_state,
                                         &audio,
                                     );
                                 }
                             }
                         }
                         FileEvent::DroppedBatch(paths) => {
-                            add_tracks_batch(&paths, &playlist, &playlist_view, &state, &audio);
+                            add_tracks_batch(&paths, &playlist, &playlist_view, &playlist_state, &audio);
                         }
                         FileEvent::OpenFiles(paths) => {
                             // 第二个实例转发的“打开方式”文件：首个立即播放（即使已在列表中），其余仅加入列表。
                             let mut files = paths.iter();
                             if let Some(first) = files.next() {
-                                play_file_now(first, &playlist, &playlist_view, &state, &audio);
+                                play_file_now(first, &playlist, &playlist_view, &playlist_state, &audio);
                             }
                             for path in files {
                                 let _ = add_track(
                                     path.clone(),
                                     &playlist,
                                     &playlist_view,
-                                    &state,
+                                    &playlist_state,
                                     &audio,
                                 );
                             }
                         }
                         FileEvent::DoubleClick => {
-                            open_file_dialog(&playlist, &playlist_view, &state, &audio)
+                            open_file_dialog(&playlist, &playlist_view, &playlist_state, &audio)
                         }
                         FileEvent::Wheel(delta) => {
                             let step = (delta as f32 / 120.0) * 0.05;
-                            let volume = (state.get_volume() + step).clamp(0.0, 1.0);
-                            state.set_volume(volume);
-                            state.set_volume_text(slint::SharedString::from(format!(
+                            let volume = (transport.get_volume() + step).clamp(0.0, 1.0);
+                            transport.set_volume(volume);
+                            transport.set_volume_text(slint::SharedString::from(format!(
                                 "{}%",
                                 (volume * 100.0).round() as u32
                             )));
-                            state.set_volume_popup_open(true);
+                            transport.set_volume_popup_open(true);
                             audio.send(Command::SetVolume(volume));
                             popup_hide_timer.restart();
                         }
@@ -2483,14 +2489,14 @@ fn main() {
                         let cache = waveform_cache.borrow();
                         if let Some(cached) = cache.get(current_path.as_ref().unwrap().as_path()) {
                             apply_waveform(
-                                &state,
+                                &transport,
                                 cached,
                                 &wave_bars_model,
                                 &bg_front,
                                 &theme_tween,
                             );
                             drop(cache);
-                            prefetch_next_track(&state, &playlist, &waveform_cache, &wave_tx);
+                            prefetch_next_track(&playlist_state, &playlist, &waveform_cache, &wave_tx);
                         }
                     }
                 }
@@ -2498,46 +2504,46 @@ fn main() {
                 while let Ok(ev) = update_rx.try_recv() {
                     match ev {
                         UpdateEvent::Checking => {
-                            state.set_update_state(UpdateState::Checking);
-                            state.set_update_note(SharedString::default());
+                            about_state.set_update_state(UpdateState::Checking);
+                            about_state.set_update_note(SharedString::default());
                         }
                         UpdateEvent::UpToDate => {
-                            state.set_update_state(UpdateState::Latest);
-                            state.set_update_note("已是最新版本".into());
+                            about_state.set_update_state(UpdateState::Latest);
+                            about_state.set_update_note("已是最新版本".into());
                         }
                         UpdateEvent::Available { version, auto_download } => {
-                            state.set_update_latest_version(SharedString::from(version.clone()));
+                            about_state.set_update_latest_version(SharedString::from(version.clone()));
                             if auto_download {
-                                state.set_update_state(UpdateState::Downloading);
-                                state.set_update_progress(0.0);
-                                state.set_update_note(
+                                about_state.set_update_state(UpdateState::Downloading);
+                                about_state.set_update_progress(0.0);
+                                about_state.set_update_note(
                                     format!("正在下载 v{version}…").into(),
                                 );
                                 spawn_update_download(update_tx.clone());
                             } else {
-                                state.set_update_state(UpdateState::Available);
-                                state.set_update_note(format!("发现新版本 v{version}").into());
+                                about_state.set_update_state(UpdateState::Available);
+                                about_state.set_update_note(format!("发现新版本 v{version}").into());
                             }
                         }
                         UpdateEvent::Progress(frac) => {
-                            state.set_update_progress(frac);
-                            state.set_update_note(
+                            about_state.set_update_progress(frac);
+                            about_state.set_update_note(
                                 format!(
                                     "正在下载 v{}… {:.0}%",
-                                    state.get_update_latest_version(),
+                                    about_state.get_update_latest_version(),
                                     frac * 100.0
                                 )
                                 .into(),
                             );
                         }
                         UpdateEvent::Ready => {
-                            state.set_update_state(UpdateState::Ready);
-                            state.set_update_progress(1.0);
-                            state.set_update_note("新版本已就绪".into());
+                            about_state.set_update_state(UpdateState::Ready);
+                            about_state.set_update_progress(1.0);
+                            about_state.set_update_note("新版本已就绪".into());
                         }
                         UpdateEvent::Failed(e) => {
-                            state.set_update_state(UpdateState::Failed);
-                            state.set_update_note(e.into());
+                            about_state.set_update_state(UpdateState::Failed);
+                            about_state.set_update_note(e.into());
                         }
                     }
                 }

@@ -1,0 +1,218 @@
+// 关于与更新模块：遮罩 + 玻璃卡片 + GitHub 图标行（含环形下载进度）。
+import { AboutState, TransportState, UpdateState } from "state.slint";
+import { IconButton } from "widgets.slint";
+
+component AboutCard inherits Rectangle {
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: parent.height;
+            background: #00000066;
+            visible: AboutState.about-open;
+            TouchArea {
+                clicked => { AboutState.about-open = false; }
+            }
+
+            // 卡片：深色玻璃 + 主题色调叠加（与列表抽屉同款方案，
+            // 但透明度更低、内容更清晰）。
+            Rectangle {
+                x: (parent.width - 340px) / 2;
+                y: (parent.height - 164px) / 2;
+                width: 340px;
+                height: 164px;
+                border-radius: 16px;
+                background: #10141cee;
+                border-width: 1px;
+                border-color: #ffffff1f;
+                drop-shadow-offset-y: 4px;
+                drop-shadow-blur: 20px;
+                drop-shadow-color: #00000088;
+
+                // 主题色调叠加层（淡）。
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 100%;
+                    height: 100%;
+                    border-radius: 16px;
+                    background: TransportState.theme-color;
+                    opacity: 0.10;
+                }
+
+                VerticalLayout {
+                    padding-left: 18px;
+                    padding-right: 18px;
+                    padding-top: 14px;
+                    padding-bottom: 10px;
+                    spacing: 5px;
+
+                    Text {
+                        text: "关于 zzhMusicPlayer";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #f2f4f8;
+                    }
+                    Text {
+                        text: "小巧、优雅、美观的音乐播放器";
+                        font-size: 12px;
+                        color: #d6dbe4;
+                    }
+                    Text {
+                        text: "开发者：zzhzhouzhou";
+                        font-size: 12px;
+                        color: #cfd4dd;
+                    }
+                    Text {
+                        text: "版本：" + AboutState.version;
+                        font-size: 12px;
+                        color: #9aa3b2;
+                    }
+
+                    // 底部一行：GitHub 图标（下载中带环形进度，点击打开仓库）
+                    // + 检查更新 / 安装并重启 + 状态说明小字。
+                    HorizontalLayout {
+                        // 与上方文字左对齐，避免整行悬在中间。
+                        alignment: start;
+                        spacing: 10px;
+
+                        // 图标 + 环形下载进度。
+                        Rectangle {
+                            width: 38px;
+                            height: 38px;
+
+                            // 进度未满一圈：主题色弧线随进度扫过。
+                            if AboutState.update-state == UpdateState.downloading
+                                && AboutState.update-progress <= 0.995: Path {
+                                width: 38px;
+                                height: 38px;
+                                viewbox-width: 38;
+                                viewbox-height: 38;
+                                stroke: TransportState.theme-color;
+                                stroke-width: 2.5px;
+                                fill: transparent;
+                                MoveTo { x: 19; y: 3.5; }
+                                ArcTo {
+                                    radius-x: 15.5;
+                                    radius-y: 15.5;
+                                    x: 19 + 15.5 * Math.sin(360deg * AboutState.update-progress);
+                                    y: 3.5 + 15.5 * (1 - Math.cos(360deg * AboutState.update-progress));
+                                    large-arc: AboutState.update-progress > 0.5;
+                                    sweep: true;
+                                }
+                            }
+                            // 下载完成：整圈闭环。
+                            if AboutState.update-state == UpdateState.downloading
+                                && AboutState.update-progress > 0.995: Rectangle {
+                                x: 3.5px;
+                                y: 3.5px;
+                                width: 31px;
+                                height: 31px;
+                                border-radius: 15.5px;
+                                border-width: 2.5px;
+                                border-color: TransportState.theme-color;
+                                background: transparent;
+                            }
+
+                            Rectangle {
+                                width: 30px;
+                                height: 28px;
+                                x: 4px;
+                                y: 5px;
+                                border-radius: 14px;
+                                background: gh-ta.has-hover
+                                    ? TransportState.theme-color.with-alpha(0.30)
+                                    : #ffffff14;
+                                animate background { duration: 120ms; easing: ease-out; }
+                                Image {
+                                    x: (parent.width - 16px) / 2;
+                                    y: (parent.height - 16px) / 2;
+                                    width: 16px;
+                                    height: 16px;
+                                    source: @image-url("../icons/github.svg");
+                                    image-fit: contain;
+                                    image-rendering: smooth;
+                                }
+                                gh-ta := TouchArea {
+                                    clicked => { AboutState.open-github(); }
+                                    mouse-cursor: pointer;
+                                }
+                            }
+                        }
+
+                        // 动作 + 状态说明（竖排，定宽让说明文字省略）。
+                        VerticalLayout {
+                            width: 210px;
+                            alignment: start;
+                            spacing: 3px;
+
+                            // 就绪态：安装并重启按钮（主题色描边玻璃，与播放键同语言）。
+                            if AboutState.update-state == UpdateState.ready: Rectangle {
+                                width: 96px;
+                                height: 22px;
+                                border-radius: 11px;
+                                border-width: 1px;
+                                border-color: TransportState.theme-color.with-alpha(0.55);
+                                background: inst-ta.has-hover
+                                    ? TransportState.theme-color.with-alpha(0.38)
+                                    : TransportState.theme-color.with-alpha(0.20);
+                                animate background { duration: 120ms; }
+                                Text {
+                                    text: "安装并重启";
+                                    font-size: 11px;
+                                    color: #f2f4f8;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                inst-ta := TouchArea {
+                                    clicked => { AboutState.install-update(); }
+                                    mouse-cursor: pointer;
+                                }
+                            }
+                            // 其余状态：检查更新 / 检查中 / 下载中。
+                            if AboutState.update-state != UpdateState.ready: Text {
+                                width: 210px;
+                                height: 22px;
+                                text: AboutState.update-state == UpdateState.checking
+                                    ? "检查中…"
+                                    : (AboutState.update-state == UpdateState.downloading
+                                        ? "下载中" : "检查更新");
+                                font-size: 12px;
+                                color: #9aa3b2;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                upd-ta := TouchArea {
+                                    enabled: AboutState.update-state == UpdateState.idle
+                                        || AboutState.update-state == UpdateState.failed
+                                        || AboutState.update-state == UpdateState.latest
+                                        || AboutState.update-state == UpdateState.available;
+                                    clicked => { AboutState.check-updates(); }
+                                    mouse-cursor: upd-ta.enabled ? pointer : default;
+                                }
+                            }
+
+                            // 状态说明（空闲/检查中为空）。
+                            Text {
+                                visible: AboutState.update-note != "";
+                                height: 14px;
+                                text: AboutState.update-note;
+                                font-size: 10px;
+                                color: AboutState.update-state == UpdateState.failed
+                                    ? #ff9c9c : #9aa3b2;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+
+                IconButton {
+                    x: parent.width - 36px;
+                    y: 6px;
+                    button-size: 24px;
+                    source: @image-url("../icons/关闭.svg");
+                    clicked => { AboutState.about-open = false; }
+                }
+            }
+        }
+}

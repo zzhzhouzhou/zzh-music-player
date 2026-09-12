@@ -1,0 +1,90 @@
+// 通用控件：玻璃图标按钮 / 音量条。被主窗口与各模块复用。
+import { TransportState } from "state.slint";
+
+export component IconButton inherits Rectangle {
+    in property <image> source;
+    in property <bool> active: false;
+    in property <length> button-size: 30px;
+    callback clicked();
+
+    width: button-size;
+    height: button-size;
+    border-radius: button-size / 2;
+    border-width: 1px;
+    // 毛玻璃：近透明底，悬停轻微提亮；active（置顶/弹层/搜索开启）用主题色提示。
+    border-color: ta.has-hover ? #ffffff30 : #ffffff10;
+    background: active ? TransportState.theme-color.with-alpha(0.32)
+        : (ta.has-hover ? #ffffff1f : #ffffff0a);
+    transform-scale: ta.pressed ? 0.92 : (ta.has-hover ? 1.06 : 1.0);
+    animate transform-scale { duration: 100ms; easing: ease-out; }
+    animate background { duration: 120ms; easing: ease-out; }
+    animate border-color { duration: 120ms; easing: ease-out; }
+
+    Image {
+        source: root.source;
+        // 显式居中：未指定 y 的元素在 Slint 中会顶部对齐。
+        x: (button-size - button-size * 0.56) / 2;
+        y: (button-size - button-size * 0.56) / 2;
+        width: button-size * 0.56;
+        height: button-size * 0.56;
+        image-fit: contain;
+        image-rendering: smooth;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+export component VolumeBar inherits Rectangle {
+    in property <float> volume: 1.0;
+    callback changed(float);
+
+    width: 110px;
+    height: 16px;
+    background: transparent;
+
+    // 轨道。
+    Rectangle {
+        y: (parent.height - 5px) / 2;
+        width: 100%;
+        height: 5px;
+        border-radius: 2.5px;
+        background: #ffffff24;
+    }
+    // 已填充部分。
+    Rectangle {
+        x: 0px;
+        y: (parent.height - 5px) / 2;
+        width: max(parent.width * clamp(root.volume, 0.0, 1.0), 0px);
+        height: 5px;
+        border-radius: 2.5px;
+        background: TransportState.theme-color;
+    }
+    // 滑块圆点。
+    Rectangle {
+        x: clamp(parent.width * clamp(root.volume, 0.0, 1.0) - 4px, 0px, parent.width - 8px);
+        y: (parent.height - 8px) / 2;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: #ffffff;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-blur: 3px;
+        drop-shadow-color: #00000073;
+    }
+
+    TouchArea {
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down
+                || (e.kind == PointerEventKind.move && self.pressed)
+            {
+                root.changed(clamp(self.mouse-x / root.width, 0.0, 1.0));
+            }
+        }
+        mouse-cursor: pointer;
+    }
+}
