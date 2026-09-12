@@ -6,6 +6,18 @@
 
 // 播放列表行数据：name 是显示名，real 是在完整播放列表中的真实索引
 // （搜索过滤后显示行号与真实索引不一致，高亮当前曲目用 real 比较）。
+// 更新流程状态机：idle 未检查 → checking → latest/failed，
+// available（发现新版，未下载）→ downloading → ready。
+export enum UpdateState {
+    idle,
+    checking,
+    latest,
+    available,
+    downloading,
+    ready,
+    failed,
+}
+
 export struct PlaylistEntry {
     name: string,
     real: int,
@@ -107,6 +119,15 @@ export global UIState {
     callback window-drag-down(float, float);
     callback window-drag-move(float, float);
     callback window-drag-up();
+    // 更新：检查（发现新版自动下载）/ 安装并重启（静默装完自动拉起）。
+    callback check-updates();
+    callback install-update();
+    // 版本号（Rust 侧从 Cargo.toml 注入）与更新状态机。
+    in-out property <string> version: "";
+    in-out property <UpdateState> update-state: UpdateState.idle;
+    in-out property <float> update-progress: 0.0;
+    in-out property <string> update-latest-version: "";
+    in-out property <string> update-note: "";
 }
 
 // 圆形图标按钮：透明玻璃底 + 发丝描边，悬停轻微提亮、按下缩小回弹。
@@ -753,6 +774,20 @@ export component MainWindow inherits Window {
             button-size: 26px;
             source: @image-url("../icons/关闭.svg");
             clicked => { UIState.close-window(); }
+        }
+        // 有新版本时，关于按钮右上角的主题色小圆点提示。
+        Rectangle {
+            visible: UIState.update-state == UpdateState.available
+                || UIState.update-state == UpdateState.downloading
+                || UIState.update-state == UpdateState.ready;
+            x: root.width - 138px + 19px;
+            y: 4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: UIState.theme-color;
+            border-width: 1px;
+            border-color: #141924;
         }
 
         // 波形进度条（视觉核心）。
@@ -1403,9 +1438,9 @@ export component MainWindow inherits Window {
             // 但透明度更低、内容更清晰）。
             Rectangle {
                 x: (root.width - 340px) / 2;
-                y: (root.height - 150px) / 2;
+                y: (root.height - 164px) / 2;
                 width: 340px;
-                height: 150px;
+                height: 164px;
                 border-radius: 16px;
                 background: #10141cee;
                 border-width: 1px;
@@ -1449,34 +1484,143 @@ export component MainWindow inherits Window {
                         color: #cfd4dd;
                     }
                     Text {
-                        text: "版本：1.2.0";
+                        text: "版本：" + UIState.version;
                         font-size: 12px;
                         color: #9aa3b2;
                     }
 
-                    // 底部联系方式：GitHub 项目仓库图标，点击跳转。
+                    // 底部一行：GitHub 图标（下载中带环形进度，点击打开仓库）
+                    // + 检查更新 / 安装并重启 + 状态说明小字。
                     HorizontalLayout {
-                        alignment: center;
+                        // 与上方文字左对齐，避免整行悬在中间。
+                        alignment: start;
+                        spacing: 10px;
+
+                        // 图标 + 环形下载进度。
                         Rectangle {
-                            width: 30px;
-                            height: 28px;
-                            border-radius: 14px;
-                            background: gh-ta.has-hover
-                                ? UIState.theme-color.with-alpha(0.30)
-                                : #ffffff14;
-                            animate background { duration: 120ms; easing: ease-out; }
-                            Image {
-                                x: (parent.width - 16px) / 2;
-                                y: (parent.height - 16px) / 2;
-                                width: 16px;
-                                height: 16px;
-                                source: @image-url("../icons/github.svg");
-                                image-fit: contain;
-                                image-rendering: smooth;
+                            width: 38px;
+                            height: 38px;
+
+                            // 进度未满一圈：主题色弧线随进度扫过。
+                            if UIState.update-state == UpdateState.downloading
+                                && UIState.update-progress <= 0.995: Path {
+                                width: 38px;
+                                height: 38px;
+                                viewbox-width: 38;
+                                viewbox-height: 38;
+                                stroke: UIState.theme-color;
+                                stroke-width: 2.5px;
+                                fill: transparent;
+                                MoveTo { x: 19; y: 3.5; }
+                                ArcTo {
+                                    radius-x: 15.5;
+                                    radius-y: 15.5;
+                                    x: 19 + 15.5 * Math.sin(360deg * UIState.update-progress);
+                                    y: 3.5 + 15.5 * (1 - Math.cos(360deg * UIState.update-progress));
+                                    large-arc: UIState.update-progress > 0.5;
+                                    sweep: true;
+                                }
                             }
-                            gh-ta := TouchArea {
-                                clicked => { UIState.open-github(); }
-                                mouse-cursor: pointer;
+                            // 下载完成：整圈闭环。
+                            if UIState.update-state == UpdateState.downloading
+                                && UIState.update-progress > 0.995: Rectangle {
+                                x: 3.5px;
+                                y: 3.5px;
+                                width: 31px;
+                                height: 31px;
+                                border-radius: 15.5px;
+                                border-width: 2.5px;
+                                border-color: UIState.theme-color;
+                                background: transparent;
+                            }
+
+                            Rectangle {
+                                width: 30px;
+                                height: 28px;
+                                x: 4px;
+                                y: 5px;
+                                border-radius: 14px;
+                                background: gh-ta.has-hover
+                                    ? UIState.theme-color.with-alpha(0.30)
+                                    : #ffffff14;
+                                animate background { duration: 120ms; easing: ease-out; }
+                                Image {
+                                    x: (parent.width - 16px) / 2;
+                                    y: (parent.height - 16px) / 2;
+                                    width: 16px;
+                                    height: 16px;
+                                    source: @image-url("../icons/github.svg");
+                                    image-fit: contain;
+                                    image-rendering: smooth;
+                                }
+                                gh-ta := TouchArea {
+                                    clicked => { UIState.open-github(); }
+                                    mouse-cursor: pointer;
+                                }
+                            }
+                        }
+
+                        // 动作 + 状态说明（竖排，定宽让说明文字省略）。
+                        VerticalLayout {
+                            width: 210px;
+                            alignment: start;
+                            spacing: 3px;
+
+                            // 就绪态：安装并重启按钮（主题色描边玻璃，与播放键同语言）。
+                            if UIState.update-state == UpdateState.ready: Rectangle {
+                                width: 96px;
+                                height: 22px;
+                                border-radius: 11px;
+                                border-width: 1px;
+                                border-color: UIState.theme-color.with-alpha(0.55);
+                                background: inst-ta.has-hover
+                                    ? UIState.theme-color.with-alpha(0.38)
+                                    : UIState.theme-color.with-alpha(0.20);
+                                animate background { duration: 120ms; }
+                                Text {
+                                    text: "安装并重启";
+                                    font-size: 11px;
+                                    color: #f2f4f8;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                inst-ta := TouchArea {
+                                    clicked => { UIState.install-update(); }
+                                    mouse-cursor: pointer;
+                                }
+                            }
+                            // 其余状态：检查更新 / 检查中 / 下载中。
+                            if UIState.update-state != UpdateState.ready: Text {
+                                width: 210px;
+                                height: 22px;
+                                text: UIState.update-state == UpdateState.checking
+                                    ? "检查中…"
+                                    : (UIState.update-state == UpdateState.downloading
+                                        ? "下载中" : "检查更新");
+                                font-size: 12px;
+                                color: #9aa3b2;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                                upd-ta := TouchArea {
+                                    enabled: UIState.update-state == UpdateState.idle
+                                        || UIState.update-state == UpdateState.failed
+                                        || UIState.update-state == UpdateState.latest
+                                        || UIState.update-state == UpdateState.available;
+                                    clicked => { UIState.check-updates(); }
+                                    mouse-cursor: upd-ta.enabled ? pointer : default;
+                                }
+                            }
+
+                            // 状态说明（空闲/检查中为空）。
+                            Text {
+                                visible: UIState.update-note != "";
+                                height: 14px;
+                                text: UIState.update-note;
+                                font-size: 10px;
+                                color: UIState.update-state == UpdateState.failed
+                                    ? #ff9c9c : #9aa3b2;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
                         }
                     }

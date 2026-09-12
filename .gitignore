@@ -7,3 +7,6 @@ zzhMusicPlayer_Setup.exe
 
 # 本地测试音频与封面
 testmedia/
+
+# ZCode 本地计划文件
+.zcode/

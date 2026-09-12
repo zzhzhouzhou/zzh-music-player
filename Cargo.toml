@@ -8,7 +8,7 @@ icon = "icons/appicon/zzhmp.ico"
 
 [package]
 name = "zzhmusicplayer"
-version = "0.1.0"
+version = "1.3.0"
 edition = "2024"
 description = "极简原生 Rust + Slint 桌面音乐播放器（Windows 11 亚克力毛玻璃）"
 license = "MIT"
@@ -49,6 +49,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_Security",
     "Win32_Foundation",
+    "Win32_Networking_WinInet",
 ] }
 
 [build-dependencies]

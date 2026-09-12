@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio_engine;
+mod updater;
 mod waveform_generator;
 
 use std::cell::{Cell, RefCell};
@@ -78,6 +79,74 @@ const SINGLE_INSTANCE_MUTEX: windows_sys::core::PCWSTR =
 const WM_COPYDATA_OPEN_FILES: usize = 0x5A1E;
 /// 等待已有实例窗口就绪的重试次数与间隔（窗口由 winit 惰性创建）。
 const SINGLE_INSTANCE_RETRIES: u32 = 20;
+/// 更新安装包在临时目录中的文件名。
+const UPDATE_INSTALLER_NAME: &str = "zzhMusicPlayer_Setup-update.exe";
+
+/// 当前版本号（Cargo 版本，与 installer.iss / Release tag 保持一致）。
+/// 测试辅助：环境变量 ZZH_VERSION_OVERRIDE 可覆盖，用于验证更新流程。
+fn app_version() -> &'static str {
+    static VERSION: OnceLock<&'static str> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        if let Ok(v) = std::env::var("ZZH_VERSION_OVERRIDE")
+            && !v.trim().is_empty()
+        {
+            return Box::leak(v.into_boxed_str());
+        }
+        env!("CARGO_PKG_VERSION")
+    })
+}
+
+/// 更新流程事件：检查/下载线程产出，UI 线程 100ms 泵消费。
+#[derive(Clone)]
+enum UpdateEvent {
+    Checking,
+    UpToDate,
+    Available { version: String, auto_download: bool },
+    Progress(f32),
+    Ready,
+    Failed(String),
+}
+
+/// 后台线程检查更新；结果经通道交 UI 线程。
+fn spawn_update_check(tx: Sender<UpdateEvent>, auto_download: bool) {
+    let _ = std::thread::Builder::new()
+        .name("update-check".into())
+        .spawn(move || {
+            let _ = tx.send(UpdateEvent::Checking);
+            match updater::check_latest() {
+                Ok(v) if updater::version_newer(app_version(), &v) => {
+                    let _ = tx.send(UpdateEvent::Available {
+                        version: v,
+                        auto_download,
+                    });
+                }
+                Ok(_) => {
+                    let _ = tx.send(UpdateEvent::UpToDate);
+                }
+                Err(e) => {
+                    let _ = tx.send(UpdateEvent::Failed(e));
+                }
+            }
+        });
+}
+
+/// 后台线程下载安装包到临时目录，进度经通道上报。
+fn spawn_update_download(tx: Sender<UpdateEvent>) {
+    let _ = std::thread::Builder::new()
+        .name("update-download".into())
+        .spawn(move || {
+            let dest = std::env::temp_dir().join(UPDATE_INSTALLER_NAME);
+            let progress_tx = tx.clone();
+            let result =
+                updater::download_installer(&dest, &move |frac| {
+                    let _ = progress_tx.send(UpdateEvent::Progress(frac));
+                });
+            let _ = match result {
+                Ok(()) => tx.send(UpdateEvent::Ready),
+                Err(e) => tx.send(UpdateEvent::Failed(e)),
+            };
+        });
+}
 
 /// 波形生成结果（后台线程产出，UI 线程消费；SharedPixelBuffer 为 Send）。
 /// 相比旧版的两张全宽位图，这里只保存 160 个条形高度与小尺寸封面缩略图，
@@ -668,20 +737,16 @@ impl PlaylistView {
         }
     }
 
-    /// 删除显示行后同步：过滤中重建，否则直接移除（恒等映射自动保持）。
-    fn removed(&mut self, display: usize, playlist: &[PathBuf]) {
-        if self.matcher.is_some() {
-            self.rebuild(playlist);
-        } else {
-            self.model.remove(display);
-            self.display_map.clear();
-        }
+    /// 删除显示行后同步：全量重建（理由同 moved，避免行复用残留）。
+    fn removed(&mut self, playlist: &[PathBuf]) {
+        self.rebuild(playlist);
     }
 
     /// 重排后同步（仅在无过滤时调用：过滤状态下 UI 已禁用拖动排序）。
-    fn moved(&mut self, from: usize, to: usize) {
-        let name = self.model.remove(from);
-        self.model.insert(to, name);
+    /// 全量重建而非 remove+insert：Slint 的 for 行复用在成对的部分更新下
+    /// 可能残留旧行内容，导致显示顺序与真实列表错位（点歌偏移的根源）。
+    fn moved(&mut self, playlist: &[PathBuf]) {
+        self.rebuild(playlist);
     }
 
     fn cleared(&mut self) {
@@ -1423,6 +1488,8 @@ fn main() {
     let (wave_tx, wave_rx) = spawn_waveform_worker();
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>();
     let _ = FILE_EVENTS.set(file_tx.clone());
+    // 更新流程事件通道：检查/下载线程产出，100ms 泵消费。
+    let (update_tx, update_rx) = mpsc::channel::<UpdateEvent>();
 
     // —— 恢复记忆设置 ——
     let settings = load_settings();
@@ -1435,6 +1502,8 @@ fn main() {
     state.set_mode_text(settings.mode.label().into());
     audio.send(Command::SetVolume(settings.volume));
     audio.send(Command::SetMode(settings.mode));
+    // 关于界面展示的版本号（单一来源：Cargo.toml）。
+    state.set_version(app_version().into());
 
     // 波形条模型：整个运行期只建一次，换曲时逐行更新数据，
     // Slint 侧复用行元素并触发高度过渡动画，避免整排重建。
@@ -1492,6 +1561,25 @@ fn main() {
                 setup_drag_drop(ui.window());
             },
         );
+    }
+
+    // 启动 30 秒后静默检查一次更新：失败无感；发现新版本仅在关于按钮
+    // 加小圆点、关于界面内呈现，不弹窗、不自动下载。
+    {
+        let probe_tx = update_tx.clone();
+        let probe_ui = ui.clone_strong();
+        let probe = Rc::new(slint::Timer::default());
+        probe.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_secs(30),
+            move || {
+                let state = probe_ui.global::<UIState>();
+                if state.get_update_state() == UpdateState::Idle {
+                    spawn_update_check(probe_tx.clone(), false);
+                }
+            },
+        );
+        let _ = probe; // 保持计时器存活直到事件循环结束
     }
 
     // 模式提示 / 音量弹层的自动隐藏计时器。
@@ -1811,6 +1899,71 @@ fn main() {
             playlist_view.borrow_mut().set_filter(&text, &playlist.borrow());
         });
     }
+    // 检查更新：手动触发时确认有新版即自动下载（启动探测不自动下载）。
+    {
+        let ui_weak = ui.as_weak();
+        let update_tx = update_tx.clone();
+        ui.global::<UIState>().on_check_updates(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let state = ui.global::<UIState>();
+            // 下载中 / 已就绪 / 检查中不重复触发。
+            if state.get_update_state() == UpdateState::Downloading
+                || state.get_update_state() == UpdateState::Ready
+                || state.get_update_state() == UpdateState::Checking
+            {
+                return;
+            }
+            drop(state);
+            spawn_update_check(update_tx.clone(), true);
+        });
+    }
+    // 安装并重启：拉起分离进程（延迟 2 秒 → 静默安装 → 自动重启新版本），
+    // 本程序随即保存设置退出，安装器不会遇到文件占用。
+    {
+        let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let mode_cell = Rc::clone(&mode_cell);
+        ui.global::<UIState>().on_install_update(move || {
+            let installer = std::env::temp_dir().join(UPDATE_INSTALLER_NAME);
+            if !installer.is_file() {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let state = ui.global::<UIState>();
+                    state.set_update_state(UpdateState::Failed);
+                    state.set_update_note("安装包丢失，请重新检查更新".into());
+                }
+                return;
+            }
+            let Ok(exe) = std::env::current_exe() else { return };
+            // 写临时 .cmd 脚本再拉起：延迟 2 秒（等本程序完全退出）→ 静默安装
+            // → 自动重启新版本。脚本自删除；.cmd 规避 cmd /C 长命令的引号转义问题。
+            let script_path = std::env::temp_dir().join("zzh_update_launch.cmd");
+            let script = format!(
+                "@echo off\r\nping -n 3 127.0.0.1 >nul\r\nstart \"\" /wait \"{}\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART\r\nstart \"\" \"{}\"\r\ndel \"%~f0\"\r\n",
+                installer.display(),
+                exe.display()
+            );
+            if std::fs::write(&script_path, script).is_err() {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let state = ui.global::<UIState>();
+                    state.set_update_state(UpdateState::Failed);
+                    state.set_update_note("无法创建安装脚本".into());
+                }
+                return;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // CREATE_NO_WINDOW：不闪黑框。
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", &script_path.display().to_string()])
+                    .creation_flags(0x0800_0000)
+                    .spawn();
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                do_close(&ui, &playlist, &mode_cell);
+            }
+        });
+    }
     // “关于”里的 GitHub 图标：跳转到项目仓库。
     {
         ui.global::<UIState>().on_open_github(move || {
@@ -1844,7 +1997,7 @@ fn main() {
             }
             let item = playlist.borrow_mut().remove(from);
             playlist.borrow_mut().insert(to, item);
-            view.moved(from, to);
+            view.moved(&playlist.borrow());
             // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
             let cur = state.get_playlist_current() as i64;
             let (f, t) = (from as i64, to as i64);
@@ -1898,7 +2051,7 @@ fn main() {
                 }
                 list.remove(real);
             }
-            playlist_view.borrow_mut().removed(display, &playlist.borrow());
+            playlist_view.borrow_mut().removed(&playlist.borrow());
             if let Some(ui) = ui_weak.upgrade() {
                 let state = ui.global::<UIState>();
                 let cur = state.get_playlist_current();
@@ -2085,6 +2238,8 @@ fn main() {
         let seek_wait = Rc::clone(&seek_wait);
         let bg_front = Rc::clone(&bg_front);
         let theme_tween = Rc::clone(&theme_tween);
+        let update_rx = update_rx;
+        let update_tx = update_tx.clone();
         timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(100),
@@ -2339,6 +2494,53 @@ fn main() {
                         }
                     }
                 }
+                // —— 更新流程事件：驱动关于界面的状态机 ——
+                while let Ok(ev) = update_rx.try_recv() {
+                    match ev {
+                        UpdateEvent::Checking => {
+                            state.set_update_state(UpdateState::Checking);
+                            state.set_update_note(SharedString::default());
+                        }
+                        UpdateEvent::UpToDate => {
+                            state.set_update_state(UpdateState::Latest);
+                            state.set_update_note("已是最新版本".into());
+                        }
+                        UpdateEvent::Available { version, auto_download } => {
+                            state.set_update_latest_version(SharedString::from(version.clone()));
+                            if auto_download {
+                                state.set_update_state(UpdateState::Downloading);
+                                state.set_update_progress(0.0);
+                                state.set_update_note(
+                                    format!("正在下载 v{version}…").into(),
+                                );
+                                spawn_update_download(update_tx.clone());
+                            } else {
+                                state.set_update_state(UpdateState::Available);
+                                state.set_update_note(format!("发现新版本 v{version}").into());
+                            }
+                        }
+                        UpdateEvent::Progress(frac) => {
+                            state.set_update_progress(frac);
+                            state.set_update_note(
+                                format!(
+                                    "正在下载 v{}… {:.0}%",
+                                    state.get_update_latest_version(),
+                                    frac * 100.0
+                                )
+                                .into(),
+                            );
+                        }
+                        UpdateEvent::Ready => {
+                            state.set_update_state(UpdateState::Ready);
+                            state.set_update_progress(1.0);
+                            state.set_update_note("新版本已就绪".into());
+                        }
+                        UpdateEvent::Failed(e) => {
+                            state.set_update_state(UpdateState::Failed);
+                            state.set_update_note(e.into());
+                        }
+                    }
+                }
             },
         );
     }
@@ -2405,7 +2607,7 @@ mod tests {
         view.set_filter("色", &list);
         assert_eq!(view.model.row_count(), 2);
         let list2: Vec<PathBuf> = list[1..].to_vec(); // 真实列表删掉了第 0 项
-        view.removed(0, &list2);
+        view.removed(&list2);
         assert_eq!(view.model.row_count(), 1);
         assert_eq!(view.model.row_data(0).unwrap().name, "黑色封面.mp3");
         assert_eq!(view.real_of(0), 0);
