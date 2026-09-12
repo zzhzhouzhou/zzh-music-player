@@ -1,0 +1,102 @@
+// 形态 A 测试面板：验证停靠机制的占位模块（无实际功能）。
+// 面板 A 验证滑条类交互，面板 B 验证开关类交互；真实模块（均衡器/歌词）
+// 将来替换此组件，停靠机制不变。
+import { DockState, TransportState } from "state.slint";
+import { VolumeBar } from "widgets.slint";
+
+export component TestPanel inherits Rectangle {
+    in property <int> variant;
+
+    // 面板 A 的本地滑条状态（仅演示停靠区内交互可用）。
+    property <float> slider-a: 0.6;
+    property <float> slider-b: 0.3;
+    property <float> slider-c: 0.8;
+    // 面板 B 的本地开关状态。
+    property <bool> switch-a: true;
+    property <bool> switch-b: false;
+
+    // 面板 A：三根滑条，验证停靠区内的指针交互。
+    if root.variant == 0: VerticalLayout {
+        x: 16px;
+        y: 6px;
+        width: parent.width - 32px;
+        height: parent.height - 12px;
+        spacing: 2px;
+
+        HorizontalLayout {
+            height: 26px;
+            spacing: 10px;
+            Text { width: 64px; text: "滑条 一"; font-size: 11px; color: #9aa3b2; vertical-alignment: center; }
+            VolumeBar { width: parent.width - 80px; volume: root.slider-a; changed(v) => { root.slider-a = v; } }
+        }
+        HorizontalLayout {
+            height: 26px;
+            spacing: 10px;
+            Text { width: 64px; text: "滑条 二"; font-size: 11px; color: #9aa3b2; vertical-alignment: center; }
+            VolumeBar { width: parent.width - 80px; volume: root.slider-b; changed(v) => { root.slider-b = v; } }
+        }
+        HorizontalLayout {
+            height: 26px;
+            spacing: 10px;
+            Text { width: 64px; text: "滑条 三"; font-size: 11px; color: #9aa3b2; vertical-alignment: center; }
+            VolumeBar { width: parent.width - 80px; volume: root.slider-c; changed(v) => { root.slider-c = v; } }
+        }
+        Text {
+            height: 14px;
+            text: "形态 A 停靠验证：滑条可拖动，证明停靠区交互完整";
+            font-size: 10px;
+            color: #ffffff59;
+            vertical-alignment: center;
+        }
+    }
+
+    // 面板 B：两个开关 chip，验证停靠区内的点击交互。
+    if root.variant == 1: VerticalLayout {
+        x: 16px;
+        y: 6px;
+        width: parent.width - 32px;
+        height: parent.height - 12px;
+        spacing: 4px;
+
+        HorizontalLayout {
+            height: 26px;
+            spacing: 10px;
+
+            Rectangle {
+                width: 96px;
+                height: 24px;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: root.switch-a ? TransportState.theme-color.with-alpha(0.55) : #ffffff1f;
+                background: root.switch-a ? TransportState.theme-color.with-alpha(0.20) : #ffffff0a;
+                animate background { duration: 120ms; }
+                Text { text: "开关 一"; font-size: 11px; color: #f2f4f8; horizontal-alignment: center; vertical-alignment: center; }
+                ta := TouchArea {
+                    clicked => { root.switch-a = !root.switch-a; }
+                    mouse-cursor: pointer;
+                }
+            }
+            Rectangle {
+                width: 96px;
+                height: 24px;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: root.switch-b ? TransportState.theme-color.with-alpha(0.55) : #ffffff1f;
+                background: root.switch-b ? TransportState.theme-color.with-alpha(0.20) : #ffffff0a;
+                animate background { duration: 120ms; }
+                Text { text: "开关 二"; font-size: 11px; color: #f2f4f8; horizontal-alignment: center; vertical-alignment: center; }
+                tb := TouchArea {
+                    clicked => { root.switch-b = !root.switch-b; }
+                    mouse-cursor: pointer;
+                }
+            }
+        }
+        Text {
+            height: 14px;
+            text: "形态 A 停靠验证：开关可点击，证明停靠区点击路由完整";
+            font-size: 10px;
+            color: #ffffff59;
+            vertical-alignment: center;
+        }
+    }
+}

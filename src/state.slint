@@ -21,6 +21,18 @@ export enum UpdateState {
     failed,
 }
 
+// 停靠区（阶段 A）：模块面板停靠在主窗口底部；open 由主控"模块"按钮切换，
+// 窗口高度由 Rust 侧按 module-height 伸展/收回（兼容用户手动调整的窗口尺寸）。
+export global DockState {
+    in-out property <bool> open: false;
+    // 当前停靠的模块：0 = 测试面板 A，1 = 测试面板 B（验证多模块切换）。
+    in-out property <int> active: 0;
+    // 模块声明的面板高度（逻辑像素）。
+    in-out property <length> module-height: 140px;
+    // 开/关切换后调用：Rust 侧据此伸展/收回窗口高度。
+    callback dock-changed();
+}
+
 // 主控域：传输控制、主题色与背景、波形、窗口管理。
 // 模块（播放列表/关于）只读此域的主题色与粒子时钟。
 export global TransportState {

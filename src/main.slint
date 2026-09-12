@@ -1,10 +1,12 @@
 // 全局与类型再导出：Rust 侧经 include_modules 访问（ui.global::<TransportState>() 等）。
-export { TransportState, PlaylistState, AboutState } from "state.slint";
+export { TransportState, PlaylistState, AboutState, DockState } from "state.slint";
 export { PlaylistEntry, UpdateState } from "state.slint";
-import { TransportState, PlaylistState, AboutState, UpdateState } from "state.slint";
+import { TransportState, PlaylistState, AboutState, UpdateState, DockState } from "state.slint";
 import { IconButton, VolumeBar } from "widgets.slint";
 import { PlaylistDrawer } from "playlist.slint";
 import { AboutCard } from "about.slint";
+import { DockState } from "state.slint";
+import { TestPanel } from "test_panel.slint";
 // zzhMusicPlayer 主界面：无边框、亚克力毛玻璃 + 主题渐变背景。
 // 布局：左侧专辑封面（无封面时隐藏）+ 歌曲/艺术家两行信息、右上角窗口控制；
 // 中部圆润镜像波形进度条（视觉核心，已播主题色 / 未播半透明白）；
@@ -298,7 +300,9 @@ export component MainWindow inherits Window {
 
     // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
     property <length> bar-x: (root.width - 300px) / 2;
-    property <length> bar-y: root.height - 46px;
+    // 主控条跟随停靠区抬升：停靠打开时窗口变高，主控条保持在主区域底部。
+    property <length> bar-y: root.height - 46px
+        - (DockState.open ? DockState.module-height : 0px);
 
     // 最底层：空白区域拖动窗口（含双击打开文件检测）。
     TouchArea {
@@ -567,6 +571,16 @@ export component MainWindow inherits Window {
                 spacing: 7px;
                 alignment: center;
 
+                // 模块停靠区开关（阶段 A 基建；真实模块后续接入）。
+                IconButton {
+                    button-size: 27px;
+                    active: DockState.open;
+                    source: @image-url("../icons/模块.svg");
+                    clicked => {
+                        DockState.open = !DockState.open;
+                        DockState.dock-changed();
+                    }
+                }
                 IconButton {
                     button-size: 27px;
                     source: @image-url("../icons/模式.svg");
@@ -681,6 +695,83 @@ export component MainWindow inherits Window {
             width: root.width;
             height: root.height;
             closed-y: root.height;
+        }
+
+        // 停靠区（阶段 A）：模块面板停靠在主窗口底部，主控条在其上方。
+        // 窗口高度由 Rust 侧按 DockState 伸展/收回（见 100ms 泵的 dock 检测）。
+        Rectangle {
+            visible: DockState.open;
+            x: 0px;
+            y: root.height - DockState.module-height;
+            width: root.width;
+            height: DockState.module-height;
+
+            // 面板玻璃底。
+            Rectangle {
+                x: 8px;
+                y: 4px;
+                width: parent.width - 16px;
+                height: parent.height - 10px;
+                border-radius: 12px;
+                background: #0f131bd9;
+                border-width: 1px;
+                border-color: #ffffff1f;
+            }
+
+            // 模块标签：面板 A / 面板 B（验证多模块切换）。
+            Rectangle {
+                x: 20px;
+                y: 8px;
+                width: 64px;
+                height: 20px;
+                border-radius: 10px;
+                background: DockState.active == 0
+                    ? TransportState.theme-color.with-alpha(0.30) : #ffffff14;
+                animate background { duration: 120ms; }
+                Text { text: "面板 A"; font-size: 11px; color: #f2f4f8;
+                       horizontal-alignment: center; vertical-alignment: center; }
+                ta := TouchArea {
+                    clicked => { DockState.active = 0; }
+                    mouse-cursor: pointer;
+                }
+            }
+            Rectangle {
+                x: 92px;
+                y: 8px;
+                width: 64px;
+                height: 20px;
+                border-radius: 10px;
+                background: DockState.active == 1
+                    ? TransportState.theme-color.with-alpha(0.30) : #ffffff14;
+                animate background { duration: 120ms; }
+                Text { text: "面板 B"; font-size: 11px; color: #f2f4f8;
+                       horizontal-alignment: center; vertical-alignment: center; }
+                tb := TouchArea {
+                    clicked => { DockState.active = 1; }
+                    mouse-cursor: pointer;
+                }
+            }
+
+            // 关闭停靠区。
+            IconButton {
+                x: parent.width - 40px;
+                y: 8px;
+                button-size: 20px;
+                source: @image-url("../icons/关闭.svg");
+                clicked => {
+                    DockState.open = false;
+                    DockState.dock-changed();
+                }
+            }
+
+            // 模块内容。
+            TestPanel {
+                x: 12px;
+                y: 32px;
+                width: parent.width - 24px;
+                height: parent.height - 38px;
+                variant: DockState.active;
+            }
         }
 
         // 关于与更新模块（AboutState.about-open 控制显隐）。
