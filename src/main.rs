@@ -1759,12 +1759,20 @@ fn main() {
     // 播放列表抽屉。
     {
         let ui_weak = ui.as_weak();
+        let playlist = Rc::clone(&playlist);
+        let playlist_view = Rc::clone(&playlist_view);
         ui.global::<UIState>().on_toggle_playlist(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 let state = ui.global::<UIState>();
                 let open = !state.get_playlist_open();
                 state.set_playlist_open(open);
                 PLAYLIST_OPEN.store(open, Ordering::Relaxed);
+                if !open {
+                    // 收起抽屉时一并清掉搜索过滤，下次展开是完整列表。
+                    state.set_search_open(false);
+                    state.set_search_text(SharedString::default());
+                    playlist_view.borrow_mut().set_filter("", &playlist.borrow());
+                }
             }
         });
     }

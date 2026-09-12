@@ -806,7 +806,7 @@ export component MainWindow inherits Window {
             width: 300px;
             height: 38px;
 
-            // 玻璃胶囊背景：近透明深底 + 发丝描边，鼠标靠近后变实保证可读性。
+            // 玻璃胶囊背景：平时几乎隐形（很淡），鼠标靠近后显现保证可读性。
             Rectangle {
                 x: 0px;
                 y: 0px;
@@ -814,9 +814,9 @@ export component MainWindow inherits Window {
                 height: 100%;
                 border-radius: 19px;
                 border-width: 1px;
-                border-color: #ffffff26;
+                border-color: #ffffff1a;
                 background: #0e131d;
-                opacity: UIState.toolbar-hovered ? 0.85 : 0.45;
+                opacity: UIState.toolbar-hovered ? 0.75 : 0.25;
                 animate opacity { duration: 150ms; easing: ease-out; }
                 drop-shadow-offset-y: 3px;
                 drop-shadow-blur: 12px;
@@ -1019,11 +1019,25 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // 搜索开关图标（左上）：未开启时点击展开并聚焦，开启时点击收起并清除过滤。
+            // 头部：标题 + 搜索图标（标题右侧）+ 搜索框 + 清空 + 收起。
+            Text {
+                x: 16px;
+                y: 15px;
+                width: 64px;
+                height: 20px;
+                text: "播放列表";
+                font-size: 13px;
+                font-weight: 600;
+                color: #f2f4f8;
+                vertical-alignment: center;
+            }
+
+            // 搜索开关图标（较小，紧贴标题右侧）：未开启时点击展开并聚焦，
+            // 开启时点击收起并清除过滤。
             IconButton {
-                x: 14px;
-                y: 13px;
-                button-size: 24px;
+                x: 84px;
+                y: 16px;
+                button-size: 20px;
                 active: UIState.search-open;
                 source: @image-url("../icons/搜索.svg");
                 clicked => {
@@ -1037,26 +1051,11 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // 头部：标题（搜索时隐藏）/ 搜索框 / 清空 / 收起。
-            Text {
-                x: 46px;
-                y: 15px;
-                width: 140px;
-                height: 20px;
-                text: "播放列表";
-                font-size: 13px;
-                font-weight: 600;
-                color: #f2f4f8;
-                vertical-alignment: center;
-                opacity: UIState.search-open ? 0.0 : 1.0;
-                animate opacity { duration: 120ms; }
-            }
-
-            // 搜索框：点搜索图标后展开，init 自动聚焦；Esc 或再点图标收起。
+            // 搜索框：展开在标题右侧；失焦或在列表区点击后自动收起。
             if UIState.search-open: Rectangle {
-                x: 14px;
+                x: 110px;
                 y: 11px;
-                width: min(parent.width - 130px, 250px);
+                width: min(parent.width - 240px, 240px);
                 height: 30px;
                 border-radius: 15px;
                 background: #ffffff12;
@@ -1088,6 +1087,14 @@ export component MainWindow inherits Window {
                     color: #f2f4f8;
                     vertical-alignment: center;
                     edited => { UIState.search-edited(UIState.search-text); }
+                    // 失焦自动收起并清除过滤（焦点被其他元素接管时触发）。
+                    changed has-focus => {
+                        if (!self.has-focus && UIState.search-open) {
+                            UIState.search-open = false;
+                            UIState.search-text = "";
+                            UIState.search-edited("");
+                        }
+                    }
                     // 回车播放当前过滤结果的第一首。
                     accepted => {
                         if (UIState.playlist.length > 0) { UIState.play-at(0); }
@@ -1343,6 +1350,13 @@ export component MainWindow inherits Window {
                         UIState.reorder-text = "";
                     }
                     armed-handle = false;
+                    // 搜索框打开时，在列表区的任何点击（播放/删除/空白处）
+                    // 都收起搜索框并恢复完整列表；行动作已在上方按过滤态结算。
+                    if UIState.search-open {
+                        UIState.search-open = false;
+                        UIState.search-text = "";
+                        UIState.search-edited("");
+                    }
                 }
             }
             // 滚轮滚动列表（覆盖层是 Flickable 的兄弟节点，滚轮不会自然到达它，
