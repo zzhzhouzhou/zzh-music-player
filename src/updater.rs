@@ -6,21 +6,20 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use windows_sys::core::w;
 use windows_sys::Win32::Networking::WinInet::{
-    HttpQueryInfoW, InternetCloseHandle, InternetOpenUrlW, InternetOpenW, InternetReadFile,
-    HTTP_QUERY_CONTENT_LENGTH, HTTP_QUERY_FLAG_NUMBER, HTTP_QUERY_STATUS_CODE,
+    HTTP_QUERY_CONTENT_LENGTH, HTTP_QUERY_FLAG_NUMBER, HTTP_QUERY_STATUS_CODE, HttpQueryInfoW,
     INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_RELOAD, INTERNET_FLAG_SECURE,
-    INTERNET_OPEN_TYPE_DIRECT, INTERNET_OPEN_TYPE_PRECONFIG,
+    INTERNET_OPEN_TYPE_DIRECT, INTERNET_OPEN_TYPE_PRECONFIG, InternetCloseHandle, InternetOpenUrlW,
+    InternetOpenW, InternetReadFile,
 };
+use windows_sys::core::w;
 
 /// Releases API：返回最新（非预发布、非草稿）版本信息。
 const RELEASES_API: &str =
     "https://api.github.com/repos/zzhzhouzhou/zzh-music-player/releases/latest";
 /// 最新版本安装包的固定地址（GitHub 自动 302 到最新 Release 的同名附件），
 /// 因此无需解析 API 里的附件列表。
-const INSTALLER_URL: &str =
-    "https://github.com/zzhzhouzhou/zzh-music-player/releases/latest/download/zzhMusicPlayer_Setup.exe";
+const INSTALLER_URL: &str = "https://github.com/zzhzhouzhou/zzh-music-player/releases/latest/download/zzhMusicPlayer_Setup.exe";
 /// GitHub API 要求请求携带 User-Agent。
 const USER_AGENT: &str = "User-Agent: zzhMusicPlayer\r\n";
 
@@ -44,7 +43,8 @@ pub fn download_installer(dest: &Path, on_progress: &dyn Fn(f32)) -> Result<(), 
     // 代理出口常为共享 IP（匿名 API 配额易耗尽、代理亦可能断开），
     // 先走系统代理设置，失败自动回退直连。
     let download = |access: u32| -> Result<(), String> {
-        let (session, request, total) = open_request(INSTALLER_URL, USER_AGENT, usize::MAX, access)?;
+        let (session, request, total) =
+            open_request(INSTALLER_URL, USER_AGENT, usize::MAX, access)?;
         let result = stream_to_file(&request, total, dest, on_progress);
         unsafe {
             InternetCloseHandle(request);
@@ -164,11 +164,7 @@ fn open_request(
 }
 
 /// 查询接口的读取（带 4MB 上限防御）。
-fn http_get(
-    url: &str,
-    max_body: usize,
-    access: u32,
-) -> Result<(u32, Vec<u8>), String> {
+fn http_get(url: &str, max_body: usize, access: u32) -> Result<(u32, Vec<u8>), String> {
     let (session, request, _) = open_request(url, USER_AGENT, max_body, access)?;
     let mut body = Vec::new();
     let result = unsafe {
@@ -266,7 +262,10 @@ mod tests {
         assert!(!version_newer("2.0.0", "1.99.99"));
         // 剥 v 前缀与非数字段容错。
         assert!(version_newer("v1.2.0", "V1.2.1"));
-        assert!(version_newer("1.2.0", "1.2.1-beta".split('-').next().unwrap()));
+        assert!(version_newer(
+            "1.2.0",
+            "1.2.1-beta".split('-').next().unwrap()
+        ));
     }
 
     #[test]
@@ -277,7 +276,7 @@ mod tests {
             "assets":[{"name":"zzhMusicPlayer_Setup.exe"}]}"#;
         let tag = extract_json_string(body, "tag_name").unwrap();
         assert_eq!(tag.trim_start_matches(['v', 'V']), "1.2.0");
-        assert!(version_newer("1.1.0", &tag.trim_start_matches(['v', 'V'])));
+        assert!(version_newer("1.1.0", tag.trim_start_matches(['v', 'V'])));
         assert!(extract_json_string(body, "missing_key").is_none());
         // 值里带转义引号不影响已匹配字段。
         let body2 = r#"{"a":"x\"y","tag_name":"v2.0.0"}"#;

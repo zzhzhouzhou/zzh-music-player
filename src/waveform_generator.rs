@@ -489,7 +489,7 @@ fn parse_id3_body(
             let start = pos + 6;
             let end = (start + fsize).min(body.len());
             let data = &body[start..end];
-            match &id[..] {
+            match id {
                 b"TT2" if title.is_none() => title = id3_text(data),
                 b"TP1" if artist.is_none() => artist = id3_text(data),
                 b"PIC" if cover.is_none() => cover = parse_v22_pic(data),
@@ -536,7 +536,7 @@ fn parse_id3_body(
                     clean = deunsync(data);
                     data = &clean;
                 }
-                match &id[..] {
+                match id {
                     b"TIT2" if title.is_none() => title = id3_text(data),
                     b"TPE1" if artist.is_none() => artist = id3_text(data),
                     b"APIC" if cover.is_none() => cover = parse_apic(data),
@@ -548,7 +548,7 @@ fn parse_id3_body(
                 if fflags & 0x00c0 != 0 {
                     continue;
                 }
-                match &id[..] {
+                match id {
                     b"TIT2" if title.is_none() => title = id3_text(data),
                     b"TPE1" if artist.is_none() => artist = id3_text(data),
                     b"APIC" if cover.is_none() => cover = parse_apic(data),
@@ -688,15 +688,15 @@ fn deunsync(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// 解码内嵌封面：缩略图（≤128px）、高斯模糊背景与主题色。
-/// 解码失败返回 `None`，调用方回退到文件名哈希主题色。
-fn cover_assets(
-    data: &[u8],
-) -> Option<(
+type CoverAssets = (
     Option<SharedPixelBuffer<Rgba8Pixel>>,
     Option<SharedPixelBuffer<Rgba8Pixel>>,
     [u8; 3],
-)> {
+);
+
+/// 解码内嵌封面：缩略图（≤128px）、高斯模糊背景与主题色。
+/// 解码失败返回 `None`，调用方回退到文件名哈希主题色。
+fn cover_assets(data: &[u8]) -> Option<CoverAssets> {
     let img = image::load_from_memory(data).ok()?;
     let theme = extract_theme(&img.thumbnail(32, 32).to_rgb8());
     let bg = blurred_background(&img);
@@ -727,8 +727,8 @@ fn blurred_background(cover: &image::DynamicImage) -> SharedPixelBuffer<Rgba8Pix
     let bytes = buf.make_mut_bytes();
     for (i, p) in up.pixels().enumerate() {
         let fy = (i as u32 / W) as f32 / (H - 1) as f32;
-        let lum = (f32::from(p[0]) * 0.30 + f32::from(p[1]) * 0.59 + f32::from(p[2]) * 0.11)
-            / 255.0;
+        let lum =
+            (f32::from(p[0]) * 0.30 + f32::from(p[1]) * 0.59 + f32::from(p[2]) * 0.11) / 255.0;
         let k = (0.42 + 0.46 * (1.0 - lum)) * (1.0 - 0.16 * fy);
         bytes[i * 4] = (f32::from(p[0]) * k) as u8;
         bytes[i * 4 + 1] = (f32::from(p[1]) * k) as u8;
@@ -753,7 +753,7 @@ fn extract_theme(small: &image::RgbImage) -> [u8; 3] {
     let weight = |s: f32, v: f32| s * s * (0.25 + 0.75 * v);
     let bin_of = |h: f32| ((h / 360.0) * HUE_BINS as f32) as usize % HUE_BINS;
     // 无色相像素：低饱和或近黑近白。
-    let colorful = |s: f32, v: f32| s >= 0.16 && v >= 0.08 && v <= 0.97;
+    let colorful = |s: f32, v: f32| s >= 0.16 && (0.08..=0.97).contains(&v);
 
     let mut bins = [0f32; HUE_BINS];
     let mut total = 0f32;
@@ -813,7 +813,11 @@ fn extract_theme(small: &image::RgbImage) -> [u8; 3] {
 
 /// RGB -> HSV（h 0~360，s/v 0~1）。
 fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
-    let (r, g, b) = (f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0);
+    let (r, g, b) = (
+        f32::from(r) / 255.0,
+        f32::from(g) / 255.0,
+        f32::from(b) / 255.0,
+    );
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
     let d = max - min;
@@ -918,7 +922,7 @@ mod tests {
         // fact：总帧数（每声道），让 codec_params.n_frames 有值，走单遍解析。
         bytes.extend_from_slice(b"fact");
         bytes.extend_from_slice(&4u32.to_le_bytes());
-        bytes.extend_from_slice(&(n as u32).to_le_bytes());
+        bytes.extend_from_slice(&n.to_le_bytes());
         // LIST INFO 元数据。
         bytes.extend_from_slice(b"LIST");
         bytes.extend_from_slice(&(info_len as u32).to_le_bytes());
@@ -1184,7 +1188,11 @@ mod tests {
         let theme = extract_theme(&img);
         // 黑白灰封面应精确命中白色中性主题（近白色在 HSL 下饱和度天然偏高，
         // 不能用饱和度阈值断言）。
-        assert_eq!(theme, [235, 238, 242], "黑白灰封面主色应为白色中性: {theme:?}");
+        assert_eq!(
+            theme,
+            [235, 238, 242],
+            "黑白灰封面主色应为白色中性: {theme:?}"
+        );
     }
 
     /// 灰白封面同样应得到中性主题；红色封面应保持红色系。
@@ -1200,7 +1208,10 @@ mod tests {
         let red = image::RgbImage::from_fn(32, 32, |_, _| image::Rgb([180, 30, 40]));
         let (h, s, _) = rgb_to_hsl(extract_theme(&red));
         assert!(s > 0.4, "红色封面主题应保持饱和: s={s}");
-        assert!(h < 20.0 || h > 340.0, "红色封面主题色相应在红区: h={h}");
+        assert!(
+            !(20.0..=340.0).contains(&h),
+            "红色封面主题色相应在红区: h={h}"
+        );
     }
 
     /// 混合封面：占多数的蓝色应胜出，而不是被少数橙色平均掉。
@@ -1221,11 +1232,9 @@ mod tests {
     /// 白封面压暗为中性灰（不刺眼、白字可读），暗封面基本保持原样。
     #[test]
     fn blurred_background_unified_dark() {
-        let white = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
-            64,
-            64,
-            |_, _| image::Rgb([250, 250, 250]),
-        ));
+        let white = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |_, _| {
+            image::Rgb([250, 250, 250])
+        }));
         let buf = blurred_background(&white);
         assert_eq!(buf.width(), 324);
         assert_eq!(buf.height(), 80);
@@ -1239,14 +1248,15 @@ mod tests {
         );
         assert_eq!(bytes[mid + 3], 235);
 
-        let dark = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
-            64,
-            64,
-            |_, _| image::Rgb([10, 12, 18]),
-        ));
+        let dark = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |_, _| {
+            image::Rgb([10, 12, 18])
+        }));
         let bytes = blurred_background(&dark).as_bytes().to_vec();
         let mid = (40 * 324 + 162) * 4;
-        assert!(bytes[mid] < 20 && bytes[mid] > 2, "暗封面背景不应被过度改变");
+        assert!(
+            bytes[mid] < 20 && bytes[mid] > 2,
+            "暗封面背景不应被过度改变"
+        );
     }
 
     /// 视觉辅助：设置 `ZZH_DUMP_BG=1` 时把几种典型封面的模糊背景转储为 PNG，
@@ -1268,11 +1278,7 @@ mod tests {
             (
                 "blue_navy",
                 image::RgbImage::from_fn(200, 200, |x, y| {
-                    image::Rgb([
-                        (20 + x / 8) as u8,
-                        (40 + y / 6) as u8,
-                        (120 + x / 10) as u8,
-                    ])
+                    image::Rgb([(20 + x / 8) as u8, (40 + y / 6) as u8, (120 + x / 10) as u8])
                 }),
             ),
             (

@@ -55,6 +55,18 @@ cargo build --release
 
 构建产物在 `target\release\zzhmusicplayer.exe`。需要安装包的话，用 Inno Setup 编译 `installer.iss` 即可。
 
+## 开发检查
+
+仓库通过 `rust-toolchain.toml` 固定 Rust 工具链。本地开发完成、准备提交前，请在 PowerShell 中运行：
+
+```powershell
+./scripts/check.ps1
+```
+
+该脚本依次检查代码格式、编译、单元测试和 Clippy。GitHub Actions 会在推送到 `main` 分支或创建 Pull Request 时执行同一脚本，但不会上传 EXE 或安装包，也不会创建 Release。
+
+涉及界面、音频输出或播放交互的修改，仍需在 Windows 上人工检查主要使用路径，自动检查不能替代实际运行验证。
+
 ## 技术栈
 
 Rust · Slint · rodio · symphonia。音频解码和波形分析都在后台线程完成，界面线程只负责渲染。

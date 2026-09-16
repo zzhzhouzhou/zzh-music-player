@@ -4,8 +4,8 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -102,8 +102,9 @@ pub struct AudioEngine {
 /// 均衡器频段数（ISO 标准倍频程中心频点）。
 pub const EQ_BANDS: usize = 10;
 /// 均衡器频段中心频率（Hz）。
-pub const EQ_FREQS: [f32; EQ_BANDS] =
-    [31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+pub const EQ_FREQS: [f32; EQ_BANDS] = [
+    31.25, 62.5, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
 
 /// 均衡器参数（模块可经命令通道即时更新，运行中的播放源无毛刺生效）。
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -289,7 +290,7 @@ impl DspStage for EqStage {
     fn process(&mut self, sample: f32, channel: usize, channels: usize) -> f32 {
         // 周期性同步共享参数（避免逐采样加锁；应用延迟 ≤ ~6ms）。
         self.counter = self.counter.wrapping_add(1);
-        if self.counter % 256 == 0 {
+        if self.counter.is_multiple_of(256) {
             // 先克隆出 owned 参数并释放锁，再改内部状态。
             let fresh = self.shared.lock().ok().map(|p| p.clone());
             if let Some(params) = fresh
@@ -767,14 +768,6 @@ mod tests {
         }
     }
 
-    /// 增益阶段（测试用）：采样 × 系数。
-    struct GainStage(f32);
-    impl DspStage for GainStage {
-        fn process(&mut self, sample: f32, _channel: usize, _channels: usize) -> f32 {
-            sample * self.0
-        }
-    }
-
     fn sine_stereo(rate: u32, freq: f32, seconds: f32, amp: f32) -> Vec<f32> {
         // 交错立体声：每个声道的第 k 个采样位于时刻 k/rate（声道采样率 = rate）。
         let n = (rate as f32 * seconds) as usize;
@@ -814,11 +807,7 @@ mod tests {
         struct HalfLeft;
         impl DspStage for HalfLeft {
             fn process(&mut self, sample: f32, channel: usize, _channels: usize) -> f32 {
-                if channel == 0 {
-                    sample * 0.5
-                } else {
-                    sample
-                }
+                if channel == 0 { sample * 0.5 } else { sample }
             }
         }
         let src = TestSource::new(input.clone(), 2, 48000);
@@ -829,8 +818,6 @@ mod tests {
             assert!((*o - expect).abs() < 1e-6, "声道映射错位 at {i}: {o}");
         }
     }
-
-
 
     #[test]
     fn eq_boost_cut_and_bypass() {
@@ -877,8 +864,9 @@ mod tests {
 
     #[test]
     fn eq_stage_usable_as_trait_object() {
-        let stages: Vec<Box<dyn DspStage>> =
-            vec![Box::new(EqStage::new(Arc::new(Mutex::new(EqSettings::default()))))];
+        let stages: Vec<Box<dyn DspStage>> = vec![Box::new(EqStage::new(Arc::new(Mutex::new(
+            EqSettings::default(),
+        ))))];
         let src = TestSource::new(sine_stereo(48000, 1000.0, 0.1, 0.25), 2, 48000);
         let pipeline = PipelineSource::new(src, stages);
         let out: Vec<f32> = pipeline.collect();

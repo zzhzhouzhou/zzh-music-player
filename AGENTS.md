@@ -27,6 +27,17 @@ cargo build --release       # 产物 target\release\zzhmusicplayer.exe
 "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
 ```
 
+本地开发完成、准备提交前，必须在 PowerShell 中运行统一质量检查：
+
+```powershell
+./scripts/check.ps1
+```
+
+该脚本依次执行 `cargo fmt --check`、`cargo check --locked`、`cargo test --locked` 和
+`cargo clippy --locked --all-targets -- -D warnings`。GitHub Actions 使用同一脚本，确保本地
+行为标准与 CI 一致。CI 只做质量检查，不上传 EXE 或安装包，不创建 Release，也不触发更新。
+涉及 UI、音频输出或播放交互的修改，仍须人工检查主界面、播放列表抽屉、搜索、关于和拖拽排序。
+
 测试钩子（环境变量）：`ZZH_OPEN_PLAYLIST=1`、`ZZH_OPEN_SEARCH=1`、`ZZH_OPEN_ABOUT=1`
 启动直达对应界面；`ZZH_VERSION_OVERRIDE=x.y.z` 伪装版本号（验证更新流程用）。
 

@@ -101,7 +101,10 @@ fn app_version() -> &'static str {
 enum UpdateEvent {
     Checking,
     UpToDate,
-    Available { version: String, auto_download: bool },
+    Available {
+        version: String,
+        auto_download: bool,
+    },
     Progress(f32),
     Ready,
     Failed(String),
@@ -137,10 +140,9 @@ fn spawn_update_download(tx: Sender<UpdateEvent>) {
         .spawn(move || {
             let dest = std::env::temp_dir().join(UPDATE_INSTALLER_NAME);
             let progress_tx = tx.clone();
-            let result =
-                updater::download_installer(&dest, &move |frac| {
-                    let _ = progress_tx.send(UpdateEvent::Progress(frac));
-                });
+            let result = updater::download_installer(&dest, &move |frac| {
+                let _ = progress_tx.send(UpdateEvent::Progress(frac));
+            });
             let _ = match result {
                 Ok(()) => tx.send(UpdateEvent::Ready),
                 Err(e) => tx.send(UpdateEvent::Failed(e)),
@@ -598,7 +600,9 @@ fn load_settings() -> Settings {
             "current" => s.current = Some(PathBuf::from(value)),
             // eq=启用,增益0,增益1,...,增益9（dB）
             "eq" => {
-                let mut it = value.split(',').map(|v| v.trim().parse::<f32>().unwrap_or(0.0));
+                let mut it = value
+                    .split(',')
+                    .map(|v| v.trim().parse::<f32>().unwrap_or(0.0));
                 s.eq.enabled = it.next().unwrap_or(0.0) > 0.5;
                 for (i, g) in it.enumerate() {
                     if i < EqSettings::default().gains.len() {
@@ -919,10 +923,13 @@ fn push_background(transport: &TransportState, bg: Image, front_showing: &Cell<b
 /// 让波形高亮 / 按钮 / 控制胶囊叠色随换曲平滑过渡。
 /// 插值在 HSL 空间沿色相环最短弧进行：RGB 插值跨色相过渡会中途发灰
 /// （先变暗再变亮），色相插值则直接经过相邻色相（绿→青→蓝→紫）。
+type HslColor = (f32, f32, f32);
+type ActiveThemeTween = (HslColor, HslColor, Instant);
+
 #[derive(Default)]
 struct ThemeTween {
     target: Cell<[u8; 3]>,
-    active: RefCell<Option<((f32, f32, f32), (f32, f32, f32), Instant)>>,
+    active: RefCell<Option<ActiveThemeTween>>,
 }
 
 impl ThemeTween {
@@ -1480,7 +1487,7 @@ fn do_close(
     eq: &EqSettings,
 ) {
     let transport = ui.global::<TransportState>();
-            let playlist_state = ui.global::<PlaylistState>();
+    let playlist_state = ui.global::<PlaylistState>();
     let current = {
         let list = playlist.borrow();
         let idx = playlist_state.get_playlist_current();
@@ -1518,8 +1525,8 @@ fn main() {
     // —— 恢复记忆设置 ——
     let settings = load_settings();
     let transport = ui.global::<TransportState>();
-            let playlist_state = ui.global::<PlaylistState>();
-            let about_state = ui.global::<AboutState>();
+    let playlist_state = ui.global::<PlaylistState>();
+    let about_state = ui.global::<AboutState>();
     transport.set_volume(settings.volume);
     transport.set_volume_text(slint::SharedString::from(format!(
         "{}%",
@@ -1626,8 +1633,8 @@ fn main() {
             move || {
                 if let Some(ui) = ui_weak.upgrade() {
                     let transport = ui.global::<TransportState>();
-            let playlist_state = ui.global::<PlaylistState>();
-            let about_state = ui.global::<AboutState>();
+                    let playlist_state = ui.global::<PlaylistState>();
+                    let about_state = ui.global::<AboutState>();
                     theme_tween.tick(&transport, 0.033);
                     // “关于”打开状态同步给 WndProc（滚轮隔离判断用）。
                     let about = about_state.get_about_open();
@@ -1752,47 +1759,49 @@ fn main() {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
         let seek_wait = Rc::clone(&seek_wait);
-        ui.global::<TransportState>().on_seek_requested(move |fraction| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let transport = ui.global::<TransportState>();
-            let target = fraction * transport.get_duration();
-            // 点击/拖拽跳转：锁定态，松手后显示立即钉在目标上，
-            // 引擎尚未完成 seek 的旧上报由事件泵过滤。
-            *seek_wait.borrow_mut() = Some(SeekState::Pending {
-                target,
-                since: Instant::now(),
-                lock: true,
+        ui.global::<TransportState>()
+            .on_seek_requested(move |fraction| {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let transport = ui.global::<TransportState>();
+                let target = fraction * transport.get_duration();
+                // 点击/拖拽跳转：锁定态，松手后显示立即钉在目标上，
+                // 引擎尚未完成 seek 的旧上报由事件泵过滤。
+                *seek_wait.borrow_mut() = Some(SeekState::Pending {
+                    target,
+                    since: Instant::now(),
+                    lock: true,
+                });
+                transport.set_seek_lock_frac(fraction);
+                transport.set_seek_lock(true);
+                transport.set_position(target);
+                transport.set_position_text(format_time(target));
+                audio.send(Command::Seek(Duration::from_secs_f32(target)));
             });
-            transport.set_seek_lock_frac(fraction);
-            transport.set_seek_lock(true);
-            transport.set_position(target);
-            transport.set_position_text(format_time(target));
-            audio.send(Command::Seek(Duration::from_secs_f32(target)));
-        });
     }
     {
         let ui_weak = ui.as_weak();
         let audio = audio.clone();
         let seek_wait = Rc::clone(&seek_wait);
         // 快捷键左右方向键：相对当前播放位置快退/快进 5 秒。
-        ui.global::<TransportState>().on_seek_relative(move |delta| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let transport = ui.global::<TransportState>();
-            let duration = transport.get_duration();
-            let target = (transport.get_position() + delta)
-                .clamp(0.0, if duration > 0.0 { duration } else { f32::MAX });
-            // 方向键快进快退：不进入锁定态，位置属性直接更新到目标，
-            // 由 played-frac 的 200ms 插值动画平滑滑过去；陈旧位置事件
-            // 仍由 seek_wait 过滤（未锁定时只顶替数值，不钉显示）。
-            *seek_wait.borrow_mut() = Some(SeekState::Pending {
-                target,
-                since: Instant::now(),
-                lock: false,
+        ui.global::<TransportState>()
+            .on_seek_relative(move |delta| {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let transport = ui.global::<TransportState>();
+                let duration = transport.get_duration();
+                let target = (transport.get_position() + delta)
+                    .clamp(0.0, if duration > 0.0 { duration } else { f32::MAX });
+                // 方向键快进快退：不进入锁定态，位置属性直接更新到目标，
+                // 由 played-frac 的 200ms 插值动画平滑滑过去；陈旧位置事件
+                // 仍由 seek_wait 过滤（未锁定时只顶替数值，不钉显示）。
+                *seek_wait.borrow_mut() = Some(SeekState::Pending {
+                    target,
+                    since: Instant::now(),
+                    lock: false,
+                });
+                transport.set_position(target);
+                transport.set_position_text(format_time(target));
+                audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
             });
-            transport.set_position(target);
-            transport.set_position_text(format_time(target));
-            audio.send(Command::Seek(Duration::from_secs_f64(f64::from(target))));
-        });
     }
     // 播放模式：顺序 → 列表循环 → 单曲循环 → 随机。
     {
@@ -1850,16 +1859,17 @@ fn main() {
     {
         let ui_weak = ui.as_weak();
         let popup_hide_timer = Rc::clone(&popup_hide_timer);
-        ui.global::<TransportState>().on_toggle_volume_popup(move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                let transport = ui.global::<TransportState>();
-                let open = !transport.get_volume_popup_open();
-                transport.set_volume_popup_open(open);
-                if open {
-                    popup_hide_timer.restart();
+        ui.global::<TransportState>()
+            .on_toggle_volume_popup(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    let transport = ui.global::<TransportState>();
+                    let open = !transport.get_volume_popup_open();
+                    transport.set_volume_popup_open(open);
+                    if open {
+                        popup_hide_timer.restart();
+                    }
                 }
-            }
-        });
+            });
     }
     {
         let ui_weak = ui.as_weak();
@@ -1881,7 +1891,7 @@ fn main() {
         let playlist_view = Rc::clone(&playlist_view);
         ui.global::<PlaylistState>().on_toggle_playlist(move || {
             if let Some(ui) = ui_weak.upgrade() {
-            let playlist_state = ui.global::<PlaylistState>();
+                let playlist_state = ui.global::<PlaylistState>();
                 let open = !playlist_state.get_playlist_open();
                 playlist_state.set_playlist_open(open);
                 PLAYLIST_OPEN.store(open, Ordering::Relaxed);
@@ -1889,7 +1899,9 @@ fn main() {
                     // 收起抽屉时一并清掉搜索过滤，下次展开是完整列表。
                     playlist_state.set_search_open(false);
                     playlist_state.set_search_text(SharedString::default());
-                    playlist_view.borrow_mut().set_filter("", &playlist.borrow());
+                    playlist_view
+                        .borrow_mut()
+                        .set_filter("", &playlist.borrow());
                 }
             }
         });
@@ -1903,7 +1915,9 @@ fn main() {
             let Some(ui) = ui_weak.upgrade() else { return };
             let playlist_state = ui.global::<PlaylistState>();
             // 显示行号 → 真实索引（搜索过滤后两者不一致）。
-            let index = playlist_view.borrow().real_of(index.round().max(0.0) as usize);
+            let index = playlist_view
+                .borrow()
+                .real_of(index.round().max(0.0) as usize);
             play_at(index, &playlist, &playlist_state, &audio);
         });
     }
@@ -1912,21 +1926,26 @@ fn main() {
         let ui_weak = ui.as_weak();
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
-        ui.global::<PlaylistState>().on_set_reorder_text(move |row| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let playlist_state = ui.global::<PlaylistState>();
-            let row = playlist_view.borrow().real_of(row.round().max(0.0) as usize);
-            if let Some(p) = playlist.borrow().get(row) {
-                playlist_state.set_reorder_text(track_name(p).into());
-            }
-        });
+        ui.global::<PlaylistState>()
+            .on_set_reorder_text(move |row| {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let playlist_state = ui.global::<PlaylistState>();
+                let row = playlist_view
+                    .borrow()
+                    .real_of(row.round().max(0.0) as usize);
+                if let Some(p) = playlist.borrow().get(row) {
+                    playlist_state.set_reorder_text(track_name(p).into());
+                }
+            });
     }
     // 搜索框文本变化：重建过滤后的显示模型。
     {
         let playlist = Rc::clone(&playlist);
         let playlist_view = Rc::clone(&playlist_view);
         ui.global::<PlaylistState>().on_search_edited(move |text| {
-            playlist_view.borrow_mut().set_filter(&text, &playlist.borrow());
+            playlist_view
+                .borrow_mut()
+                .set_filter(&text, &playlist.borrow());
         });
     }
     // 检查更新：手动触发时确认有新版即自动下载（启动探测不自动下载）。
@@ -2052,7 +2071,9 @@ fn main() {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                let index = playlist_view.borrow().real_of(index.round().max(0.0) as usize);
+                let index = playlist_view
+                    .borrow()
+                    .real_of(index.round().max(0.0) as usize);
                 if let Some(p) = playlist.borrow().get(index) {
                     // explorer /select,"路径"：打开文件夹并高亮该文件。
                     let _ = std::process::Command::new("explorer.exe")
@@ -2083,7 +2104,7 @@ fn main() {
             }
             playlist_view.borrow_mut().removed(&playlist.borrow());
             if let Some(ui) = ui_weak.upgrade() {
-            let playlist_state = ui.global::<PlaylistState>();
+                let playlist_state = ui.global::<PlaylistState>();
                 let cur = playlist_state.get_playlist_current();
                 if cur as usize == real {
                     playlist_state.set_playlist_current(-1);
@@ -2105,7 +2126,7 @@ fn main() {
             playlist_view.borrow_mut().cleared();
             audio.send(Command::SetPlaylist(Vec::new()));
             if let Some(ui) = ui_weak.upgrade() {
-            let playlist_state = ui.global::<PlaylistState>();
+                let playlist_state = ui.global::<PlaylistState>();
                 playlist_state.set_playlist_current(-1);
             }
         });
@@ -2148,56 +2169,58 @@ fn main() {
         let drag_state = Rc::clone(&drag_state);
         let last_press = Rc::clone(&last_press);
         let file_tx = file_tx.clone();
-        ui.global::<TransportState>().on_window_drag_down(move |x, y| {
-            // 双击检测（窗口类无 CS_DBLCLKS，须自行判定）：两次按下
-            // 间隔短且位置接近即视为双击。
-            let now = Instant::now();
-            let is_double = if let Some((t, px, py)) = *last_press.borrow() {
-                now.duration_since(t) <= DOUBLE_CLICK_INTERVAL
-                    && (x - px).abs() <= DOUBLE_CLICK_TOLERANCE
-                    && (y - py).abs() <= DOUBLE_CLICK_TOLERANCE
-            } else {
-                false
-            };
-            *last_press.borrow_mut() = Some((now, x, y));
-            if is_double {
-                let _ = file_tx.send(FileEvent::DoubleClick);
-            }
-            if let Some(ui) = ui_weak.upgrade() {
-                let origin = ui.window().position();
-                match cursor_position() {
-                    Some((cx, cy)) => {
-                        *drag_state.borrow_mut() = Some((origin, cx, cy));
-                    }
-                    // 兜底：拿不到系统光标时用局部坐标近似。
-                    None => {
-                        let scale = ui.window().scale_factor();
-                        *drag_state.borrow_mut() = Some((
-                            origin,
-                            (x * scale).round() as i32,
-                            (y * scale).round() as i32,
-                        ));
+        ui.global::<TransportState>()
+            .on_window_drag_down(move |x, y| {
+                // 双击检测（窗口类无 CS_DBLCLKS，须自行判定）：两次按下
+                // 间隔短且位置接近即视为双击。
+                let now = Instant::now();
+                let is_double = if let Some((t, px, py)) = *last_press.borrow() {
+                    now.duration_since(t) <= DOUBLE_CLICK_INTERVAL
+                        && (x - px).abs() <= DOUBLE_CLICK_TOLERANCE
+                        && (y - py).abs() <= DOUBLE_CLICK_TOLERANCE
+                } else {
+                    false
+                };
+                *last_press.borrow_mut() = Some((now, x, y));
+                if is_double {
+                    let _ = file_tx.send(FileEvent::DoubleClick);
+                }
+                if let Some(ui) = ui_weak.upgrade() {
+                    let origin = ui.window().position();
+                    match cursor_position() {
+                        Some((cx, cy)) => {
+                            *drag_state.borrow_mut() = Some((origin, cx, cy));
+                        }
+                        // 兜底：拿不到系统光标时用局部坐标近似。
+                        None => {
+                            let scale = ui.window().scale_factor();
+                            *drag_state.borrow_mut() = Some((
+                                origin,
+                                (x * scale).round() as i32,
+                                (y * scale).round() as i32,
+                            ));
+                        }
                     }
                 }
-            }
-        });
+            });
     }
     {
         let ui_weak = ui.as_weak();
         let drag_state = Rc::clone(&drag_state);
-        ui.global::<TransportState>().on_window_drag_move(move |_, _| {
-            let Some((origin, cx0, cy0)) = *drag_state.borrow() else {
-                return;
-            };
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let Some((cx, cy)) = cursor_position() else {
-                return;
-            };
-            ui.window().set_position(slint::PhysicalPosition::new(
-                origin.x + (cx - cx0),
-                origin.y + (cy - cy0),
-            ));
-        });
+        ui.global::<TransportState>()
+            .on_window_drag_move(move |_, _| {
+                let Some((origin, cx0, cy0)) = *drag_state.borrow() else {
+                    return;
+                };
+                let Some(ui) = ui_weak.upgrade() else { return };
+                let Some((cx, cy)) = cursor_position() else {
+                    return;
+                };
+                ui.window().set_position(slint::PhysicalPosition::new(
+                    origin.x + (cx - cx0),
+                    origin.y + (cy - cy0),
+                ));
+            });
     }
     {
         let drag_state = Rc::clone(&drag_state);
@@ -2279,8 +2302,8 @@ fn main() {
             move || {
                 let Some(ui) = ui_weak.upgrade() else { return };
                 let transport = ui.global::<TransportState>();
-            let playlist_state = ui.global::<PlaylistState>();
-            let about_state = ui.global::<AboutState>();
+                let playlist_state = ui.global::<PlaylistState>();
+                let about_state = ui.global::<AboutState>();
 
                 while let Some(event) = audio.try_recv_event() {
                     match event {
@@ -2294,7 +2317,8 @@ fn main() {
                             transport.set_seek_lock(false);
                             transport.set_dragging(false);
                             let idx = playlist.borrow().iter().position(|p| *p == path);
-                            playlist_state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
+                            playlist_state
+                                .set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
                             if let Some(res) = waveform_cache.borrow().get(&path) {
                                 // 内存缓存命中时直接复用，切歌几乎无感。
                                 apply_waveform(
@@ -2304,7 +2328,12 @@ fn main() {
                                     &bg_front,
                                     &theme_tween,
                                 );
-                                prefetch_next_track(&playlist_state, &playlist, &waveform_cache, &wave_tx);
+                                prefetch_next_track(
+                                    &playlist_state,
+                                    &playlist,
+                                    &waveform_cache,
+                                    &wave_tx,
+                                );
                             } else if let Some(res) = read_wave_cache(&path) {
                                 // 磁盘缓存命中：免整曲解码，元数据/封面/波形一步到位。
                                 {
@@ -2456,13 +2485,25 @@ fn main() {
                             }
                         }
                         FileEvent::DroppedBatch(paths) => {
-                            add_tracks_batch(&paths, &playlist, &playlist_view, &playlist_state, &audio);
+                            add_tracks_batch(
+                                &paths,
+                                &playlist,
+                                &playlist_view,
+                                &playlist_state,
+                                &audio,
+                            );
                         }
                         FileEvent::OpenFiles(paths) => {
                             // 第二个实例转发的“打开方式”文件：首个立即播放（即使已在列表中），其余仅加入列表。
                             let mut files = paths.iter();
                             if let Some(first) = files.next() {
-                                play_file_now(first, &playlist, &playlist_view, &playlist_state, &audio);
+                                play_file_now(
+                                    first,
+                                    &playlist,
+                                    &playlist_view,
+                                    &playlist_state,
+                                    &audio,
+                                );
                             }
                             for path in files {
                                 let _ = add_track(
@@ -2525,7 +2566,12 @@ fn main() {
                                 &theme_tween,
                             );
                             drop(cache);
-                            prefetch_next_track(&playlist_state, &playlist, &waveform_cache, &wave_tx);
+                            prefetch_next_track(
+                                &playlist_state,
+                                &playlist,
+                                &waveform_cache,
+                                &wave_tx,
+                            );
                         }
                     }
                 }
@@ -2540,18 +2586,21 @@ fn main() {
                             about_state.set_update_state(UpdateState::Latest);
                             about_state.set_update_note("已是最新版本".into());
                         }
-                        UpdateEvent::Available { version, auto_download } => {
-                            about_state.set_update_latest_version(SharedString::from(version.clone()));
+                        UpdateEvent::Available {
+                            version,
+                            auto_download,
+                        } => {
+                            about_state
+                                .set_update_latest_version(SharedString::from(version.clone()));
                             if auto_download {
                                 about_state.set_update_state(UpdateState::Downloading);
                                 about_state.set_update_progress(0.0);
-                                about_state.set_update_note(
-                                    format!("正在下载 v{version}…").into(),
-                                );
+                                about_state.set_update_note(format!("正在下载 v{version}…").into());
                                 spawn_update_download(update_tx.clone());
                             } else {
                                 about_state.set_update_state(UpdateState::Available);
-                                about_state.set_update_note(format!("发现新版本 v{version}").into());
+                                about_state
+                                    .set_update_note(format!("发现新版本 v{version}").into());
                             }
                         }
                         UpdateEvent::Progress(frac) => {
@@ -2684,7 +2733,10 @@ mod tests {
         assert!(read.artist.is_none());
         assert!(read.cover.is_some());
         assert_eq!(read.cover.as_ref().unwrap().width(), 4);
-        assert_eq!(read.bg.as_ref().map(|b| (b.width(), b.height())), Some((8, 8)));
+        assert_eq!(
+            read.bg.as_ref().map(|b| (b.width(), b.height())),
+            Some((8, 8))
+        );
 
         // 源文件 mtime 变化后旧缓存应作废并删除。
         let file = std::fs::OpenOptions::new().append(true).open(&src).unwrap();
