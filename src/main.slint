@@ -1,6 +1,8 @@
 // 全局与类型再导出：Rust 侧经 include_modules 访问（ui.global::<TransportState>() 等）。
 export { TransportState, PlaylistState, AboutState, DockState } from "state.slint";
 export { PlaylistEntry, UpdateState } from "state.slint";
+// 独立播放列表窗口（阶段 C）：Rust 侧按需实例化/销毁。
+export { PlaylistWindow } from "playlist_window.slint";
 import { TransportState, PlaylistState, AboutState, UpdateState, DockState } from "state.slint";
 import { IconButton, VolumeBar } from "widgets.slint";
 import { PlaylistDrawer } from "playlist.slint";
@@ -621,7 +623,8 @@ export component MainWindow inherits Window {
                 }
                 IconButton {
                     button-size: 27px;
-                    active: PlaylistState.playlist-open;
+                    // 抽屉打开或已弹出为独立窗口时都视为激活态。
+                    active: PlaylistState.playlist-open || PlaylistState.popped;
                     source: @image-url("../icons/播放列表.svg");
                     clicked => { PlaylistState.toggle-playlist(); }
                 }

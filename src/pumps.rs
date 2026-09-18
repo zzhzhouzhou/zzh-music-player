@@ -27,10 +27,26 @@ pub fn pump_events(app: &App) {
     let transport = app.ui.global::<TransportState>();
     let playlist_state = app.ui.global::<PlaylistState>();
     let about_state = app.ui.global::<AboutState>();
+    sync_popout_current(app, &playlist_state);
     drain_audio(app, &transport, &playlist_state);
     drain_files(app, &transport, &playlist_state);
     drain_waves(app, &transport, &playlist_state);
     drain_updates(app, &about_state);
+}
+
+/// 独立弹窗桥接：当前曲目高亮。Slint 全局按组件实例隔离（见
+/// playlist_window.slint），弹窗的 PlaylistState 是另一份实例，播放/增删/
+/// 排序引起的高亮变化由这里从主窗口实例单向同步（仅变化时写入）。
+fn sync_popout_current(app: &App, playlist_state: &PlaylistState) {
+    let guard = app.playlist_window.borrow();
+    let Some(pw) = guard.as_ref() else {
+        return;
+    };
+    let pw_state = pw.global::<PlaylistState>();
+    let cur = playlist_state.get_playlist_current();
+    if pw_state.get_playlist_current() != cur {
+        pw_state.set_playlist_current(cur);
+    }
 }
 
 /// 消费音频引擎事件：播放状态、位置、跳转回执与错误。
@@ -262,6 +278,10 @@ fn drain_files(app: &App, transport: &TransportState, playlist_state: &PlaylistS
                 // 保存设置并退出（拦截了系统 WM_CLOSE）。
                 crate::app::do_close(app);
             }
+            FileEvent::PlaylistWindowClose => {
+                // 弹窗的关闭按钮 / Alt+F4：只收回弹窗，绝不退出程序。
+                crate::app::close_playlist_window(app);
+            }
         }
     }
 }
@@ -385,72 +405,120 @@ pub fn particle_33ms(app: &App) {
         let t = transport.get_particle_time() + 0.033;
         transport.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
     }
-    // 工具栏悬停检测：光标进入工具栏矩形范围时让背景变实。
+    // 工具栏悬停检测（仅主窗口）：光标进入工具栏矩形范围时让背景变实。
     if let Some((cx, cy)) = cursor_position() {
-        let scale = ui.window().scale_factor();
-        let origin = ui.window().position();
-        let local_x = (cx - origin.x) as f32 / scale;
-        let local_y = (cy - origin.y) as f32 / scale;
-        // 窗口逻辑尺寸（布局常量均按逻辑像素与 main.slint 对齐）。
-        let logical_w = ui.window().size().width as f32 / scale;
-        let logical_h = ui.window().size().height as f32 / scale;
-        // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
-        let bar_x = (logical_w - 330.0) / 2.0;
-        let bar_y = logical_h - 46.0;
-        let x0 = origin.x + (bar_x * scale) as i32;
-        let x1 = origin.x + ((bar_x + 330.0) * scale) as i32;
-        let y0 = origin.y + (bar_y * scale) as i32;
-        let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
-        let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
-        if hovered != transport.get_toolbar_hovered() {
-            transport.set_toolbar_hovered(hovered);
+        {
+            let scale = ui.window().scale_factor();
+            let origin = ui.window().position();
+            let logical_w = ui.window().size().width as f32 / scale;
+            let logical_h = ui.window().size().height as f32 / scale;
+            // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
+            let bar_x = (logical_w - 330.0) / 2.0;
+            let bar_y = logical_h - 46.0;
+            let x0 = origin.x + (bar_x * scale) as i32;
+            let x1 = origin.x + ((bar_x + 330.0) * scale) as i32;
+            let y0 = origin.y + (bar_y * scale) as i32;
+            let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
+            let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+            if hovered != transport.get_toolbar_hovered() {
+                transport.set_toolbar_hovered(hovered);
+            }
         }
-        // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标；
-        // 光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
-        if playlist_state.get_reorder_from() >= 0.0 {
-            playlist_state.set_reorder_y(local_y);
-            // 列表区：y 42..(logical_h - 6)；上/下缘 22px 内开始滚动，
-            // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
-            // 视口范围与 main.slint 一致：[-(vh-rows*32-2), 0]。
-            const EDGE: f32 = 22.0;
-            const MAX_SPEED: f32 = 6.0;
-            const LIST_TOP: f32 = 42.0;
-            const LIST_BOTTOM_GAP: f32 = 6.0;
-            if playlist_state.get_reorder_to() >= 0.0 {
-                let rows = playlist_state.get_playlist().row_count() as f32;
-                let list_h = logical_h - 48.0;
-                let vp_min = 0.0f32.min(list_h - (rows * 32.0 + 2.0));
-                let vp = playlist_state.get_list_vp_y();
-                let bottom = logical_h - LIST_BOTTOM_GAP;
-                // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
-                let delta = if local_y < LIST_TOP + EDGE {
-                    MAX_SPEED * (1.0 - (local_y - LIST_TOP) / EDGE).max(0.15)
-                } else if local_y > bottom - EDGE {
-                    -MAX_SPEED * (1.0 - (bottom - local_y) / EDGE).max(0.15)
-                } else {
-                    0.0
-                };
-                if delta != 0.0 {
-                    playlist_state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
+        // —— 独立播放列表窗口桥接（Slint 全局按组件实例隔离）——
+        // 主题色 / 播放状态 / 粒子时钟逐帧从主窗口实例同步，仅变化时写入；
+        // 列表内容靠共享模型，当前曲目高亮由事件泵同步。
+        let pop_guard = app.playlist_window.borrow();
+        if let Some(pw) = pop_guard.as_ref() {
+            let pw_transport = pw.global::<TransportState>();
+            let theme = transport.get_theme_color();
+            if pw_transport.get_theme_color() != theme {
+                pw_transport.set_theme_color(theme);
+            }
+            let playing = transport.get_playing();
+            if pw_transport.get_playing() != playing {
+                pw_transport.set_playing(playing);
+            }
+            if playing {
+                let t = transport.get_particle_time();
+                if pw_transport.get_particle_time() != t {
+                    pw_transport.set_particle_time(t);
                 }
             }
+            // 弹窗承载列表：拖拽/悬停按弹窗几何换算。
+            sync_playlist_pointer(&pw.global::<PlaylistState>(), pw.window(), cx, cy, true);
+        } else {
+            // 抽屉承载列表（弹窗未打开时二者互斥）。
+            sync_playlist_pointer(
+                &playlist_state,
+                ui.window(),
+                cx,
+                cy,
+                playlist_state.get_playlist_open(),
+            );
         }
-        // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
-        // 避免覆盖层收不到“离开”事件导致的高亮滞留。
-        // 列表区几何与 main.slint 的覆盖层保持一致。
-        let in_list = playlist_state.get_playlist_open()
-            && playlist_state.get_reorder_from() < 0.0
-            && local_x >= 8.0
-            && local_x <= logical_w - 8.0
-            && local_y >= 42.0
-            && local_y <= logical_h - 6.0;
-        if !in_list {
-            if playlist_state.get_hover_row() >= 0.0 {
-                playlist_state.set_hover_row(-1.0);
+    }
+}
+
+/// 拖拽排序浮块跟随 / 边缘自动滚动 / 悬停清理：把系统光标换算到指定窗口
+/// 的局部坐标后驱动。抽屉与弹窗互斥打开，承载窗口由调用方决定；
+/// list_visible = 该窗口的列表是否可交互（抽屉=playlist-open，弹窗恒真）。
+fn sync_playlist_pointer(
+    playlist_state: &PlaylistState,
+    window: &slint::Window,
+    cx: i32,
+    cy: i32,
+    list_visible: bool,
+) {
+    let scale = window.scale_factor();
+    let origin = window.position();
+    let local_x = (cx - origin.x) as f32 / scale;
+    let local_y = (cy - origin.y) as f32 / scale;
+    let logical_w = window.size().width as f32 / scale;
+    let logical_h = window.size().height as f32 / scale;
+    // 拖动排序浮块跟随：光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
+    if playlist_state.get_reorder_from() >= 0.0 {
+        playlist_state.set_reorder_y(local_y);
+        // 列表区：y 42..(logical_h - 6)；上/下缘 22px 内开始滚动，
+        // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
+        // 视口范围与面板一致：[-(vh-rows*32-2), 0]。
+        const EDGE: f32 = 22.0;
+        const MAX_SPEED: f32 = 6.0;
+        const LIST_TOP: f32 = 42.0;
+        const LIST_BOTTOM_GAP: f32 = 6.0;
+        if playlist_state.get_reorder_to() >= 0.0 {
+            let rows = playlist_state.get_playlist().row_count() as f32;
+            let list_h = logical_h - 48.0;
+            let vp_min = 0.0f32.min(list_h - (rows * 32.0 + 2.0));
+            let vp = playlist_state.get_list_vp_y();
+            let bottom = logical_h - LIST_BOTTOM_GAP;
+            // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
+            let delta = if local_y < LIST_TOP + EDGE {
+                MAX_SPEED * (1.0 - (local_y - LIST_TOP) / EDGE).max(0.15)
+            } else if local_y > bottom - EDGE {
+                -MAX_SPEED * (1.0 - (bottom - local_y) / EDGE).max(0.15)
+            } else {
+                0.0
+            };
+            if delta != 0.0 {
+                playlist_state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
             }
-            if playlist_state.get_hover_button() != 0.0 {
-                playlist_state.set_hover_button(0.0);
-            }
+        }
+    }
+    // 光标离开列表区 / 列表关闭 / 正在拖动时清除行悬停高亮，
+    // 避免覆盖层收不到“离开”事件导致的高亮滞留。
+    // 列表区几何与 PlaylistPanel 的覆盖层保持一致。
+    let in_list = list_visible
+        && playlist_state.get_reorder_from() < 0.0
+        && local_x >= 8.0
+        && local_x <= logical_w - 8.0
+        && local_y >= 42.0
+        && local_y <= logical_h - 6.0;
+    if !in_list {
+        if playlist_state.get_hover_row() >= 0.0 {
+            playlist_state.set_hover_row(-1.0);
+        }
+        if playlist_state.get_hover_button() != 0.0 {
+            playlist_state.set_hover_button(0.0);
         }
     }
 }

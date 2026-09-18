@@ -25,6 +25,9 @@ pub enum FileEvent {
     Wheel(i32),
     /// 关闭请求（右上角按钮或系统 WM_CLOSE）。
     CloseRequest,
+    /// 播放列表独立窗口的关闭请求（弹窗内按钮或其 WM_CLOSE，Alt+F4）。
+    /// 与主窗口 CloseRequest 分开：弹窗关闭只收回弹窗，绝不退出程序。
+    PlaylistWindowClose,
 }
 
 /// 更新流程事件：检查/下载线程产出，UI 线程事件泵消费。

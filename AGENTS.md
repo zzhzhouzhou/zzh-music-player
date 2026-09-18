@@ -14,14 +14,14 @@ Windows 单机音乐播放器。原生 Rust + Slint（femtovg 渲染 + winit 后
    大依赖；能用 `windows-sys` 加 feature 解决就不加 crate；JSON 这类固定结构允许手写
    扫描器（先例：ID3v2 解析器、更新器字段提取）。
 2. **美观第二** — 深色玻璃视觉语言：半透明面板 + 发丝描边 + 主题色（从封面提取）点缀。
-3. **功能不变原则** — 任何重构/新功能合并前，25 个单元测试必须全绿，且全部 UI 面
-   （主界面 / 播放列表抽屉 / 搜索 / 关于 / 拖拽排序）人工过一遍。
+3. **功能不变原则** — 任何重构/新功能合并前，26 个单元测试必须全绿，且全部 UI 面
+   （主界面 / 播放列表抽屉 / 搜索 / 关于 / 拖拽排序 / 播放列表弹窗）人工过一遍。
 4. 中文注释，注释解释 **为什么** 而不是做了什么。
 
 ## 构建与验证
 
 ```bash
-cargo test                  # 25 个单元测试（波形/ID3/更新器/缓存/搜索过滤/DSP管线）
+cargo test                  # 26 个单元测试（波形/ID3/更新器/缓存/搜索过滤/DSP管线/seek回归）
 cargo build --release       # 产物 target\release\zzhmusicplayer.exe
 # 安装包（改版本后）：
 "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
@@ -51,8 +51,8 @@ ISCC 打包 → `gh release create vX.Y.Z zzhMusicPlayer_Setup.exe`（走代理�
 
 ```
 UI 线程（Slint 事件循环 + 两个 Timer 泵）
- ├─ 100ms 泵：音频事件 / 文件事件 / 波形结果 / 更新事件 四个 mpsc 的统一消费点
- ├─ 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动
+ ├─ 16ms 事件泵：音频事件 / 文件事件 / 波形结果 / 更新事件 四个 mpsc 的统一消费点
+ ├─ 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动、弹窗属性桥接
  ├─ 音频线程（audio_engine.rs）：rodio 播放，Command/Event 通道
  ├─ 波形线程（waveform_generator.rs）：symphonia 流式解码 → 波形/封面/主题色
  └─ 更新线程（updater.rs）：WinINet 查询+下载（代理优先失败转直连）
@@ -64,13 +64,14 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 |---|---|
 | `src/state.slint` | 全局状态三域：`TransportState`（主控/传输/主题）、`PlaylistState`（播放列表模块）、`AboutState`（关于与更新模块）；含 `PlaylistEntry`、`UpdateState` |
 | `src/widgets.slint` | 通用控件：IconButton（玻璃按钮）、VolumeBar、WaveformArea（波形进度）、PlaylistRow |
-| `src/playlist.slint` | 播放列表模块：全窗口抽屉 + 搜索框 + 列表覆盖层（点击/拖拽排序）+ 拖动浮块 |
+| `src/playlist.slint` | 播放列表面板（`PlaylistPanel`，窗口无关）+ 抽屉外壳（`PlaylistDrawer`：开合动画 + 弹出入口）+ 搜索框 + 列表覆盖层（点击/拖拽排序）+ 拖动浮块 |
+| `src/playlist_window.slint` | 播放列表独立窗口（阶段 C）：无边框亚克力小窗，复用 `PlaylistPanel`；标题不得与主窗口相同 |
 | `src/about.slint` | 关于与更新模块：遮罩 + 卡片 + GitHub 图标环形下载进度 |
 | `src/main.slint` | 主窗口：背景/封面/标题、波形（WaveformArea 实例）、控制胶囊、音量弹层、窗口快捷键与拖动 |
 | `src/main.rs` | 模块树根 + 薄入口：`slint::include_modules!()` 的生成类型落在这里（crate 根），子模块经 `crate::` 引用；实际逻辑只有 `app::run()` |
-| `src/app.rs` | 组合根：`App` 结构（全部共享状态集中一处）、`run()` 装配（窗口/引擎/通道/计时器/设置恢复/启动参数）、`do_close` 退出持久化 |
-| `src/ui_callbacks.rs` | Slint 回调接线，按四域分组注册：传输 / 播放列表 / 关于与更新 / 窗口壳层（拖动 + 双击）；闭包只持 `Weak<App>` |
-| `src/pumps.rs` | 两只周期泵的泵体：100ms 四通道统一消费点（音频/文件/波形/更新，轮询顺序勿改），33ms 粒子/悬停/自动滚动 |
+| `src/app.rs` | 组合根：`App` 结构（全部共享状态集中一处）、`run()` 装配（窗口/引擎/通道/计时器/设置恢复/启动参数）、`do_close` 退出持久化、弹窗开关（`open/close_playlist_window`） |
+| `src/ui_callbacks.rs` | Slint 回调接线，按四域分组注册：传输 / 播放列表 / 关于与更新 / 窗口壳层（拖动 + 双击）；播放列表动作经 `action_*` 共享函数供主窗抽屉与弹窗复用；闭包只持 `Weak<App>` |
+| `src/pumps.rs` | 两只周期泵的泵体：16ms 事件泵四通道统一消费点（音频/文件/波形/更新，轮询顺序勿改），33ms 粒子/悬停/自动滚动 + 弹窗属性桥接同步 |
 | `src/events.rs` | 跨线程事件类型与后台生产者：`FileEvent`/`UpdateEvent`、更新检查/下载线程、文件夹递归扫描线程 |
 | `src/playlist.rs` | 播放列表域：`PlaylistView` 显示模型（过滤 + 显示行→真实行映射）、`Matcher` 搜索、增删播业务操作；搜索/映射测试在此 |
 | `src/waveform.rs` | 波形域：`WaveformResult`、后台工作线程（最新任务优先 + 代次取消）、RAM 缓存写入（LRU）、`apply_waveform` 上屏 |
@@ -80,9 +81,9 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 | `src/audio_engine.rs` | rodio 封装：Command/Event 通道，播放列表按路径重定位；DspStage/EqStage 音频管线 |
 | `src/waveform_generator.rs` | 流式解码聚合波形（min/max/rms）、封面缩略图、中央横带模糊背景、主题色提取（HSV 直方图投票，黑白灰→白色中性） |
 | `src/waveform_cache.rs` | 波形/封面/背景磁盘缓存 v4：50MB LRU、魔数版本失效 |
-| `src/settings.rs` | settings.txt 行式读写：音量/模式/EQ/播放列表/置顶/上次播放 |
+| `src/settings.rs` | settings.txt 行式读写：音量/模式/EQ/播放列表/置顶/上次播放/弹窗位置（pop-x/pop-y） |
 | `src/updater.rs` | 纯 WinINet：查 releases/latest、下载安装包、版本比较；系统代理优先失败转直连 |
-| `src/windows_platform.rs` | Win32 集成：亚克力/圆角、单例互斥 + WM_COPYDATA 转发、WndProc 子类化（拖拽/滚轮/WM_CLOSE） |
+| `src/windows_platform.rs` | Win32 集成：亚克力/圆角、单例互斥 + WM_COPYDATA 转发、WndProc 子类化（主窗：拖拽/滚轮/WM_CLOSE；弹窗：WM_CLOSE 收回） |
 
 ### 关键设计（为什么是这样的）
 
@@ -94,6 +95,13 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   Slint 的 `for` 行复用在"删除+插入"成对部分更新下会残留旧行内容（已踩坑：点歌偏移）。
 - **主题色**：HSV 色相直方图投票选主导鲜艳色；无彩色封面返回白色中性
   （`NEUTRAL_THEME`）。改算法必须 bump 缓存版本（颜色随缓存持久化）。
+- **播放列表独立弹窗（阶段 C 首落地）**：`PlaylistWindow` 与主窗抽屉共用
+  `PlaylistPanel`。**Slint 全局按组件实例隔离**（slint 1.17 文档明确），弹窗拿到的
+  是另一份全局——跨窗口桥接只有两条路：列表内容共享同一 `ModelRc`（天然同步），
+  其余轻量属性（主题色/播放状态/粒子时钟/当前曲目）由泵从主窗实例单向同步
+  （仅变化时写入）。弹窗即建即毁（关闭即 drop 释放资源），位置记忆在
+  settings.txt（pop-x/pop-y），主控关闭级联收回。弹窗动作回调与主窗共用
+  `action_*` 实现（ui_callbacks.rs）。
 - **更新安装**：临时 .cmd（自删除）→ ping 延迟 2 秒 → `/VERYSILENT` 覆盖安装 →
   `start` 重启 `current_exe()`。不要改回 cmd /C 长命令（引号转义会静默失败）。
 - **网络**：WinINet `PRECONFIG` 优先（跟随系统代理），失败转 `DIRECT`——共享代理
@@ -111,6 +119,15 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 - 单实例互斥体 + `FindWindowW("zzhMusicPlayer")` 按窗口标题转发：**模块窗口不得
   使用相同标题**。
 - Slint 禁用默认 feature 后无辅助功能树（UIA 枚举不到子元素），GUI 自动化只能走像素。
+- rodio 的 `Source::try_seek` 带默认实现（返回 `NotSupported`）：**包装解码器的
+  自定义 Source 必须转发 try_seek**，否则所有跳转静默失败（阶段 1 引入
+  PipelineSource 时踩过，已有回归测试 `pipeline_forwards_seek_to_inner`）。
+- Slint 全局单例**按组件实例隔离**（每个导出组件实例一套全局）——多窗口之间
+  属性不互通，跨窗口状态必须 Rust 侧桥接（见"播放列表独立弹窗"设计）。
+- Slint 窗口 height 加动画：伸展期间依赖 `height - X` 定位的元素会出现
+  "先瞬移再滑回"的布局瞬态——窗口尺寸变化一律瞬时生效。
+- PowerShell 5.1 下对 check.ps1 / cargo 外层加 `2>&1` 会把 stderr 进度行变成
+  错误记录导致脚本误报失败——直接原样运行 `./scripts/check.ps1`。
 
 ## 模块化路线图（最终目标 = C）
 
@@ -119,32 +136,35 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 
 **阶段 0（已完成）：状态分域 + 组件拆分**
 UIState 大杂烩拆为三个 global；抽屉/关于抽成独立组件；模块组件**窗口无关**
-（同一组件既可停靠在主窗口内，也可将来实例化为独立窗口——Slint 全局在同编译
-单元的多窗口实例间共享，模块读传输状态零成本）。
+（同一组件既可停靠在主窗口内，也可实例化为独立窗口。注意：Slint 全局按组件
+实例隔离，多窗口并不天然共享全局——跨窗口同步靠 Rust 侧桥接，见关键设计）。
 
 **阶段 A（基建已完成）：同窗停靠**
 `DockState` 全局 + 主控条最左端"模块"按钮开关停靠区；停靠区固定在主窗口底部
-（底部伸展由 Rust 的 `on_dock_changed` 管理窗口高度，保持用户手动调整的基准）；
-`test_panel.slint` 的测试面板 A/B 验证滑条与点击交互（无实际功能）。
-新模块接入步骤：实现面板组件 → 在停靠区注册标签与 variant → 完成。
+（窗口高度由 Slint 的 root.height 绑定按 DockState 直接管理，瞬时生效无动画，
+避免主控条布局瞬态）；`test_panel.slint` 的测试面板 A/B 验证滑条与点击交互
+（无实际功能）。新模块接入步骤：实现面板组件 → 在停靠区注册标签与 variant。
 
-**阶段 C（最终）：混合弹出**
-在 A 基础上，模块可"弹出为独立无边框窗口"（Slint 多窗口，`set_position` 记忆位置、
-吸附主控、逐窗口亚克力与置顶同步、主控关闭逐个收尾）。**按需逐模块开放弹出**，
-第一个候选是桌面歌词。基建 3~5 天，只在真需求出现时做。
+**阶段 C（首落地）：混合弹出**
+播放列表已可弹出为独立无边框窗口（弹出/收回切换 + 位置记忆 + 亚克力/圆角 +
+主控关闭级联收回；暂无吸附）。基建已通：Slint 多窗口 + 逐窗口系统效果 +
+独立 WndProc 子类化 + 泵桥接同步。**按需逐模块开放弹出**，下一个候选是
+桌面歌词；新模块弹出照抄播放列表的模式（面板组件窗口无关 + 共享模型 + 泵同步）。
 
 ### 阶段 1~3（功能模块，均以模块化单体形态实现）
 
 1. **音频管线挂钩（已完成）+ 均衡器 UI（待做）**：`audio_engine.rs` 已有
    `DspStage` trait（逐采样 f32 处理）+ `PipelineSource`（解码器→DSP 链→输出，
-   无阶段零开销直通）+ `EqStage`（10 段 RBJ peaking，Arc<Mutex<EqSettings>> 共享，
-   参数经 Command::SetEq 即时生效）+ 设置持久化（settings.txt `eq=` 行）。
+   无阶段零开销直通；**必须转发 try_seek**，见坑列表）+ `EqStage`（10 段 RBJ
+   peaking，Arc<Mutex<EqSettings>> 共享，参数经 Command::SetEq 即时生效）+
+   设置持久化（settings.txt `eq=` 行）。
    **剩余：EQ 模块 UI**（停靠面板 10 根滑条 + 预设 + 开关），接 `audio.set_eq()` 即可。
 2. **歌词**（1~2 天）：位置事件（50ms）现成；本地 .lrc 解析 → 在线 API（做成可换
    源）；UI 填停靠区或波形上方单行。
-3. **自定义音源**（1~2 周，最后做）：`TrackProvider` 抽象（搜索→解析流地址→流式
-   喂解码器，HTTP range seek 是难点）；**合规红线：核心不带任何内置源，一律用户
-   自行添加**（前车之鉴：LX Music）。若开放第三方，走脚本/进程外 IPC，不走动态库。
+3. **自定义音源（暂缓）**：用户已决定推迟，不排入当前计划；届时从
+   `TrackProvider` 抽象做起（搜索→解析流地址→流式喂解码器，HTTP range seek
+   是难点）；**合规红线：核心不带任何内置源，一律用户自行添加**（前车之鉴：
+   LX Music）。若开放第三方，走脚本/进程外 IPC，不走动态库。
 
 ## 明确不做
 
@@ -155,7 +175,7 @@ UIState 大杂烩拆为三个 global；抽屉/关于抽成独立组件；模块�
 
 ## 性能预算
 
-- 全局拆分是命名空间重组，零运行时成本；**禁止**在 33ms/100ms 泵里做每帧分配
+- 全局拆分是命名空间重组，零运行时成本；**禁止**在 33ms/16ms 泵里做每帧分配
 - 泵内属性写入只在值变化时执行（先读后写比对），避免无谓重绘
 - 波形/背景纹理保持小图放大方案，禁止引入窗口尺寸的全幅位图（旧版 70-80MB
   内存的历史教训）

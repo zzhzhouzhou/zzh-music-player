@@ -79,7 +79,10 @@ in-out property <[float]> wave-bars;
 }
 
 // 播放列表模块状态：真实列表的过滤视图、当前曲目（真实索引）、
-// 搜索过滤、拖拽排序与悬停。
+// 搜索过滤、拖拽排序与悬停。popped / pop-out / pop-close 支撑独立弹窗
+// （阶段 C）：窗口实例由 Rust 创建销毁，本域只承载开关语义。
+// 注意：Slint 1.17 的全局单例按组件实例隔离——独立窗口拿到的是本域的
+// 另一份实例，跨窗口同步由 Rust 侧桥接（共享模型 + 泵同步），见 app.rs。
 export global PlaylistState {
     in-out property <[PlaylistEntry]> playlist: [];
     in-out property <int> playlist-current: -1;
@@ -93,6 +96,8 @@ export global PlaylistState {
     in-out property <float> hover-row: -1.0;
     in-out property <float> hover-button: 0.0;
     in-out property <length> list-vp-y: 0px;
+    // 播放列表是否已弹出为独立窗口（Rust 维护；主控按钮高亮与行为分支用）。
+    in-out property <bool> popped: false;
     callback play-at(float);
     callback remove-track(float);
     callback move-track(float, float);
@@ -101,6 +106,9 @@ export global PlaylistState {
     callback clear-playlist();
     callback toggle-playlist();
     callback search-edited(string);
+    // 请求把播放列表弹出为独立窗口 / 收回独立窗口（Rust 侧开关窗口实例）。
+    callback pop-out();
+    callback pop-close();
 }
 
 // 关于与更新模块状态：关于卡片开关、版本号（Cargo.toml 注入）、

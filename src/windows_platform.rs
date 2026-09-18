@@ -37,6 +37,8 @@ const SINGLE_INSTANCE_RETRIES: u32 = 20;
 static FILE_EVENTS: OnceLock<Sender<FileEvent>> = OnceLock::new();
 /// 被替换的原窗口过程（winit 的 WndProc）。
 static ORIGINAL_WNDPROC: OnceLock<isize> = OnceLock::new();
+/// 播放列表独立窗口被替换的原窗口过程（与主窗口分开保存，互不覆盖）。
+static POPOUT_ORIGINAL_WNDPROC: OnceLock<isize> = OnceLock::new();
 /// 播放列表抽屉是否打开（打开时滚轮交给列表滚动，不调节音量）。
 static PLAYLIST_OPEN: AtomicBool = AtomicBool::new(false);
 /// “关于”对话框是否打开（打开时滚轮不再调整音量）。
@@ -254,15 +256,51 @@ fn forward_to_running_instance(files: &[PathBuf]) -> bool {
     true
 }
 
-/// 把消息转发给原始窗口过程。
-unsafe fn forward_to_original(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let original = ORIGINAL_WNDPROC.get().copied().unwrap_or(0);
+/// 把消息转发给指定的原窗口过程。
+unsafe fn forward_to(
+    original: isize,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if original != 0 {
         let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
             unsafe { std::mem::transmute(original) };
         unsafe { proc(hwnd, msg, wparam, lparam) }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
+
+/// 把消息转发给主窗口的原窗口过程。
+unsafe fn forward_to_original(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        forward_to(
+            ORIGINAL_WNDPROC.get().copied().unwrap_or(0),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
+    }
+}
+
+/// 把消息转发给播放列表独立窗口的原窗口过程。
+unsafe fn forward_to_popout_original(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        forward_to(
+            POPOUT_ORIGINAL_WNDPROC.get().copied().unwrap_or(0),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
     }
 }
 
@@ -356,6 +394,44 @@ pub(crate) fn setup_drag_drop(window: &slint::Window) {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
         DragAcceptFiles(hwnd, 1);
         eprintln!("[sys] 文件拖拽已注册（WndProc 子类化 + DragAcceptFiles）");
+    }
+}
+
+/// 子类化播放列表独立窗口：仅拦 WM_CLOSE（Alt+F4 收回弹窗而非退出程序）。
+/// 不注册文件拖拽（拖拽入口保留在主窗口）；滚轮等其余消息原样转发给
+/// winit，由 Slint 路由到弹窗内元素（列表滚轮在面板覆盖层处理）。
+pub(crate) fn setup_playlist_window(window: &slint::Window) {
+    let Some(hwnd) = hwnd_from_window(window) else {
+        eprintln!("[sys] 弹窗子类化失败：获取 HWND 失败");
+        return;
+    };
+    unsafe {
+        let original = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+        if original == 0 {
+            eprintln!("[sys] 弹窗子类化失败：获取原 WndProc 失败");
+            return;
+        }
+        let _ = POPOUT_ORIGINAL_WNDPROC.set(original);
+        let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = popout_wnd_proc;
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
+    }
+}
+
+/// 播放列表独立窗口的窗口过程：只拦 WM_CLOSE，其余全部转发。
+unsafe extern "system" fn popout_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
+            if let Some(tx) = FILE_EVENTS.get() {
+                let _ = tx.send(FileEvent::PlaylistWindowClose);
+            }
+            0
+        }
+        _ => unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) },
     }
 }
 

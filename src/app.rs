@@ -16,15 +16,18 @@ use crate::playlist::{PlaylistView, add_track, play_file_now};
 use crate::pumps::{particle_33ms, pump_events};
 use crate::settings::{load_settings, save_settings};
 use crate::transport::{SeekState, ThemeTween};
-use crate::ui_callbacks::register_callbacks;
+use crate::ui_callbacks::{register_callbacks, register_playlist_window_callbacks};
 use crate::version::app_version;
 use crate::waveform::{WaveformResult, spawn_waveform_worker};
 use crate::waveform_cache::trim_wave_cache;
 use crate::windows_platform::{
     apply_system_effects, enforce_single_instance, hwnd_from_window, set_about_open,
-    set_always_on_top, set_file_events, set_playlist_open, setup_drag_drop,
+    set_always_on_top, set_file_events, set_playlist_open, setup_drag_drop, setup_playlist_window,
 };
-use crate::{AboutState, MainWindow, PlaylistEntry, PlaylistState, TransportState, UpdateState};
+use crate::{
+    AboutState, MainWindow, PlaylistEntry, PlaylistState, PlaylistWindow, TransportState,
+    UpdateState,
+};
 
 /// 组合根持有的全部共享状态。UI 线程独占（整体 Rc），闭包经 Weak<App>
 /// 临时升级访问——与拆分前“闭包克隆各自 Rc”等价，但依赖清单集中一处。
@@ -51,6 +54,15 @@ pub struct App {
     pub eq: EqSettings,
     /// 当前正在播放的曲目路径（事件泵维护，波形上屏判断用）。
     pub current_path: RefCell<Option<PathBuf>>,
+    /// 播放列表显示模型：主窗口抽屉与独立弹窗共享同一 ModelRc，
+    /// 增删/过滤/排序只发生一次，两个窗口同步呈现。
+    pub playlist_model: Rc<VecModel<PlaylistEntry>>,
+    /// 播放列表独立窗口（阶段 C）：Some = 已弹出。关闭即销毁实例释放
+    /// 全部 UI 资源（内存优先），下次弹出重建——列表内容在 Rust 侧，
+    /// 重建零成本恢复。Slint 全局按组件实例隔离，跨窗口桥接见 pumps.rs。
+    pub playlist_window: RefCell<Option<PlaylistWindow>>,
+    /// 弹窗位置记忆（物理坐标）：会话内重开用，退出时随设置持久化。
+    pub playlist_pop_pos: Cell<Option<(i32, i32)>>,
 }
 
 /// 统一关闭流程：保存记忆设置、隐藏窗口并退出事件循环。
@@ -66,6 +78,8 @@ pub(crate) fn do_close(app: &App) {
             None
         }
     };
+    // 独立播放列表窗口：先关闭（内部记录位置）再保存设置，位置随本次持久化。
+    let pop_pos = close_playlist_window(app);
     save_settings(
         &app.playlist.borrow(),
         transport.get_position(),
@@ -74,9 +88,76 @@ pub(crate) fn do_close(app: &App) {
         transport.get_always_on_top(),
         current.as_ref(),
         &app.eq,
+        pop_pos,
     );
     let _ = app.ui.window().hide();
     let _ = slint::quit_event_loop();
+}
+
+/// 打开播放列表独立窗口（幂等）：创建实例、共享列表模型、注册回调、
+/// 恢复记忆位置、应用亚克力/圆角并子类化 WndProc（Alt+F4 收回弹窗）。
+pub(crate) fn open_playlist_window(app: &Rc<App>) {
+    if app.playlist_window.borrow().is_some() {
+        return;
+    }
+    let Ok(pw) = PlaylistWindow::new() else {
+        eprintln!("[sys] 创建播放列表窗口失败");
+        return;
+    };
+    // 共享显示模型：弹窗的 PlaylistState.playlist 指向与主窗口相同的
+    // ModelRc（全局按组件实例隔离，模型必须手动共享）。
+    pw.global::<PlaylistState>()
+        .set_playlist(ModelRc::from(Rc::clone(&app.playlist_model)));
+    // 打开瞬间对齐当前曲目高亮；其余属性（主题色/播放状态/粒子时钟）
+    // 由 33ms 泵逐帧同步，无需在此逐项搬运。
+    let cur = app.ui.global::<PlaylistState>().get_playlist_current();
+    pw.global::<PlaylistState>().set_playlist_current(cur);
+    // 位置记忆：恢复上次关闭位置；首次弹出默认出现在主窗口右侧。
+    if let Some((x, y)) = app.playlist_pop_pos.get() {
+        pw.window().set_position(slint::PhysicalPosition::new(x, y));
+    } else {
+        let origin = app.ui.window().position();
+        let width = app.ui.window().size().width as i32;
+        pw.window().set_position(slint::PhysicalPosition::new(
+            origin.x + width + 12,
+            origin.y,
+        ));
+    }
+    register_playlist_window_callbacks(app, &pw);
+    pw.show().expect("显示播放列表窗口失败");
+    // 亚克力/圆角与 WndProc 子类化。winit 窗口惰性创建：HWND 未就绪时
+    // 短延时重试一次（与主窗口的 setup_timer 同一防御）。
+    if hwnd_from_window(pw.window()).is_none() {
+        let weak = pw.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(50), move || {
+            if let Some(pw) = weak.upgrade() {
+                apply_system_effects(pw.window());
+                setup_playlist_window(pw.window());
+            }
+        });
+    } else {
+        apply_system_effects(pw.window());
+        setup_playlist_window(pw.window());
+    }
+    app.playlist_window.borrow_mut().replace(pw);
+    app.ui.global::<PlaylistState>().set_popped(true);
+    eprintln!("[sys] 播放列表已弹出为独立窗口");
+}
+
+/// 关闭播放列表独立窗口（幂等）：记录位置（供会话内重开与退出持久化）、
+/// 复位共享显示模型的搜索过滤并销毁实例，返回记录的位置。
+pub(crate) fn close_playlist_window(app: &App) -> Option<(i32, i32)> {
+    let pw = app.playlist_window.borrow_mut().take()?;
+    let pos = pw.window().position();
+    app.playlist_pop_pos.set(Some((pos.x, pos.y)));
+    // 弹窗内的搜索框属于它自己的全局实例（随窗口销毁），但共享显示模型
+    // 的过滤必须复位，否则抽屉重新打开仍是被过滤状态。
+    app.playlist_view
+        .borrow_mut()
+        .set_filter("", &app.playlist.borrow());
+    app.ui.global::<PlaylistState>().set_popped(false);
+    eprintln!("[sys] 播放列表独立窗口已收回");
+    Some((pos.x, pos.y)) // pw 在此 drop：窗口与全部 UI 资源同步释放
 }
 
 /// 程序入口：装配一切并阻塞在 UI 事件循环上。
@@ -168,6 +249,9 @@ pub fn run() {
         popup_hide_timer,
         eq: settings.eq.clone(),
         current_path: RefCell::new(None),
+        playlist_model: Rc::clone(&playlist_model),
+        playlist_window: RefCell::new(None),
+        playlist_pop_pos: Cell::new(settings.pop_pos),
     });
 
     // winit 窗口是惰性创建的：事件循环启动（Resumed 阶段）后才真正存在，

@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 
 use slint::{ComponentHandle, SharedString};
 
-use crate::app::{App, do_close};
+use crate::app::{App, close_playlist_window, do_close, open_playlist_window};
 use crate::events::{FileEvent, UPDATE_INSTALLER_NAME, spawn_update_check};
 use crate::playlist::{play_at, track_name};
 use crate::windows_platform::{cursor_position, set_always_on_top, set_playlist_open};
-use crate::{AboutState, PlaylistState, TransportState, UpdateState};
+use crate::{AboutState, PlaylistState, PlaylistWindow, TransportState, UpdateState};
 
 /// 双击判定的最大时间间隔（毫秒）。
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -197,14 +197,21 @@ fn register_transport_callbacks(app: &Rc<App>) {
 }
 
 /// 播放列表域：抽屉开关、点歌、搜索、拖拽排序、删除、清空、打开文件夹。
+/// 动作实现集中在下方 action_* 共享函数：主窗口抽屉与独立弹窗的
+/// Slint 全局互不相通（按组件实例隔离），但 Rust 侧共享状态是唯一事实源。
 fn register_playlist_callbacks(app: &Rc<App>) {
-    // 播放列表抽屉。
+    // 播放列表抽屉开关（主控按钮）。
     {
         let app_weak = Rc::downgrade(app);
         app.ui
             .global::<PlaylistState>()
             .on_toggle_playlist(move || {
                 if let Some(app) = app_weak.upgrade() {
+                    // 已弹出为独立窗口：主控按钮此时负责收回弹窗。
+                    if app.playlist_window.borrow().is_some() {
+                        close_playlist_window(&app);
+                        return;
+                    }
                     let playlist_state = app.ui.global::<PlaylistState>();
                     let open = !playlist_state.get_playlist_open();
                     playlist_state.set_playlist_open(open);
@@ -220,17 +227,27 @@ fn register_playlist_callbacks(app: &Rc<App>) {
                 }
             });
     }
+    // 弹出为独立窗口（阶段 C）：收起抽屉并复位过滤，内容转由弹窗承载。
+    {
+        let app_weak = Rc::downgrade(app);
+        app.ui.global::<PlaylistState>().on_pop_out(move || {
+            if let Some(app) = app_weak.upgrade() {
+                let playlist_state = app.ui.global::<PlaylistState>();
+                playlist_state.set_playlist_open(false);
+                playlist_state.set_search_open(false);
+                playlist_state.set_search_text(SharedString::default());
+                app.playlist_view
+                    .borrow_mut()
+                    .set_filter("", &app.playlist.borrow());
+                open_playlist_window(&app);
+            }
+        });
+    }
     {
         let app_weak = Rc::downgrade(app);
         app.ui.global::<PlaylistState>().on_play_at(move |index| {
             if let Some(app) = app_weak.upgrade() {
-                let playlist_state = app.ui.global::<PlaylistState>();
-                // 显示行号 → 真实索引（搜索过滤后两者不一致）。
-                let index = app
-                    .playlist_view
-                    .borrow()
-                    .real_of(index.round().max(0.0) as usize);
-                play_at(index, &app.playlist, &playlist_state, &app.audio);
+                action_play_at(&app, index);
             }
         });
     }
@@ -240,15 +257,12 @@ fn register_playlist_callbacks(app: &Rc<App>) {
         app.ui
             .global::<PlaylistState>()
             .on_set_reorder_text(move |row| {
-                if let Some(app) = app_weak.upgrade() {
-                    let playlist_state = app.ui.global::<PlaylistState>();
-                    let row = app
-                        .playlist_view
-                        .borrow()
-                        .real_of(row.round().max(0.0) as usize);
-                    if let Some(p) = app.playlist.borrow().get(row) {
-                        playlist_state.set_reorder_text(track_name(p).into());
-                    }
+                if let Some(app) = app_weak.upgrade()
+                    && let Some(name) = action_reorder_text(&app, row)
+                {
+                    app.ui
+                        .global::<PlaylistState>()
+                        .set_reorder_text(name.into());
                 }
             });
     }
@@ -259,9 +273,7 @@ fn register_playlist_callbacks(app: &Rc<App>) {
             .global::<PlaylistState>()
             .on_search_edited(move |text| {
                 if let Some(app) = app_weak.upgrade() {
-                    app.playlist_view
-                        .borrow_mut()
-                        .set_filter(&text, &app.playlist.borrow());
+                    action_search_edited(&app, &text);
                 }
             });
     }
@@ -272,39 +284,9 @@ fn register_playlist_callbacks(app: &Rc<App>) {
         app.ui
             .global::<PlaylistState>()
             .on_move_track(move |from, to| {
-                let Some(app) = app_weak.upgrade() else {
-                    return;
-                };
-                let playlist_state = app.ui.global::<PlaylistState>();
-                let mut view = app.playlist_view.borrow_mut();
-                if view.is_filtering() {
-                    return;
+                if let Some(app) = app_weak.upgrade() {
+                    action_move_track(&app, from, to);
                 }
-                let len = app.playlist.borrow().len();
-                let from = from.round().max(0.0) as usize;
-                let to = (to.round().max(0.0) as usize).min(len.saturating_sub(1));
-                if from >= len || from == to {
-                    return;
-                }
-                let item = app.playlist.borrow_mut().remove(from);
-                app.playlist.borrow_mut().insert(to, item);
-                view.moved(&app.playlist.borrow());
-                // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
-                let cur = playlist_state.get_playlist_current() as i64;
-                let (f, t) = (from as i64, to as i64);
-                let new_cur = if cur == f {
-                    t
-                } else if f < cur && cur <= t {
-                    cur - 1
-                } else if t <= cur && cur < f {
-                    cur + 1
-                } else {
-                    cur
-                };
-                playlist_state.set_playlist_current(new_cur as i32);
-                app.audio.send(crate::audio_engine::Command::SetPlaylist(
-                    app.playlist.borrow().clone(),
-                ));
             });
     }
     // 在资源管理器中打开曲目所在文件夹并选中文件。
@@ -314,25 +296,7 @@ fn register_playlist_callbacks(app: &Rc<App>) {
             .global::<PlaylistState>()
             .on_open_folder(move |index| {
                 if let Some(app) = app_weak.upgrade() {
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        let index = app
-                            .playlist_view
-                            .borrow()
-                            .real_of(index.round().max(0.0) as usize);
-                        if let Some(p) = app.playlist.borrow().get(index) {
-                            // explorer /select,"路径"：打开文件夹并高亮该文件。
-                            let _ = std::process::Command::new("explorer.exe")
-                                .raw_arg(format!("/select,\"{}\"", p.display()))
-                                .spawn();
-                        }
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = index;
-                        let _ = &app;
-                    }
+                    action_open_folder(&app, index);
                 }
             });
     }
@@ -342,27 +306,7 @@ fn register_playlist_callbacks(app: &Rc<App>) {
             .global::<PlaylistState>()
             .on_remove_track(move |index| {
                 if let Some(app) = app_weak.upgrade() {
-                    let display = index.round().max(0.0) as usize;
-                    let real = app.playlist_view.borrow().real_of(display);
-                    {
-                        let mut list = app.playlist.borrow_mut();
-                        if real >= list.len() {
-                            return;
-                        }
-                        list.remove(real);
-                    }
-                    app.playlist_view
-                        .borrow_mut()
-                        .removed(&app.playlist.borrow());
-                    let playlist_state = app.ui.global::<PlaylistState>();
-                    let cur = playlist_state.get_playlist_current();
-                    if cur as usize == real {
-                        playlist_state.set_playlist_current(-1);
-                    } else if cur as usize > real {
-                        playlist_state.set_playlist_current(cur - 1);
-                    }
-                    // 引擎侧同步删除；若删的是当前播放曲目，引擎会自动切到下一首。
-                    app.audio.send(crate::audio_engine::Command::RemoveAt(real));
+                    action_remove_track(&app, index);
                 }
             });
     }
@@ -370,13 +314,245 @@ fn register_playlist_callbacks(app: &Rc<App>) {
         let app_weak = Rc::downgrade(app);
         app.ui.global::<PlaylistState>().on_clear_playlist(move || {
             if let Some(app) = app_weak.upgrade() {
-                app.playlist.borrow_mut().clear();
-                app.playlist_view.borrow_mut().cleared();
-                app.audio
-                    .send(crate::audio_engine::Command::SetPlaylist(Vec::new()));
-                let playlist_state = app.ui.global::<PlaylistState>();
-                playlist_state.set_playlist_current(-1);
+                action_clear_playlist(&app);
             }
+        });
+    }
+}
+
+// —— 播放列表动作的共享实现：主窗口抽屉与独立弹窗的回调都落到这里 ——
+// playlist_current 等写入主窗口实例的属性由事件泵同步到弹窗（pumps.rs），
+// 因此这些函数统一经 app.ui 访问全局即可；需要“写回发起窗口自身”的
+// 返回值（如浮块文本）由调用方处理。
+
+fn action_play_at(app: &App, index: f32) {
+    let playlist_state = app.ui.global::<PlaylistState>();
+    // 显示行号 → 真实索引（搜索过滤后两者不一致）。
+    let index = app
+        .playlist_view
+        .borrow()
+        .real_of(index.round().max(0.0) as usize);
+    play_at(index, &app.playlist, &playlist_state, &app.audio);
+}
+
+fn action_remove_track(app: &App, index: f32) {
+    let display = index.round().max(0.0) as usize;
+    let real = app.playlist_view.borrow().real_of(display);
+    {
+        let mut list = app.playlist.borrow_mut();
+        if real >= list.len() {
+            return;
+        }
+        list.remove(real);
+    }
+    app.playlist_view
+        .borrow_mut()
+        .removed(&app.playlist.borrow());
+    let playlist_state = app.ui.global::<PlaylistState>();
+    let cur = playlist_state.get_playlist_current();
+    if cur as usize == real {
+        playlist_state.set_playlist_current(-1);
+    } else if cur as usize > real {
+        playlist_state.set_playlist_current(cur - 1);
+    }
+    // 引擎侧同步删除；若删的是当前播放曲目，引擎会自动切到下一首。
+    app.audio.send(crate::audio_engine::Command::RemoveAt(real));
+}
+
+fn action_move_track(app: &App, from: f32, to: f32) {
+    let playlist_state = app.ui.global::<PlaylistState>();
+    let mut view = app.playlist_view.borrow_mut();
+    if view.is_filtering() {
+        return;
+    }
+    let len = app.playlist.borrow().len();
+    let from = from.round().max(0.0) as usize;
+    let to = (to.round().max(0.0) as usize).min(len.saturating_sub(1));
+    if from >= len || from == to {
+        return;
+    }
+    let item = app.playlist.borrow_mut().remove(from);
+    app.playlist.borrow_mut().insert(to, item);
+    view.moved(&app.playlist.borrow());
+    drop(view);
+    // 当前曲目索引随移动平移（引擎侧按路径重定位，无需单独命令）。
+    let cur = playlist_state.get_playlist_current() as i64;
+    let (f, t) = (from as i64, to as i64);
+    let new_cur = if cur == f {
+        t
+    } else if f < cur && cur <= t {
+        cur - 1
+    } else if t <= cur && cur < f {
+        cur + 1
+    } else {
+        cur
+    };
+    playlist_state.set_playlist_current(new_cur as i32);
+    app.audio.send(crate::audio_engine::Command::SetPlaylist(
+        app.playlist.borrow().clone(),
+    ));
+}
+
+#[cfg(windows)]
+fn action_open_folder(app: &App, index: f32) {
+    use std::os::windows::process::CommandExt;
+    let index = app
+        .playlist_view
+        .borrow()
+        .real_of(index.round().max(0.0) as usize);
+    if let Some(p) = app.playlist.borrow().get(index) {
+        // explorer /select,"路径"：打开文件夹并高亮该文件。
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{}\"", p.display()))
+            .spawn();
+    }
+}
+
+#[cfg(not(windows))]
+fn action_open_folder(app: &App, index: f32) {
+    let _ = (app, index);
+}
+
+fn action_search_edited(app: &App, text: &str) {
+    app.playlist_view
+        .borrow_mut()
+        .set_filter(text, &app.playlist.borrow());
+}
+
+fn action_clear_playlist(app: &App) {
+    app.playlist.borrow_mut().clear();
+    app.playlist_view.borrow_mut().cleared();
+    app.audio
+        .send(crate::audio_engine::Command::SetPlaylist(Vec::new()));
+    let playlist_state = app.ui.global::<PlaylistState>();
+    playlist_state.set_playlist_current(-1);
+}
+
+/// 按显示行号取歌名（填充拖动浮块）；行号越界返回 None。
+fn action_reorder_text(app: &App, row: f32) -> Option<String> {
+    let row = app
+        .playlist_view
+        .borrow()
+        .real_of(row.round().max(0.0) as usize);
+    app.playlist.borrow().get(row).map(|p| track_name(p))
+}
+
+/// 独立播放列表窗口的回调接线：与主窗口抽屉共用同一批动作实现，但
+/// “写回发起窗口自身属性”的回调（浮块文本）必须落到本窗口的全局实例，
+/// 因此这些回调经 pw_weak 升级后取本窗口的 global，避免持有强引用自环。
+pub(crate) fn register_playlist_window_callbacks(app: &Rc<App>, pw: &PlaylistWindow) {
+    let ps = pw.global::<PlaylistState>();
+    let ts = pw.global::<TransportState>();
+    let pw_weak = pw.as_weak();
+
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_play_at(move |index| {
+            if let Some(app) = app_weak.upgrade() {
+                action_play_at(&app, index);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_remove_track(move |index| {
+            if let Some(app) = app_weak.upgrade() {
+                action_remove_track(&app, index);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_move_track(move |from, to| {
+            if let Some(app) = app_weak.upgrade() {
+                action_move_track(&app, from, to);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_open_folder(move |index| {
+            if let Some(app) = app_weak.upgrade() {
+                action_open_folder(&app, index);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_search_edited(move |text| {
+            if let Some(app) = app_weak.upgrade() {
+                action_search_edited(&app, &text);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_clear_playlist(move || {
+            if let Some(app) = app_weak.upgrade() {
+                action_clear_playlist(&app);
+            }
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        let pw_weak = pw_weak.clone();
+        ps.on_set_reorder_text(move |row| {
+            if let (Some(app), Some(pw)) = (app_weak.upgrade(), pw_weak.upgrade())
+                && let Some(name) = action_reorder_text(&app, row)
+            {
+                pw.global::<PlaylistState>().set_reorder_text(name.into());
+            }
+        });
+    }
+    // 弹窗内关闭按钮（面板 close-requested → pop-close）。
+    {
+        let app_weak = Rc::downgrade(app);
+        ps.on_pop_close(move || {
+            if let Some(app) = app_weak.upgrade() {
+                close_playlist_window(&app);
+            }
+        });
+    }
+
+    // —— 标题区拖动本窗口（与主窗口同一套光标跟随，无双击打开文件语义）——
+    let drag_state: Rc<RefCell<Option<(slint::PhysicalPosition, i32, i32)>>> =
+        Rc::new(RefCell::new(None));
+    {
+        let pw_weak = pw_weak.clone();
+        let drag_state = Rc::clone(&drag_state);
+        ts.on_window_drag_down(move |_, _| {
+            let Some(pw) = pw_weak.upgrade() else {
+                return;
+            };
+            let Some((cx, cy)) = cursor_position() else {
+                return;
+            };
+            *drag_state.borrow_mut() = Some((pw.window().position(), cx, cy));
+        });
+    }
+    {
+        let pw_weak = pw_weak.clone();
+        let drag_state = Rc::clone(&drag_state);
+        ts.on_window_drag_move(move |_, _| {
+            let Some((origin, cx0, cy0)) = *drag_state.borrow() else {
+                return;
+            };
+            let Some(pw) = pw_weak.upgrade() else {
+                return;
+            };
+            let Some((cx, cy)) = cursor_position() else {
+                return;
+            };
+            pw.window().set_position(slint::PhysicalPosition::new(
+                origin.x + (cx - cx0),
+                origin.y + (cy - cy0),
+            ));
+        });
+    }
+    {
+        let drag_state = Rc::clone(&drag_state);
+        ts.on_window_drag_up(move || {
+            *drag_state.borrow_mut() = None;
         });
     }
 }

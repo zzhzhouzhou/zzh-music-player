@@ -1,0 +1,46 @@
+// 播放列表独立窗口（阶段 C 首落地）：无边框亚克力小窗，承载与停靠抽屉
+// 完全相同的 PlaylistPanel。窗口实例由 Rust 侧按需创建销毁（关闭即释放）。
+//
+// 重要：Slint 1.17 的全局单例按组件实例隔离（slint crate 文档：
+// "Global singletons are instantiated once per component"），本窗口的
+// PlaylistState / TransportState 是与主窗口无关的另一份实例。列表内容靠
+// 共享同一 ModelRc，主题色 / 播放状态 / 粒子时钟 / 当前曲目由事件泵从
+// 主窗口实例同步（见 pumps.rs 桥接段）——不要假设属性天然互通。
+import { PlaylistState, TransportState } from "state.slint";
+import { PlaylistPanel } from "playlist.slint";
+
+export component PlaylistWindow inherits Window {
+    no-frame: true;
+    background: transparent;
+    // 标题不得与主窗口相同：单实例转发按标题 FindWindowW 精确匹配主窗口。
+    title: "zzhMusicPlayer Playlist";
+    width: 340px;
+    height: 520px;
+
+    PlaylistPanel {
+        width: 100%;
+        height: 100%;
+        active: true;
+        docked: false;
+        // 弹窗右上角关闭按钮：收回独立窗口（位置记忆在 Rust 侧处理）。
+        close-requested => { PlaylistState.pop-close(); }
+    }
+
+    // 标题区拖动窗口：悬于面板之上，只盖住无交互的标题段（x 0..80），
+    // 不挡搜索框（x 84 起）/ 清空 / 关闭。无双击打开文件语义（主窗口专属）。
+    TouchArea {
+        x: 0px;
+        y: 0px;
+        width: 80px;
+        height: 40px;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                TransportState.window-drag-down(self.mouse-x / 1px, self.mouse-y / 1px);
+            } else if e.kind == PointerEventKind.move {
+                TransportState.window-drag-move(self.mouse-x / 1px, self.mouse-y / 1px);
+            } else if e.kind == PointerEventKind.up {
+                TransportState.window-drag-up();
+            }
+        }
+    }
+}
