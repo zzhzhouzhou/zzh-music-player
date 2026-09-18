@@ -1,5 +1,5 @@
 //! 跨线程事件的类型与后台生产者：文件事件（拖拽/双击/滚轮/单例转发）与更新事件。
-//! 通道的统一消费点在 pumps 模块的 100ms 泵。
+//! 通道的统一消费点在 pumps 模块的事件泵。
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -27,7 +27,7 @@ pub enum FileEvent {
     CloseRequest,
 }
 
-/// 更新流程事件：检查/下载线程产出，UI 线程 100ms 泵消费。
+/// 更新流程事件：检查/下载线程产出，UI 线程事件泵消费。
 #[derive(Clone)]
 pub enum UpdateEvent {
     Checking,

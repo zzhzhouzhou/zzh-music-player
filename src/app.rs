@@ -13,7 +13,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::audio_engine::{AudioEngine, Command, EqSettings, PlaybackMode};
 use crate::events::{self, FileEvent, UpdateEvent};
 use crate::playlist::{PlaylistView, add_track, play_file_now};
-use crate::pumps::{particle_33ms, pump_100ms};
+use crate::pumps::{particle_33ms, pump_events};
 use crate::settings::{load_settings, save_settings};
 use crate::transport::{SeekState, ThemeTween};
 use crate::ui_callbacks::register_callbacks;
@@ -49,7 +49,7 @@ pub struct App {
     pub mode_hide_timer: Rc<slint::Timer>,
     pub popup_hide_timer: Rc<slint::Timer>,
     pub eq: EqSettings,
-    /// 当前正在播放的曲目路径（100ms 泵维护，波形上屏判断用）。
+    /// 当前正在播放的曲目路径（事件泵维护，波形上屏判断用）。
     pub current_path: RefCell<Option<PathBuf>>,
 }
 
@@ -89,7 +89,7 @@ pub fn run() {
     let (wave_tx, wave_rx) = spawn_waveform_worker();
     let (file_tx, file_rx) = mpsc::channel::<FileEvent>();
     set_file_events(file_tx.clone());
-    // 更新流程事件通道：检查/下载线程产出，100ms 泵消费。
+    // 更新流程事件通道：检查/下载线程产出，事件泵消费。
     let (update_tx, update_rx) = mpsc::channel::<UpdateEvent>();
 
     // —— 恢复记忆设置 ——
@@ -326,16 +326,17 @@ pub fn run() {
         }
     }
 
-    // —— 100ms 周期泵：音频事件 / 文件事件 / 波形结果 / 更新事件 ——
+    // —— 16ms 周期泵：音频事件 / 文件事件 / 波形结果 / 更新事件 ——
+    // （提速自 100ms：seek 回执与换曲状态的感知延迟降至一帧，见 pumps 模块说明。）
     let pump_timer = slint::Timer::default();
     {
         let app_weak = Rc::downgrade(&app);
         pump_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(100),
+            Duration::from_millis(16),
             move || {
                 if let Some(app) = app_weak.upgrade() {
-                    pump_100ms(&app);
+                    pump_events(&app);
                 }
             },
         );

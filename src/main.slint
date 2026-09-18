@@ -252,8 +252,10 @@ export component MainWindow inherits Window {
     title: "zzhMusicPlayer";
     width: 720px;
     // 停靠区打开时窗口向下伸展（Slint 绑定直接管理高度）。
+    // 不要给 height 加动画：伸展期间 root.height 逐帧滞后于 module-height，
+    // 依赖“height - module-height”定位的主控条会先瞬移出窗再滑回（布局瞬态）。
+    // 窗口瞬时变高、主控内容纹丝不动，停靠区直接出现在新增的底部区域。
     height: 178px + (DockState.open ? DockState.module-height : 0px);
-    animate height { duration: 200ms; easing: ease-out; }
     default-font-family: "HarmonyOS Sans SC";
 
     // 全局快捷键：空格 播放/暂停，左右方向键 快退/快进 5 秒，
@@ -289,7 +291,7 @@ export component MainWindow inherits Window {
         shortcuts.focus();
     }
 
-    // 播放位置比例：播放引擎每 ~100ms 上报一次，这里用 200ms 线性动画在
+    // 播放位置比例：播放引擎每 ~50ms 上报一次，这里用 200ms 线性动画在
     // 两次上报之间插值，让播放头连续平移（“平滑滑动”）而非一格格跳动。
     property <float> played-frac:
         TransportState.duration > 0.0 ? min(TransportState.position / TransportState.duration, 1.0) : 0.0;
@@ -302,7 +304,8 @@ export component MainWindow inherits Window {
 
     // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
     property <length> bar-x: (root.width - 330px) / 2;
-    // 主控条跟随停靠区抬升：停靠打开时窗口变高，主控条保持在主区域底部。
+    // 主控条固定在主区域底部：停靠区打开时窗口向下伸展，主控条位置不变
+    //（伸展前后的 height - module-height 相同），无动画亦无瞬态。
     property <length> bar-y: root.height - 46px
         - (DockState.open ? DockState.module-height : 0px);
 
@@ -697,7 +700,7 @@ export component MainWindow inherits Window {
         }
 
         // 停靠区（阶段 A）：模块面板停靠在主窗口底部，主控条在其上方。
-        // 窗口高度由 Rust 侧按 DockState 伸展/收回（见 100ms 泵的 dock 检测）。
+        // 窗口高度由上方 root.height 绑定按 DockState 直接管理（瞬时生效）。
         Rectangle {
             visible: DockState.open;
             x: 0px;

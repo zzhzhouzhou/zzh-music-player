@@ -201,6 +201,15 @@ where
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+    // 必须转发：rodio 对 Source::try_seek 提供的默认实现是返回 NotSupported，
+    // 不转发则包装后的解码器全部不可跳转（快进快退/进度条/恢复进度静默失败）。
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(pos)?;
+        // 解码器 seek 后从帧边界重新输出（首样本必为声道 0）：声道映射计数
+        // 归零，避免落在奇数样本边界时立体声左右声道互换。
+        self.consumed = 0;
+        Ok(())
+    }
 }
 
 /// RBJ peaking biquad（二阶峰值滤波器，Direct Form I）。
@@ -734,6 +743,8 @@ mod tests {
         samples: std::vec::IntoIter<f32>,
         channels: u16,
         rate: u32,
+        /// 记录收到的 seek 目标（验证管线向内层转发跳转，见下方回归测试）。
+        seek_target: std::rc::Rc<std::cell::Cell<Option<Duration>>>,
     }
 
     impl TestSource {
@@ -742,6 +753,7 @@ mod tests {
                 samples: samples.into_iter(),
                 channels,
                 rate,
+                seek_target: Default::default(),
             }
         }
     }
@@ -765,6 +777,10 @@ mod tests {
         }
         fn total_duration(&self) -> Option<Duration> {
             None
+        }
+        fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+            self.seek_target.set(Some(pos));
+            Ok(())
         }
     }
 
@@ -859,6 +875,30 @@ mod tests {
         assert!(
             cut < in_rms * 0.45,
             "1kHz -12dB 应显著衰减能量: {cut} vs {in_rms}"
+        );
+    }
+
+    #[test]
+    fn pipeline_forwards_seek_to_inner() {
+        // 回归测试（阶段 1 引入的缺陷）：播放源被 PipelineSource 包装后，
+        // rodio 的 Source::try_seek 默认实现直接返回 NotSupported，导致
+        // 快进快退、进度条跳转、恢复上次进度全部静默失败。管线必须把
+        // seek 原样转发给内层解码器。
+        let target: std::rc::Rc<std::cell::Cell<Option<Duration>>> = Default::default();
+        let src = TestSource {
+            samples: vec![0.0; 4800].into_iter(),
+            channels: 2,
+            rate: 48000,
+            seek_target: std::rc::Rc::clone(&target),
+        };
+        let mut pipeline = PipelineSource::new(src, Vec::new());
+        pipeline
+            .try_seek(Duration::from_secs(5))
+            .expect("管线必须向内层转发 seek，而不是返回 NotSupported");
+        assert_eq!(
+            target.get(),
+            Some(Duration::from_secs(5)),
+            "seek 目标应原样到达内层解码器"
         );
     }
 

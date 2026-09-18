@@ -39,7 +39,7 @@ pub struct WaveformResult {
 pub const WAVE_CACHE_LIMIT: usize = 8;
 
 /// 把波形结果写入 RAM 缓存（LRU 淘汰最旧）；已在缓存则仅覆盖内容。
-/// 100ms 泵的两条路径（磁盘缓存命中 / 后台分析完成）共用，避免淘汰逻辑分叉。
+/// 事件泵的两条路径（磁盘缓存命中 / 后台分析完成）共用，避免淘汰逻辑分叉。
 pub fn cache_insert(
     cache: &mut HashMap<PathBuf, WaveformResult>,
     order: &mut VecDeque<PathBuf>,

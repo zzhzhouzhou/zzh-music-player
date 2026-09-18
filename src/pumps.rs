@@ -1,5 +1,8 @@
 //! UI 线程的两只周期泵。
-//! 100ms 泵：音频事件 / 文件事件 / 波形结果 / 更新事件 四个 mpsc 的统一消费点。
+//! 16ms 事件泵：音频事件 / 文件事件 / 波形结果 / 更新事件 四个 mpsc 的统一消费点。
+//! （旧为 100ms：慢泵让 seek 回执、换曲状态、文件追加的感知延迟高达 100ms；
+//! 固定 16ms 与显示刷新对齐，四个 try_recv 的空转成本可忽略。不用动态调间隔——
+//! Slint Timer 每次 restart 需重新装箱闭包，违反“泵内零分配”约束。）
 //! 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动。
 //! 约束：泵内不做每帧分配的重活；属性只在值变化时写入（先读后写比对）。
 
@@ -18,9 +21,9 @@ use crate::waveform_cache::read_wave_cache;
 use crate::windows_platform::{cursor_position, is_about_open, set_about_open};
 use crate::{AboutState, PlaylistState, TransportState, UpdateState};
 
-/// 100ms 泵：四个通道的统一消费点。轮询顺序（音频→文件→波形→更新）
+/// 16ms 事件泵：四个通道的统一消费点。轮询顺序（音频→文件→波形→更新）
 /// 与拆分前保持一致：音频状态优先上屏，文件操作其次，波形与更新最后。
-pub fn pump_100ms(app: &App) {
+pub fn pump_events(app: &App) {
     let transport = app.ui.global::<TransportState>();
     let playlist_state = app.ui.global::<PlaylistState>();
     let about_state = app.ui.global::<AboutState>();
