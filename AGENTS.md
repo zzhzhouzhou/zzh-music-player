@@ -14,14 +14,14 @@ Windows 单机音乐播放器。原生 Rust + Slint（femtovg 渲染 + winit 后
    大依赖；能用 `windows-sys` 加 feature 解决就不加 crate；JSON 这类固定结构允许手写
    扫描器（先例：ID3v2 解析器、更新器字段提取）。
 2. **美观第二** — 深色玻璃视觉语言：半透明面板 + 发丝描边 + 主题色（从封面提取）点缀。
-3. **功能不变原则** — 任何重构/新功能合并前，21 个单元测试必须全绿，且全部 UI 面
+3. **功能不变原则** — 任何重构/新功能合并前，25 个单元测试必须全绿，且全部 UI 面
    （主界面 / 播放列表抽屉 / 搜索 / 关于 / 拖拽排序）人工过一遍。
 4. 中文注释，注释解释 **为什么** 而不是做了什么。
 
 ## 构建与验证
 
 ```bash
-cargo test                  # 21 个单元测试（波形/ID3/更新器/缓存/搜索过滤）
+cargo test                  # 25 个单元测试（波形/ID3/更新器/缓存/搜索过滤/DSP管线）
 cargo build --release       # 产物 target\release\zzhmusicplayer.exe
 # 安装包（改版本后）：
 "C:\Users\admin\AppData\Local\Programs\Inno Setup 6\ISCC.exe" installer.iss
@@ -58,7 +58,7 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
  └─ 更新线程（updater.rs）：WinINet 查询+下载（代理优先失败转直连）
 ```
 
-### 文件地图（阶段 0 拆分后）
+### 文件地图（组合根拆分后：main.rs 薄入口 + app.rs 组装）
 
 | 文件 | 职责 |
 |---|---|
@@ -67,10 +67,22 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 | `src/playlist.slint` | 播放列表模块：全窗口抽屉 + 搜索框 + 列表覆盖层（点击/拖拽排序）+ 拖动浮块 |
 | `src/about.slint` | 关于与更新模块：遮罩 + 卡片 + GitHub 图标环形下载进度 |
 | `src/main.slint` | 主窗口：背景/封面/标题、波形（WaveformArea 实例）、控制胶囊、音量弹层、窗口快捷键与拖动 |
-| `src/main.rs` | 组装：全局句柄、回调接线、四个泵、单实例/WndProc/拖拽注册、更新安装 |
-| `src/audio_engine.rs` | rodio 封装：Command/Event 通道，播放列表按路径重定位 |
+| `src/main.rs` | 模块树根 + 薄入口：`slint::include_modules!()` 的生成类型落在这里（crate 根），子模块经 `crate::` 引用；实际逻辑只有 `app::run()` |
+| `src/app.rs` | 组合根：`App` 结构（全部共享状态集中一处）、`run()` 装配（窗口/引擎/通道/计时器/设置恢复/启动参数）、`do_close` 退出持久化 |
+| `src/ui_callbacks.rs` | Slint 回调接线，按四域分组注册：传输 / 播放列表 / 关于与更新 / 窗口壳层（拖动 + 双击）；闭包只持 `Weak<App>` |
+| `src/pumps.rs` | 两只周期泵的泵体：100ms 四通道统一消费点（音频/文件/波形/更新，轮询顺序勿改），33ms 粒子/悬停/自动滚动 |
+| `src/events.rs` | 跨线程事件类型与后台生产者：`FileEvent`/`UpdateEvent`、更新检查/下载线程、文件夹递归扫描线程 |
+| `src/playlist.rs` | 播放列表域：`PlaylistView` 显示模型（过滤 + 显示行→真实行映射）、`Matcher` 搜索、增删播业务操作；搜索/映射测试在此 |
+| `src/waveform.rs` | 波形域：`WaveformResult`、后台工作线程（最新任务优先 + 代次取消）、RAM 缓存写入（LRU）、`apply_waveform` 上屏 |
+| `src/transport.rs` | 传输域纯 Rust 状态：`SeekState` 跳转回执过滤、`ThemeTween` 主题色 HSL 补间 |
+| `src/render_utils.rs` | 渲染小工具：兜底背景位图（80×48 光斑）、占位波形、m:ss 时间文本、背景交叉淡入 |
+| `src/version.rs` | `app_version()`：单一来源 Cargo.toml；`ZZH_VERSION_OVERRIDE` 测试覆盖 |
+| `src/audio_engine.rs` | rodio 封装：Command/Event 通道，播放列表按路径重定位；DspStage/EqStage 音频管线 |
 | `src/waveform_generator.rs` | 流式解码聚合波形（min/max/rms）、封面缩略图、中央横带模糊背景、主题色提取（HSV 直方图投票，黑白灰→白色中性） |
+| `src/waveform_cache.rs` | 波形/封面/背景磁盘缓存 v4：50MB LRU、魔数版本失效 |
+| `src/settings.rs` | settings.txt 行式读写：音量/模式/EQ/播放列表/置顶/上次播放 |
 | `src/updater.rs` | 纯 WinINet：查 releases/latest、下载安装包、版本比较；系统代理优先失败转直连 |
+| `src/windows_platform.rs` | Win32 集成：亚克力/圆角、单例互斥 + WM_COPYDATA 转发、WndProc 子类化（拖拽/滚轮/WM_CLOSE） |
 
 ### 关键设计（为什么是这样的）
 

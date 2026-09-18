@@ -1,0 +1,453 @@
+//! UI 线程的两只周期泵。
+//! 100ms 泵：音频事件 / 文件事件 / 波形结果 / 更新事件 四个 mpsc 的统一消费点。
+//! 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动。
+//! 约束：泵内不做每帧分配的重活；属性只在值变化时写入（先读后写比对）。
+
+use std::time::Instant;
+
+use slint::{ComponentHandle, Image, Model, SharedString};
+
+use crate::app::App;
+use crate::audio_engine::{Command, Event};
+use crate::events::{FileEvent, UpdateEvent, spawn_update_download};
+use crate::playlist::{add_track, add_tracks_batch, open_file_dialog, play_file_now};
+use crate::render_utils::{format_time, placeholder_bars, push_background};
+use crate::transport::{SEEK_CONFIRM_TIMEOUT, SEEK_SETTLE_WINDOW, SeekState};
+use crate::waveform::{apply_waveform, cache_insert, prefetch_next_track};
+use crate::waveform_cache::read_wave_cache;
+use crate::windows_platform::{cursor_position, is_about_open, set_about_open};
+use crate::{AboutState, PlaylistState, TransportState, UpdateState};
+
+/// 100ms 泵：四个通道的统一消费点。轮询顺序（音频→文件→波形→更新）
+/// 与拆分前保持一致：音频状态优先上屏，文件操作其次，波形与更新最后。
+pub fn pump_100ms(app: &App) {
+    let transport = app.ui.global::<TransportState>();
+    let playlist_state = app.ui.global::<PlaylistState>();
+    let about_state = app.ui.global::<AboutState>();
+    drain_audio(app, &transport, &playlist_state);
+    drain_files(app, &transport, &playlist_state);
+    drain_waves(app, &transport, &playlist_state);
+    drain_updates(app, &about_state);
+}
+
+/// 消费音频引擎事件：播放状态、位置、跳转回执与错误。
+fn drain_audio(app: &App, transport: &TransportState, playlist_state: &PlaylistState) {
+    while let Some(event) = app.audio.try_recv_event() {
+        match event {
+            Event::TrackStarted { path } => {
+                *app.current_path.borrow_mut() = Some(path.clone());
+                transport.set_playing(true);
+                transport.set_position(0.0);
+                transport.set_position_text(format_time(0.0));
+                // 新曲目开始：上一首的跳转等待与锁定作废。
+                *app.seek_wait.borrow_mut() = None;
+                transport.set_seek_lock(false);
+                transport.set_dragging(false);
+                let idx = app.playlist.borrow().iter().position(|p| *p == path);
+                playlist_state.set_playlist_current(idx.map(|i| i as i32).unwrap_or(-1));
+                if let Some(res) = app.waveform_cache.borrow().get(&path) {
+                    // 内存缓存命中时直接复用，切歌几乎无感。
+                    apply_waveform(
+                        transport,
+                        res,
+                        &app.wave_bars_model,
+                        &app.bg_front,
+                        &app.theme_tween,
+                    );
+                    prefetch_next_track(
+                        playlist_state,
+                        &app.playlist,
+                        &app.waveform_cache,
+                        &app.wave_tx,
+                    );
+                } else if let Some(res) = read_wave_cache(&path) {
+                    // 磁盘缓存命中：免整曲解码，元数据/封面/波形一步到位。
+                    {
+                        let mut cache = app.waveform_cache.borrow_mut();
+                        let mut order = app.cache_order.borrow_mut();
+                        cache_insert(&mut cache, &mut order, path.clone(), res);
+                    }
+                    let res = app.waveform_cache.borrow().get(&path).cloned();
+                    if let Some(res) = res.as_ref() {
+                        apply_waveform(
+                            transport,
+                            res,
+                            &app.wave_bars_model,
+                            &app.bg_front,
+                            &app.theme_tween,
+                        );
+                        prefetch_next_track(
+                            playlist_state,
+                            &app.playlist,
+                            &app.waveform_cache,
+                            &app.wave_tx,
+                        );
+                    }
+                } else {
+                    // 音频已开始播放，波形分析在后台进行。先显示轻量占位波形，
+                    // 不让用户等分析完成才看到可操作的进度区；结果回来后再平滑替换。
+                    // 背景交叉淡出到兜底深色，避免残留上一首的色调。
+                    let _ = app.wave_tx.send(path.clone());
+                    let title = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    transport.set_track_title(title.into());
+                    transport.set_track_artist(SharedString::default());
+                    app.wave_bars_model.set_vec(placeholder_bars());
+                    transport.set_cover_image(Image::default());
+                    transport.set_has_cover(false);
+                    push_background(transport, Image::default(), &app.bg_front);
+                }
+                eprintln!("开始播放: {:?}", path);
+            }
+            Event::Duration { duration } => {
+                // 解码器可立即提供时长；无需等待完整波形分析。
+                let seconds = duration.as_secs_f32();
+                transport.set_duration(seconds);
+                transport.set_duration_text(format_time(seconds));
+            }
+            Event::SeekApplied { position } => {
+                // rodio 已完成 seek；保持目标一个短窗口，吸收已经排队的旧
+                // Position。锁定型跳转（点击/拖拽）显示继续钉在目标上；
+                // 非锁定型（方向键）不钉显示，由插值动画平滑到位。
+                let seconds = position.as_secs_f32();
+                let (target, lock) = match *app.seek_wait.borrow() {
+                    Some(SeekState::Pending { target, lock, .. })
+                    | Some(SeekState::Settling { target, lock, .. }) => (target, lock),
+                    None => {
+                        // 无在途跳转（如启动恢复进度）：按实际落点钉住，
+                        // 避免锁定期间显示回落到默认的 0。
+                        let frac = if transport.get_duration() > 0.0 {
+                            (seconds / transport.get_duration()).min(1.0)
+                        } else {
+                            0.0
+                        };
+                        transport.set_seek_lock_frac(frac);
+                        (seconds, true)
+                    }
+                };
+                *app.seek_wait.borrow_mut() = Some(SeekState::Settling {
+                    target,
+                    until: Instant::now() + SEEK_SETTLE_WINDOW,
+                    lock,
+                });
+                transport.set_seek_lock(lock);
+                transport.set_position(target);
+                transport.set_position_text(format_time(target));
+            }
+            Event::Position(pos) => {
+                let pos = pos.as_secs_f32();
+                // seek 生效前与刚生效后的陈旧上报一律顶替为目标值：
+                // 锁定型显示钉在目标；非锁定型 position=target 让
+                // 插值动画从当前位置平滑滑向目标。等待超时则放行真实位置。
+                let applied = {
+                    let mut wait = app.seek_wait.borrow_mut();
+                    match *wait {
+                        Some(SeekState::Pending { target, since, .. })
+                            if since.elapsed() <= SEEK_CONFIRM_TIMEOUT =>
+                        {
+                            target
+                        }
+                        Some(SeekState::Settling { target, until, .. })
+                            if Instant::now() < until =>
+                        {
+                            target
+                        }
+                        _ => {
+                            *wait = None;
+                            transport.set_seek_lock(false);
+                            pos
+                        }
+                    }
+                };
+                transport.set_position(applied);
+                transport.set_position_text(format_time(applied));
+            }
+            Event::Finished => {
+                transport.set_playing(false);
+                transport.set_position(transport.get_duration());
+                transport.set_position_text(format_time(transport.get_duration()));
+                *app.seek_wait.borrow_mut() = None;
+                transport.set_seek_lock(false);
+                transport.set_dragging(false);
+                *app.current_path.borrow_mut() = None;
+                playlist_state.set_playlist_current(-1);
+            }
+            Event::Error(e) => {
+                // 跳转失败：解除预览锁定，进度条回到真实位置。
+                *app.seek_wait.borrow_mut() = None;
+                transport.set_seek_lock(false);
+                transport.set_dragging(false);
+                eprintln!("音频错误: {e}");
+            }
+        }
+    }
+}
+
+/// 消费文件事件：拖入/转发/双击/滚轮/关闭。
+fn drain_files(app: &App, transport: &TransportState, playlist_state: &PlaylistState) {
+    while let Ok(evt) = app.file_rx.try_recv() {
+        match evt {
+            FileEvent::Dropped(paths) => {
+                for path in paths {
+                    if path.is_dir() {
+                        // 文件夹：后台线程递归扫描，每 50 个一批渐进式追加，
+                        // 大文件夹也能立刻看到列表在增长。
+                        crate::events::spawn_folder_scan(path, app.file_tx.clone());
+                    } else {
+                        let _ = add_track(
+                            path,
+                            &app.playlist,
+                            &app.playlist_view,
+                            playlist_state,
+                            &app.audio,
+                        );
+                    }
+                }
+            }
+            FileEvent::DroppedBatch(paths) => {
+                add_tracks_batch(
+                    &paths,
+                    &app.playlist,
+                    &app.playlist_view,
+                    playlist_state,
+                    &app.audio,
+                );
+            }
+            FileEvent::OpenFiles(paths) => {
+                // 第二个实例转发的“打开方式”文件：首个立即播放（即使已在列表中），其余仅加入列表。
+                let mut files = paths.iter();
+                if let Some(first) = files.next() {
+                    play_file_now(
+                        first,
+                        &app.playlist,
+                        &app.playlist_view,
+                        playlist_state,
+                        &app.audio,
+                    );
+                }
+                for path in files {
+                    let _ = add_track(
+                        path.clone(),
+                        &app.playlist,
+                        &app.playlist_view,
+                        playlist_state,
+                        &app.audio,
+                    );
+                }
+            }
+            FileEvent::DoubleClick => open_file_dialog(
+                &app.playlist,
+                &app.playlist_view,
+                playlist_state,
+                &app.audio,
+            ),
+            FileEvent::Wheel(delta) => {
+                let step = (delta as f32 / 120.0) * 0.05;
+                let volume = (transport.get_volume() + step).clamp(0.0, 1.0);
+                transport.set_volume(volume);
+                transport.set_volume_text(slint::SharedString::from(format!(
+                    "{}%",
+                    (volume * 100.0).round() as u32
+                )));
+                transport.set_volume_popup_open(true);
+                app.audio.send(Command::SetVolume(volume));
+                app.popup_hide_timer.restart();
+            }
+            FileEvent::CloseRequest => {
+                // 保存设置并退出（拦截了系统 WM_CLOSE）。
+                crate::app::do_close(app);
+            }
+        }
+    }
+}
+
+/// 消费波形结果：全部入 RAM 缓存，属于当前曲目的立即上屏并预取下一首。
+fn drain_waves(app: &App, transport: &TransportState, playlist_state: &PlaylistState) {
+    while let Ok(res) = app.wave_rx.try_recv() {
+        // 只把属于当前曲目的波形立即上屏；其余缓存，等切到该曲再显示。
+        let is_current = app
+            .current_path
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| *p == res.path);
+        {
+            let mut cache = app.waveform_cache.borrow_mut();
+            let mut order = app.cache_order.borrow_mut();
+            cache_insert(&mut cache, &mut order, res.path.clone(), res);
+        }
+        if is_current {
+            let cache = app.waveform_cache.borrow();
+            let cur = app.current_path.borrow();
+            if let Some(cached) = cache.get(cur.as_ref().unwrap().as_path()) {
+                apply_waveform(
+                    transport,
+                    cached,
+                    &app.wave_bars_model,
+                    &app.bg_front,
+                    &app.theme_tween,
+                );
+                drop(cache);
+                prefetch_next_track(
+                    playlist_state,
+                    &app.playlist,
+                    &app.waveform_cache,
+                    &app.wave_tx,
+                );
+            }
+        }
+    }
+}
+
+/// 消费更新流程事件：驱动关于界面的状态机。
+fn drain_updates(app: &App, about_state: &AboutState) {
+    while let Ok(ev) = app.update_rx.try_recv() {
+        match ev {
+            UpdateEvent::Checking => {
+                about_state.set_update_state(UpdateState::Checking);
+                about_state.set_update_note(SharedString::default());
+            }
+            UpdateEvent::UpToDate => {
+                about_state.set_update_state(UpdateState::Latest);
+                about_state.set_update_note("已是最新版本".into());
+            }
+            UpdateEvent::Available {
+                version,
+                auto_download,
+            } => {
+                about_state.set_update_latest_version(SharedString::from(version.clone()));
+                if auto_download {
+                    about_state.set_update_state(UpdateState::Downloading);
+                    about_state.set_update_progress(0.0);
+                    about_state.set_update_note(format!("正在下载 v{version}…").into());
+                    spawn_update_download(app.update_tx.clone());
+                } else {
+                    about_state.set_update_state(UpdateState::Available);
+                    about_state.set_update_note(format!("发现新版本 v{version}").into());
+                }
+            }
+            UpdateEvent::Progress(frac) => {
+                about_state.set_update_progress(frac);
+                about_state.set_update_note(
+                    format!(
+                        "正在下载 v{}… {:.0}%",
+                        about_state.get_update_latest_version(),
+                        frac * 100.0
+                    )
+                    .into(),
+                );
+            }
+            UpdateEvent::Ready => {
+                about_state.set_update_state(UpdateState::Ready);
+                about_state.set_update_progress(1.0);
+                about_state.set_update_note("新版本已就绪".into());
+            }
+            UpdateEvent::Failed(e) => {
+                about_state.set_update_state(UpdateState::Failed);
+                about_state.set_update_note(e.into());
+            }
+        }
+    }
+}
+
+/// 33ms 泵：粒子时钟、关于开关同步、波形悬停提示、工具栏悬停与
+/// 拖拽排序的浮块跟随 / 边缘自动滚动 / 悬停清理。
+pub fn particle_33ms(app: &App) {
+    let ui = &app.ui;
+    let transport = ui.global::<TransportState>();
+    let playlist_state = ui.global::<PlaylistState>();
+    let about_state = ui.global::<AboutState>();
+    app.theme_tween.tick(&transport, 0.033);
+    // “关于”打开状态同步给 WndProc（滚轮隔离判断用）。
+    let about = about_state.get_about_open();
+    if is_about_open() != about {
+        set_about_open(about);
+    }
+    // 波形悬停时间提示：仅文本变化时写属性，避免逐帧重排。
+    let frac = transport.get_wave_hover_frac();
+    let tip = if frac >= 0.0 && transport.get_duration() > 0.0 {
+        slint::SharedString::from(format!(
+            "{} / {}",
+            format_time(frac * transport.get_duration()),
+            transport.get_duration_text()
+        ))
+    } else {
+        slint::SharedString::from("")
+    };
+    if tip != transport.get_tooltip_text() {
+        transport.set_tooltip_text(tip);
+    }
+    if transport.get_playing() {
+        let t = transport.get_particle_time() + 0.033;
+        transport.set_particle_time(if t >= 1.0 { t - 1.0 } else { t });
+    }
+    // 工具栏悬停检测：光标进入工具栏矩形范围时让背景变实。
+    if let Some((cx, cy)) = cursor_position() {
+        let scale = ui.window().scale_factor();
+        let origin = ui.window().position();
+        let local_x = (cx - origin.x) as f32 / scale;
+        let local_y = (cy - origin.y) as f32 / scale;
+        // 窗口逻辑尺寸（布局常量均按逻辑像素与 main.slint 对齐）。
+        let logical_w = ui.window().size().width as f32 / scale;
+        let logical_h = ui.window().size().height as f32 / scale;
+        // 与 main.slint 的 control_bar（300×38、水平居中、距底 8px）保持一致。
+        let bar_x = (logical_w - 330.0) / 2.0;
+        let bar_y = logical_h - 46.0;
+        let x0 = origin.x + (bar_x * scale) as i32;
+        let x1 = origin.x + ((bar_x + 330.0) * scale) as i32;
+        let y0 = origin.y + (bar_y * scale) as i32;
+        let y1 = origin.y + ((bar_y + 38.0) * scale) as i32;
+        let hovered = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+        if hovered != transport.get_toolbar_hovered() {
+            transport.set_toolbar_hovered(hovered);
+        }
+        // 拖动排序浮块跟随：把系统光标换算成窗口局部纵坐标；
+        // 光标贴近列表上下缘时直接滚动视口（33ms 一拍）。
+        if playlist_state.get_reorder_from() >= 0.0 {
+            playlist_state.set_reorder_y(local_y);
+            // 列表区：y 42..(logical_h - 6)；上/下缘 22px 内开始滚动，
+            // 速度按深入边缘的程度最高 6px/拍（约 180px/s）。
+            // 视口范围与 main.slint 一致：[-(vh-rows*32-2), 0]。
+            const EDGE: f32 = 22.0;
+            const MAX_SPEED: f32 = 6.0;
+            const LIST_TOP: f32 = 42.0;
+            const LIST_BOTTOM_GAP: f32 = 6.0;
+            if playlist_state.get_reorder_to() >= 0.0 {
+                let rows = playlist_state.get_playlist().row_count() as f32;
+                let list_h = logical_h - 48.0;
+                let vp_min = 0.0f32.min(list_h - (rows * 32.0 + 2.0));
+                let vp = playlist_state.get_list_vp_y();
+                let bottom = logical_h - LIST_BOTTOM_GAP;
+                // 上缘向上滚（viewport-y 增大趋近 0），下缘向下滚（减小）。
+                let delta = if local_y < LIST_TOP + EDGE {
+                    MAX_SPEED * (1.0 - (local_y - LIST_TOP) / EDGE).max(0.15)
+                } else if local_y > bottom - EDGE {
+                    -MAX_SPEED * (1.0 - (bottom - local_y) / EDGE).max(0.15)
+                } else {
+                    0.0
+                };
+                if delta != 0.0 {
+                    playlist_state.set_list_vp_y((vp + delta).max(vp_min).min(0.0));
+                }
+            }
+        }
+        // 光标离开列表区 / 抽屉关闭 / 正在拖动时清除行悬停高亮，
+        // 避免覆盖层收不到“离开”事件导致的高亮滞留。
+        // 列表区几何与 main.slint 的覆盖层保持一致。
+        let in_list = playlist_state.get_playlist_open()
+            && playlist_state.get_reorder_from() < 0.0
+            && local_x >= 8.0
+            && local_x <= logical_w - 8.0
+            && local_y >= 42.0
+            && local_y <= logical_h - 6.0;
+        if !in_list {
+            if playlist_state.get_hover_row() >= 0.0 {
+                playlist_state.set_hover_row(-1.0);
+            }
+            if playlist_state.get_hover_button() != 0.0 {
+                playlist_state.set_hover_button(0.0);
+            }
+        }
+    }
+}

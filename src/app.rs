@@ -1,0 +1,350 @@
+//! 组合根：创建窗口 / 引擎 / 通道 / 计时器，恢复设置，接线回调与泵，
+//! 进入事件循环。main.rs 只调用 run()；各领域细节在兄弟模块中。
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+
+use crate::audio_engine::{AudioEngine, Command, EqSettings, PlaybackMode};
+use crate::events::{self, FileEvent, UpdateEvent};
+use crate::playlist::{PlaylistView, add_track, play_file_now};
+use crate::pumps::{particle_33ms, pump_100ms};
+use crate::settings::{load_settings, save_settings};
+use crate::transport::{SeekState, ThemeTween};
+use crate::ui_callbacks::register_callbacks;
+use crate::version::app_version;
+use crate::waveform::{WaveformResult, spawn_waveform_worker};
+use crate::waveform_cache::trim_wave_cache;
+use crate::windows_platform::{
+    apply_system_effects, enforce_single_instance, hwnd_from_window, set_about_open,
+    set_always_on_top, set_file_events, set_playlist_open, setup_drag_drop,
+};
+use crate::{AboutState, MainWindow, PlaylistEntry, PlaylistState, TransportState, UpdateState};
+
+/// 组合根持有的全部共享状态。UI 线程独占（整体 Rc），闭包经 Weak<App>
+/// 临时升级访问——与拆分前“闭包克隆各自 Rc”等价，但依赖清单集中一处。
+pub struct App {
+    pub ui: MainWindow,
+    pub audio: Rc<AudioEngine>,
+    pub playlist: Rc<RefCell<Vec<PathBuf>>>,
+    pub playlist_view: Rc<RefCell<PlaylistView>>,
+    pub wave_bars_model: Rc<VecModel<f32>>,
+    pub waveform_cache: Rc<RefCell<HashMap<PathBuf, WaveformResult>>>,
+    pub cache_order: Rc<RefCell<VecDeque<PathBuf>>>,
+    pub mode_cell: Rc<Cell<PlaybackMode>>,
+    pub seek_wait: Rc<RefCell<Option<SeekState>>>,
+    pub bg_front: Rc<Cell<bool>>,
+    pub theme_tween: Rc<ThemeTween>,
+    pub file_tx: mpsc::Sender<FileEvent>,
+    pub file_rx: mpsc::Receiver<FileEvent>,
+    pub wave_tx: mpsc::Sender<PathBuf>,
+    pub wave_rx: mpsc::Receiver<WaveformResult>,
+    pub update_tx: mpsc::Sender<UpdateEvent>,
+    pub update_rx: mpsc::Receiver<UpdateEvent>,
+    pub mode_hide_timer: Rc<slint::Timer>,
+    pub popup_hide_timer: Rc<slint::Timer>,
+    pub eq: EqSettings,
+    /// 当前正在播放的曲目路径（100ms 泵维护，波形上屏判断用）。
+    pub current_path: RefCell<Option<PathBuf>>,
+}
+
+/// 统一关闭流程：保存记忆设置、隐藏窗口并退出事件循环。
+pub(crate) fn do_close(app: &App) {
+    let transport = app.ui.global::<TransportState>();
+    let playlist_state = app.ui.global::<PlaylistState>();
+    let current = {
+        let list = app.playlist.borrow();
+        let idx = playlist_state.get_playlist_current();
+        if idx >= 0 {
+            list.get(idx as usize).cloned()
+        } else {
+            None
+        }
+    };
+    save_settings(
+        &app.playlist.borrow(),
+        transport.get_position(),
+        transport.get_volume(),
+        app.mode_cell.get(),
+        transport.get_always_on_top(),
+        current.as_ref(),
+        &app.eq,
+    );
+    let _ = app.ui.window().hide();
+    let _ = slint::quit_event_loop();
+}
+
+/// 程序入口：装配一切并阻塞在 UI 事件循环上。
+pub fn run() {
+    // 单例模式：已有实例时转发文件并退出，不创建第二个窗口。
+    enforce_single_instance();
+
+    let ui = MainWindow::new().expect("创建窗口失败");
+    let audio = Rc::new(AudioEngine::start());
+    let (wave_tx, wave_rx) = spawn_waveform_worker();
+    let (file_tx, file_rx) = mpsc::channel::<FileEvent>();
+    set_file_events(file_tx.clone());
+    // 更新流程事件通道：检查/下载线程产出，100ms 泵消费。
+    let (update_tx, update_rx) = mpsc::channel::<UpdateEvent>();
+
+    // —— 恢复记忆设置 ——
+    let settings = load_settings();
+    let transport = ui.global::<TransportState>();
+    let playlist_state = ui.global::<PlaylistState>();
+    let about_state = ui.global::<AboutState>();
+    transport.set_volume(settings.volume);
+    transport.set_volume_text(SharedString::from(format!(
+        "{}%",
+        (settings.volume * 100.0).round() as u32
+    )));
+    transport.set_mode_text(settings.mode.label().into());
+    audio.send(Command::SetVolume(settings.volume));
+    audio.send(Command::SetMode(settings.mode));
+    // 均衡器参数下发（当前无 UI 调整入口，随设置持久化前向兼容）。
+    audio.set_eq(settings.eq.clone());
+    // 关于界面展示的版本号（单一来源：Cargo.toml）。
+    about_state.set_version(app_version().into());
+
+    // 波形条模型：整个运行期只建一次，换曲时逐行更新数据，
+    // Slint 侧复用行元素并触发高度过渡动画，避免整排重建。
+    let wave_bars_model: Rc<VecModel<f32>> = Rc::new(VecModel::from(Vec::new()));
+    transport.set_wave_bars(ModelRc::from(Rc::clone(&wave_bars_model)));
+
+    // 播放列表（仅保留仍存在的文件，避免启动后大量报错）。
+    let playlist: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let playlist_model: Rc<VecModel<PlaylistEntry>> = Rc::new(VecModel::default());
+    let playlist_view = Rc::new(RefCell::new(PlaylistView::new(Rc::clone(&playlist_model))));
+    for path in &settings.playlist {
+        if path.is_file() {
+            playlist.borrow_mut().push(path.clone());
+        }
+    }
+    playlist_view.borrow_mut().rebuild(&playlist.borrow());
+    playlist_state.set_playlist(ModelRc::from(playlist_model.clone()));
+    audio.send(Command::SetPlaylist(playlist.borrow().clone()));
+
+    let waveform_cache: Rc<RefCell<HashMap<PathBuf, WaveformResult>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let cache_order: Rc<RefCell<VecDeque<PathBuf>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let mode_cell: Rc<Cell<PlaybackMode>> = Rc::new(Cell::new(settings.mode));
+    // 跳转等待：Some((目标秒, 发起时刻))。松手后 UI 已乐观更新到目标，
+    // 期间忽略播放引擎尚未完成 seek 前残留的旧位置上报。
+    let seek_wait: Rc<RefCell<Option<SeekState>>> = Rc::new(RefCell::new(None));
+    // 背景交叉淡入状态：当前可见层是否为 front。
+    let bg_front = Rc::new(Cell::new(true));
+    // 主题色补间（换曲时约 400ms 颜色过渡，见 ThemeTween）。
+    // 初始目标与 main.slint 的默认 theme-color 一致。
+    let theme_tween = Rc::new(ThemeTween::new([0x5a, 0xc8, 0xfa]));
+    // 模式提示 / 音量弹层的自动隐藏计时器。
+    let mode_hide_timer = Rc::new(slint::Timer::default());
+    let popup_hide_timer = Rc::new(slint::Timer::default());
+
+    ui.show().expect("显示窗口失败");
+
+    let app = Rc::new(App {
+        ui,
+        audio,
+        playlist,
+        playlist_view,
+        wave_bars_model,
+        waveform_cache,
+        cache_order,
+        mode_cell,
+        seek_wait,
+        bg_front,
+        theme_tween,
+        file_tx,
+        file_rx,
+        wave_tx,
+        wave_rx,
+        update_tx,
+        update_rx,
+        mode_hide_timer,
+        popup_hide_timer,
+        eq: settings.eq.clone(),
+        current_path: RefCell::new(None),
+    });
+
+    // winit 窗口是惰性创建的：事件循环启动（Resumed 阶段）后才真正存在，
+    // 此前 window_handle() 返回 Unavailable。因此亚克力/圆角/拖拽注册等
+    // 系统效果须等到窗口就绪后再应用（轮询检测，成功后停止）。
+    let setup_timer = Rc::new(slint::Timer::default());
+    {
+        let app_weak = Rc::downgrade(&app);
+        let stop_handle = Rc::clone(&setup_timer);
+        setup_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(50),
+            move || {
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                if hwnd_from_window(app.ui.window()).is_none() {
+                    return; // 窗口尚未创建，稍后重试。
+                }
+                stop_handle.stop();
+                eprintln!("[sys] 窗口已创建，开始应用系统效果");
+                apply_system_effects(app.ui.window());
+                setup_drag_drop(app.ui.window());
+            },
+        );
+    }
+
+    // 启动 30 秒后静默检查一次更新：失败无感；发现新版本仅在关于按钮
+    // 加小圆点、关于界面内呈现，不弹窗、不自动下载。
+    let probe_timer = slint::Timer::default();
+    {
+        let app_weak = Rc::downgrade(&app);
+        probe_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_secs(30),
+            move || {
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                let about_state = app.ui.global::<AboutState>();
+                if about_state.get_update_state() == UpdateState::Idle {
+                    events::spawn_update_check(app.update_tx.clone(), false);
+                }
+            },
+        );
+    }
+
+    // 模式提示 / 音量弹层的自动隐藏计时器初次武装（此后由回调 restart）。
+    {
+        let app_weak = Rc::downgrade(&app);
+        app.mode_hide_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(1600),
+            move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.ui.global::<TransportState>().set_mode_showing(false);
+                }
+            },
+        );
+    }
+    {
+        let app_weak = Rc::downgrade(&app);
+        app.popup_hide_timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(3000),
+            move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.ui
+                        .global::<TransportState>()
+                        .set_volume_popup_open(false);
+                }
+            },
+        );
+    }
+
+    // 粒子系统：每 33ms 推进相位，驱动白色粒子与列表均衡器动画；
+    // 同时推进主题色补间（换曲颜色过渡）。暂停时粒子相位冻结，
+    // 工具栏悬停仅在状态变化时写属性，避免无谓的重绘。
+    let particle_timer = slint::Timer::default();
+    {
+        let app_weak = Rc::downgrade(&app);
+        particle_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(33),
+            move || {
+                if let Some(app) = app_weak.upgrade() {
+                    particle_33ms(&app);
+                }
+            },
+        );
+    }
+
+    // —— 回调接线（按领域分组，见 ui_callbacks）——
+    register_callbacks(&app);
+
+    // 恢复置顶状态与上次播放进度；测试钩子（环境变量）直达对应界面。
+    if settings.pin {
+        let transport = app.ui.global::<TransportState>();
+        transport.set_always_on_top(true);
+        set_always_on_top(app.ui.window(), true);
+    }
+    // 测试辅助：ZZH_OPEN_PLAYLIST=1 启动时直接展开播放列表抽屉。
+    if std::env::var("ZZH_OPEN_PLAYLIST").as_deref() == Ok("1") {
+        app.ui.global::<PlaylistState>().set_playlist_open(true);
+        set_playlist_open(true);
+    }
+    // 测试辅助：ZZH_OPEN_SEARCH=1 启动时直接展开播放列表搜索框。
+    if std::env::var("ZZH_OPEN_SEARCH").as_deref() == Ok("1") {
+        app.ui.global::<PlaylistState>().set_search_open(true);
+    }
+    // 测试辅助：ZZH_OPEN_ABOUT=1 启动时直接打开“关于”对话框。
+    if std::env::var("ZZH_OPEN_ABOUT").as_deref() == Ok("1") {
+        app.ui.global::<AboutState>().set_about_open(true);
+        set_about_open(true);
+    }
+    if let Some(cur) = &settings.current
+        && let Some(idx) = app.playlist.borrow().iter().position(|p| p == cur)
+    {
+        app.ui
+            .global::<PlaylistState>()
+            .set_playlist_current(idx as i32);
+        app.audio.send(Command::PlayAt(idx));
+        if settings.position > 1.0 {
+            app.audio
+                .send(Command::Seek(Duration::from_secs_f32(settings.position)));
+        }
+    }
+
+    // 启动参数（如“打开方式”传入的音乐文件）加入播放列表；
+    // 首个文件立即播放——双击文件打开时用户意图明确是听这首，而非接着上次继续。
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some() {
+        let first = PathBuf::from(args.next().unwrap());
+        if first.is_file() {
+            play_file_now(
+                &first,
+                &app.playlist,
+                &app.playlist_view,
+                &app.ui.global::<PlaylistState>(),
+                &app.audio,
+            );
+        }
+    }
+    for arg in args {
+        let path = PathBuf::from(arg);
+        if path.is_dir() {
+            events::spawn_folder_scan(path, app.file_tx.clone());
+        } else if path.is_file() {
+            let _ = add_track(
+                path,
+                &app.playlist,
+                &app.playlist_view,
+                &app.ui.global::<PlaylistState>(),
+                &app.audio,
+            );
+        }
+    }
+
+    // —— 100ms 周期泵：音频事件 / 文件事件 / 波形结果 / 更新事件 ——
+    let pump_timer = slint::Timer::default();
+    {
+        let app_weak = Rc::downgrade(&app);
+        pump_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(100),
+            move || {
+                if let Some(app) = app_weak.upgrade() {
+                    pump_100ms(&app);
+                }
+            },
+        );
+    }
+
+    // 波形磁盘缓存维护（孤儿清理 + LRU 上限）放到后台线程，不阻塞启动。
+    let _ = std::thread::Builder::new()
+        .name("wavecache-trim".to_string())
+        .spawn(trim_wave_cache);
+
+    app.ui.run().expect("UI 事件循环失败");
+}
