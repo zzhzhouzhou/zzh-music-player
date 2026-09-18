@@ -16,12 +16,13 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, HWND_NOTOPMOST,
-    HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL,
+    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, HTCAPTION,
+    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, SW_RESTORE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -394,6 +395,20 @@ pub(crate) fn setup_drag_drop(window: &slint::Window) {
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc as usize as isize);
         DragAcceptFiles(hwnd, 1);
         eprintln!("[sys] 文件拖拽已注册（WndProc 子类化 + DragAcceptFiles）");
+    }
+}
+
+/// 进入系统原生窗口拖动（无边框窗口的标准做法）：释放鼠标捕获后向本窗口
+/// 发送 WM_NCLBUTTONDOWN/HTCAPTION，由 OS 模态循环接管拖动直至松开按键。
+/// 不自己用 GetCursorPos 增量算位置——系统光标读数与 Slint 的坐标空间在
+/// 混合 DPI / 远程会话下存在漂移偏移，自算会让窗口跑离光标导致拖动中断。
+pub(crate) fn begin_native_drag(window: &slint::Window) {
+    let Some(hwnd) = hwnd_from_window(window) else {
+        return;
+    };
+    unsafe {
+        ReleaseCapture();
+        SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
     }
 }
 

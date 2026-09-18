@@ -37,9 +37,13 @@ cargo build --release       # 产物 target\release\zzhmusicplayer.exe
 `cargo clippy --locked --all-targets -- -D warnings`。GitHub Actions 使用同一脚本，确保本地
 行为标准与 CI 一致。CI 只做质量检查，不上传 EXE 或安装包，不创建 Release，也不触发更新。
 涉及 UI、音频输出或播放交互的修改，仍须人工检查主界面、播放列表抽屉、搜索、关于和拖拽排序。
+**用户固定要求：每次改动完成并通过检查后，必须同时构建 release 并静默覆盖安装本机**
+（`cargo build --release` → ISCC 打包 → 安装包 `/VERYSILENT` 覆盖升级 `D:\zzh-music-player`），
+只跑 debug 验证不算完成——用户日常运行的是安装版。
 
-测试钩子（环境变量）：`ZZH_OPEN_PLAYLIST=1`、`ZZH_OPEN_SEARCH=1`、`ZZH_OPEN_ABOUT=1`
-启动直达对应界面；`ZZH_VERSION_OVERRIDE=x.y.z` 伪装版本号（验证更新流程用）。
+测试钩子（环境变量）：`ZZH_OPEN_PLAYLIST=1`、`ZZH_OPEN_SEARCH=1`、`ZZH_OPEN_ABOUT=1`、
+`ZZH_OPEN_POPOUT=1` 启动直达对应界面；`ZZH_VERSION_OVERRIDE=x.y.z` 伪装版本号
+（验证更新流程用）。
 
 发布流程：`Cargo.toml` 版本 → `installer.iss` AppVersion → git tag **三处同步**，
 ISCC 打包 → `gh release create vX.Y.Z zzhMusicPlayer_Setup.exe`（走代理）→ 静默覆盖
@@ -128,6 +132,11 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   "先瞬移再滑回"的布局瞬态——窗口尺寸变化一律瞬时生效。
 - PowerShell 5.1 下对 check.ps1 / cargo 外层加 `2>&1` 会把 stderr 进度行变成
   错误记录导致脚本误报失败——直接原样运行 `./scripts/check.ps1`。
+- **次级窗口拖动必须走系统原生拖动**（`begin_native_drag`：ReleaseCapture +
+  `WM_NCLBUTTONDOWN`/HTCAPTION），不要用 GetCursorPos 增量自算位置——混合 DPI /
+  远程会话下系统光标读数与 Slint 坐标空间存在漂移偏移，自算会让窗口跑离光标、
+  拖动数帧后中断（主窗口全窗 TouchArea 因窗口 1:1 跟随光标而未暴露此问题）。
+  弹窗拖拽可用 `scripts/drag_probe.ps1` 做回归验证。
 
 ## 模块化路线图（最终目标 = C）
 

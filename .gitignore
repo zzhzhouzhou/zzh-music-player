@@ -10,3 +10,4 @@ testmedia/
 
 # ZCode 本地计划文件
 .zcode/
+scripts/probe_err.log

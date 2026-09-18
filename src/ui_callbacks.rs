@@ -10,7 +10,9 @@ use slint::{ComponentHandle, SharedString};
 use crate::app::{App, close_playlist_window, do_close, open_playlist_window};
 use crate::events::{FileEvent, UPDATE_INSTALLER_NAME, spawn_update_check};
 use crate::playlist::{play_at, track_name};
-use crate::windows_platform::{cursor_position, set_always_on_top, set_playlist_open};
+use crate::windows_platform::{
+    begin_native_drag, cursor_position, set_always_on_top, set_playlist_open,
+};
 use crate::{AboutState, PlaylistState, PlaylistWindow, TransportState, UpdateState};
 
 /// 双击判定的最大时间间隔（毫秒）。
@@ -514,47 +516,21 @@ pub(crate) fn register_playlist_window_callbacks(app: &Rc<App>, pw: &PlaylistWin
         });
     }
 
-    // —— 标题区拖动本窗口（与主窗口同一套光标跟随，无双击打开文件语义）——
-    let drag_state: Rc<RefCell<Option<(slint::PhysicalPosition, i32, i32)>>> =
-        Rc::new(RefCell::new(None));
+    // —— 标题区拖动本窗口：按下即交给系统原生拖动（HTCAPTION 模态循环），
+    // 松开自动结束；不依赖 GetCursorPos 增量（见 windows_platform 的说明）。
+    // 无双击打开文件语义（主窗口专属）。
     {
         let pw_weak = pw_weak.clone();
-        let drag_state = Rc::clone(&drag_state);
         ts.on_window_drag_down(move |_, _| {
             let Some(pw) = pw_weak.upgrade() else {
                 return;
             };
-            let Some((cx, cy)) = cursor_position() else {
-                return;
-            };
-            *drag_state.borrow_mut() = Some((pw.window().position(), cx, cy));
+            begin_native_drag(pw.window());
         });
     }
-    {
-        let pw_weak = pw_weak.clone();
-        let drag_state = Rc::clone(&drag_state);
-        ts.on_window_drag_move(move |_, _| {
-            let Some((origin, cx0, cy0)) = *drag_state.borrow() else {
-                return;
-            };
-            let Some(pw) = pw_weak.upgrade() else {
-                return;
-            };
-            let Some((cx, cy)) = cursor_position() else {
-                return;
-            };
-            pw.window().set_position(slint::PhysicalPosition::new(
-                origin.x + (cx - cx0),
-                origin.y + (cy - cy0),
-            ));
-        });
-    }
-    {
-        let drag_state = Rc::clone(&drag_state);
-        ts.on_window_drag_up(move || {
-            *drag_state.borrow_mut() = None;
-        });
-    }
+    // 系统模态拖动期间不会产生这两个回调；保留空实现以匹配 .slint 接线。
+    ts.on_window_drag_move(move |_, _| {});
+    ts.on_window_drag_up(move || {});
 }
 
 /// 关于与更新域：检查更新、安装重启、打开仓库主页。

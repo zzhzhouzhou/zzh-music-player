@@ -367,6 +367,10 @@ pub fn run() {
         app.ui.global::<AboutState>().set_about_open(true);
         set_about_open(true);
     }
+    // 测试辅助：ZZH_OPEN_POPOUT=1 启动时直接弹出播放列表独立窗口。
+    if std::env::var("ZZH_OPEN_POPOUT").as_deref() == Ok("1") {
+        open_playlist_window(&app);
+    }
     if let Some(cur) = &settings.current
         && let Some(idx) = app.playlist.borrow().iter().position(|p| p == cur)
     {
