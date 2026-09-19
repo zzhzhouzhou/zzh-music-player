@@ -21,11 +21,12 @@ use crate::version::app_version;
 use crate::waveform::{WaveformResult, spawn_waveform_worker};
 use crate::waveform_cache::trim_wave_cache;
 use crate::windows_platform::{
-    apply_system_effects, enforce_single_instance, hwnd_from_window, set_about_open,
+    apply_system_effects, enforce_single_instance, hwnd_from_window, screen_size, set_about_open,
     set_always_on_top, set_file_events, set_playlist_open, setup_drag_drop, setup_playlist_window,
+    window_rect_px,
 };
 use crate::{
-    AboutState, MainWindow, PlaylistEntry, PlaylistState, PlaylistWindow, TransportState,
+    AboutState, EqState, MainWindow, PlaylistEntry, PlaylistState, PlaylistWindow, TransportState,
     UpdateState,
 };
 
@@ -51,7 +52,12 @@ pub struct App {
     pub update_rx: mpsc::Receiver<UpdateEvent>,
     pub mode_hide_timer: Rc<slint::Timer>,
     pub popup_hide_timer: Rc<slint::Timer>,
-    pub eq: EqSettings,
+    /// 引擎侧均衡器参数：EqState 回调改写（RefCell——Rc<App> 共享下的
+    /// 运行时可变性），do_close 时随 settings 持久化。
+    pub eq: RefCell<EqSettings>,
+    /// EQ 面板 10 段增益的 Slint 模型：滑条回写与设置恢复的单一数据源，
+    /// app.eq（引擎侧 EqSettings）在每次改动时从本模型重建。
+    pub eq_gains_model: Rc<VecModel<f32>>,
     /// 当前正在播放的曲目路径（事件泵维护，波形上屏判断用）。
     pub current_path: RefCell<Option<PathBuf>>,
     /// 播放列表显示模型：主窗口抽屉与独立弹窗共享同一 ModelRc，
@@ -90,7 +96,7 @@ pub(crate) fn do_close(app: &App) {
         app.mode_cell.get(),
         transport.get_always_on_top(),
         current.as_ref(),
-        &app.eq,
+        &app.eq.borrow(),
         pop_pos,
     );
     let _ = app.ui.window().hide();
@@ -115,36 +121,58 @@ pub(crate) fn open_playlist_window(app: &Rc<App>) {
     // 由 33ms 泵逐帧同步，无需在此逐项搬运。
     let cur = app.ui.global::<PlaylistState>().get_playlist_current();
     pw.global::<PlaylistState>().set_playlist_current(cur);
-    // 位置记忆：恢复上次关闭位置；首次弹出默认出现在主窗口右侧。
-    if let Some((x, y)) = app.playlist_pop_pos.get() {
-        pw.window().set_position(slint::PhysicalPosition::new(x, y));
-    } else {
-        let origin = app.ui.window().position();
-        let width = app.ui.window().size().width as i32;
-        pw.window().set_position(slint::PhysicalPosition::new(
-            origin.x + width + 12,
-            origin.y,
-        ));
-    }
     register_playlist_window_callbacks(app, &pw);
     pw.show().expect("显示播放列表窗口失败");
     // 亚克力/圆角与 WndProc 子类化。winit 窗口惰性创建：HWND 未就绪时
     // 短延时重试一次（与主窗口的 setup_timer 同一防御）。
     if hwnd_from_window(pw.window()).is_none() {
         let weak = pw.as_weak();
+        let app_weak = Rc::downgrade(app);
         slint::Timer::single_shot(Duration::from_millis(50), move || {
             if let Some(pw) = weak.upgrade() {
                 apply_system_effects(pw.window());
                 setup_playlist_window(pw.window());
+                // 定位也依赖窗口就绪（show 前/未就绪时 set_position 被静默
+                // 丢弃，实测弹窗落在 winit 默认位置），故挂在同一重试点。
+                if let Some(app) = app_weak.upgrade() {
+                    place_popout_right_of_main(&app, &pw);
+                }
             }
         });
     } else {
         apply_system_effects(pw.window());
         setup_playlist_window(pw.window());
+        place_popout_right_of_main(app, &pw);
     }
     app.playlist_window.borrow_mut().replace(pw);
     app.ui.global::<PlaylistState>().set_popped(true);
     eprintln!("[sys] 播放列表已弹出为独立窗口 playlist-opened");
+}
+
+/// 将弹窗定位到主窗口右侧（用户要求：每次弹出都贴主窗右缘 +8px，不做绝对
+/// 位置记忆）。主窗矩形用 Win32 GetWindowRect 取物理像素；屏幕右缘放不下
+/// 则翻到主窗左侧，纵向贴主窗顶缘并夹回屏内。必须在 winit 窗口就绪后调用。
+fn place_popout_right_of_main(app: &App, pw: &PlaylistWindow) {
+    let Some((ml, mt, mr, _mb)) = window_rect_px(app.ui.window()) else {
+        return;
+    };
+    // 面板尺寸 340×520 逻辑 px，按弹窗所在显示器的缩放换算物理尺寸。
+    let scale = pw.window().scale_factor();
+    let w = (340.0 * scale) as i32;
+    let h = (520.0 * scale) as i32;
+    let (cx, cy) = screen_size();
+    let mut x = mr + 8;
+    if x + w > cx {
+        x = ml - w - 8;
+    }
+    let mut y = mt;
+    if y + h > cy {
+        y = cy - h;
+    }
+    if y < 0 {
+        y = 0;
+    }
+    pw.window().set_position(slint::PhysicalPosition::new(x, y));
 }
 
 /// 关闭播放列表独立窗口（幂等）：记录位置（供会话内重开与退出持久化）、
@@ -194,8 +222,13 @@ pub fn run() {
     transport.set_mode_text(settings.mode.label().into());
     audio.send(Command::SetVolume(settings.volume));
     audio.send(Command::SetMode(settings.mode));
-    // 均衡器参数下发（当前无 UI 调整入口，随设置持久化前向兼容）。
+    // 均衡器参数下发（EqState 面板接线见 ui_callbacks，settings.txt eq= 持久化）。
     audio.set_eq(settings.eq.clone());
+    // EQ 面板初始增益模型：来自 settings.txt 的 eq= 行（10 段 dB 值）。
+    let eq_gains_model: Rc<VecModel<f32>> = Rc::new(VecModel::from(settings.eq.gains.to_vec()));
+    let eq_state = ui.global::<EqState>();
+    eq_state.set_gains(ModelRc::from(Rc::clone(&eq_gains_model)));
+    eq_state.set_enabled(settings.eq.enabled);
     // 关于界面展示的版本号（单一来源：Cargo.toml）。
     about_state.set_version(app_version().into());
 
@@ -255,7 +288,8 @@ pub fn run() {
         update_rx,
         mode_hide_timer,
         popup_hide_timer,
-        eq: settings.eq.clone(),
+        eq: RefCell::new(settings.eq.clone()),
+        eq_gains_model: Rc::clone(&eq_gains_model),
         current_path: RefCell::new(None),
         playlist_model: Rc::clone(&playlist_model),
         playlist_window: RefCell::new(None),

@@ -25,10 +25,26 @@ export enum UpdateState {
 // 窗口高度由 Rust 侧按 module-height 伸展/收回（兼容用户手动调整的窗口尺寸）。
 export global DockState {
     in-out property <bool> open: false;
-    // 当前停靠的模块：0 = 测试面板 A，1 = 测试面板 B（验证多模块切换）。
+    // 当前停靠的模块：0 = 均衡器（阶段 1 首个真实模块）。
     in-out property <int> active: 0;
     // 模块声明的面板高度（逻辑像素）。
-    in-out property <length> module-height: 140px;
+    in-out property <length> module-height: 204px;
+}
+
+// 均衡器模块（阶段 1）：10 段增益（dB，-12~+12）+ 预设 + 开关。
+// gains 由 Rust 侧 VecModel 提供（面板滑条经 set-gain 回调回写，引擎经
+// Command::SetEq 即时生效，settings.txt eq= 行持久化）。active-preset:
+// 0=自定义（手动拖动任一滑条即落回自定义），1..6 对应内置预设。
+export global EqState {
+    in-out property <bool> enabled: false;
+    in-out property <int> active-preset: 0;
+    in-out property <[float]> gains;
+    // 仅展示用标签（与 audio_engine::EQ_FREQS 对应），无需 Rust 回写。
+    in-out property <[string]> preset-names: ["平直", "流行", "摇滚", "爵士", "人声", "古典"];
+    in-out property <[string]> band-labels: ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
+    callback set-gain(int /* band */, float /* dB */);
+    callback apply-preset(int);
+    callback toggle-enabled();
 }
 
 // 主控域：传输控制、主题色与背景、波形、窗口管理。

@@ -77,12 +77,13 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
 
 | 文件 | 职责 |
 |---|---|
-| `src/state.slint` | 全局状态三域：`TransportState`（主控/传输/主题）、`PlaylistState`（播放列表模块）、`AboutState`（关于与更新模块）；含 `PlaylistEntry`、`UpdateState` |
+| `src/state.slint` | 全局状态分域：`TransportState`（主控/传输/主题）、`PlaylistState`（播放列表模块）、`AboutState`（关于与更新模块）、`DockState`（停靠区）、`EqState`（均衡器模块）；含 `PlaylistEntry`、`UpdateState` |
 | `src/widgets.slint` | 通用控件：IconButton（玻璃按钮）、VolumeBar、WaveformArea（波形进度）、PlaylistRow |
 | `src/playlist.slint` | 播放列表面板（`PlaylistPanel`，窗口无关）+ 抽屉外壳（`PlaylistDrawer`：开合动画 + 弹出入口）+ 搜索框 + 列表覆盖层（点击/拖拽排序）+ 拖动浮块 |
 | `src/playlist_window.slint` | 播放列表独立窗口（阶段 C）：无边框亚克力小窗，复用 `PlaylistPanel`；标题不得与主窗口相同 |
 | `src/about.slint` | 关于与更新模块：遮罩 + 卡片 + GitHub 图标环形下载进度 |
-| `src/main.slint` | 主窗口：背景/封面/标题、波形（WaveformArea 实例）、控制胶囊、音量弹层、窗口快捷键与拖动 |
+| `src/eq.slint` | 均衡器面板（阶段 1）：10 段竖向滑条 ±12dB（0dB 中线双向填充）+ 6 预设 + 开关；窗口无关组件 |
+| `src/main.slint` | 主窗口：背景/封面/标题、波形（WaveformArea 实例）、控制胶囊、音量弹层、窗口快捷键与拖动、停靠区（均衡器） |
 | `src/main.rs` | 模块树根 + 薄入口：`slint::include_modules!()` 的生成类型落在这里（crate 根），子模块经 `crate::` 引用；实际逻辑只有 `app::run()` |
 | `src/app.rs` | 组合根：`App` 结构（全部共享状态集中一处）、`run()` 装配（窗口/引擎/通道/计时器/设置恢复/启动参数）、`do_close` 退出持久化、弹窗开关（`open/close_playlist_window`） |
 | `src/ui_callbacks.rs` | Slint 回调接线，按四域分组注册：传输 / 播放列表 / 关于与更新 / 窗口壳层（拖动 + 双击）；播放列表动作经 `action_*` 共享函数供主窗抽屉与弹窗复用；闭包只持 `Weak<App>` |
@@ -114,8 +115,9 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   `PlaylistPanel`。**Slint 全局按组件实例隔离**（slint 1.17 文档明确），弹窗拿到的
   是另一份全局——跨窗口桥接只有两条路：列表内容共享同一 `ModelRc`（天然同步），
   其余轻量属性（主题色/播放状态/粒子时钟/当前曲目）由泵从主窗实例单向同步
-  （仅变化时写入）。弹窗即建即毁（关闭即 drop 释放资源），位置记忆在
-  settings.txt（pop-x/pop-y），主控关闭级联收回。弹窗动作回调与主窗共用
+  （仅变化时写入）。弹窗即建即毁（关闭即 drop 释放资源），每次弹出固定在
+  主窗口右侧 +8px（右缘放不下翻左侧，纵向贴顶缘并夹回屏内；不做绝对位置
+  记忆），主控关闭级联收回。弹窗动作回调与主窗共用
   `action_*` 实现（ui_callbacks.rs）。
 - **更新安装**：临时 .cmd（自删除）→ ping 延迟 2 秒 → `/VERYSILENT` 覆盖安装 →
   `start` 重启 `current_exe()`。不要改回 cmd /C 长命令（引号转义会静默失败）。
@@ -167,6 +169,15 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   `default-font-family`（系统回退字体，瞬时打开）；主窗/抽屉共享主窗上下文，
   用 HarmonyOS Sans SC（标题 font-weight 500 = Medium）。字体一致性若将来
   必须，可考虑持久化弹窗实例（hide/show 代替即建即毁）——接受内存代价。
+- **Slint 入口文件必须显式 `export { ... } from "xxx.slint"` 重导出全局**，`include_modules!()`
+  才会在 crate 根生成对应类型——只在入口 `import`（供组件使用）不会生成
+  `crate::EqState` 这类类型（E0432 且报错不指向真正原因）。
+- **次级窗口的 set_position 必须等 winit 窗口真正创建后调用**：`show()` 返回时
+  HWND 仍可能未就绪（winit 惰性创建），此前的 set_position 被**静默丢弃**，
+  窗口落在 winit 默认位置（实测：定位写在 show 后仍被丢，挂进现有
+  "HWND 未就绪则 50ms 重试"分支后才生效）。位置计算统一走 Win32
+  `GetWindowRect`（物理像素）——Slint 的 position/size 语义在窗口创建前后
+  有出入，勿混用逻辑/物理单位。
 - **泵周期更新的属性绝不能挂 Slint `animate`**（"播放中 40% CPU"的根因）：
   粒子 opacity 与播放头 played-frac 曾分别挂 200ms/200ms 补间，而泵每 33/50ms
   写一次——补间时长 > 写入间隔意味着动画永远在途，Slint 动画时钟永不停歇，
@@ -195,24 +206,27 @@ UIState 大杂烩拆为三个 global；抽屉/关于抽成独立组件；模块�
 **阶段 A（基建已完成）：同窗停靠**
 `DockState` 全局 + 主控条最左端"模块"按钮开关停靠区；停靠区固定在主窗口底部
 （开合为 240ms 幕布式平滑动画：动画驱动源是 `dock-h` 共享镜像，窗口高度与
-主控条 y 共用同一动画值，差值恒定无布局瞬态，见坑列表）；`test_panel.slint`
-的测试面板 A/B 验证滑条与点击交互（无实际功能）。新模块接入步骤：实现面板
-组件 → 在停靠区注册标签与 variant。
+主控条 y 共用同一动画值，差值恒定无布局瞬态，见坑列表）。首 个真实模块
+**均衡器**（`eq.slint`）已停靠；播放列表抽屉打开时覆盖整个窗口（含停靠区）。
+新模块接入步骤：实现面板组件 → 在停靠区注册标签与内容。
 
 **阶段 C（首落地）：混合弹出**
-播放列表已可弹出为独立无边框窗口（弹出/收回切换 + 位置记忆 + 亚克力/圆角 +
+播放列表已可弹出为独立无边框窗口（弹出/收回切换 + 固定贴主窗右侧 + 亚克力/圆角 +
 主控关闭级联收回；暂无吸附）。基建已通：Slint 多窗口 + 逐窗口系统效果 +
 独立 WndProc 子类化 + 泵桥接同步。**按需逐模块开放弹出**，下一个候选是
 桌面歌词；新模块弹出照抄播放列表的模式（面板组件窗口无关 + 共享模型 + 泵同步）。
 
 ### 阶段 1~3（功能模块，均以模块化单体形态实现）
 
-1. **音频管线挂钩（已完成）+ 均衡器 UI（待做）**：`audio_engine.rs` 已有
+1. **音频管线挂钩（已完成）+ 均衡器 UI（已完成）**：`audio_engine.rs` 已有
    `DspStage` trait（逐采样 f32 处理）+ `PipelineSource`（解码器→DSP 链→输出，
    无阶段零开销直通；**必须转发 try_seek**，见坑列表）+ `EqStage`（10 段 RBJ
    peaking，Arc<Mutex<EqSettings>> 共享，参数经 Command::SetEq 即时生效）+
    设置持久化（settings.txt `eq=` 行）。
-   **剩余：EQ 模块 UI**（停靠面板 10 根滑条 + 预设 + 开关），接 `audio.set_eq()` 即可。
+   EQ UI（`eq.slint` + `EqState`）：停靠面板 10 根滑条 + 6 预设（平直/流行/
+   摇滚/爵士/人声/古典）+ 开关；增益单一数据源是 `app.eq_gains_model`
+   （VecModel<f32>），每次改动重建 EqSettings 下发引擎并同步 `app.eq`
+   （RefCell，do_close 持久化）；手动拖动任一滑条即落回"自定义"。
 2. **歌词**（1~2 天）：位置事件（50ms）现成；本地 .lrc 解析 → 在线 API（做成可换
    源）；UI 填停靠区或波形上方单行。
 3. **自定义音源（暂缓）**：用户已决定推迟，不排入当前计划；届时从

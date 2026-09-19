@@ -21,11 +21,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, PostMessageW,
-    SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES,
-    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
+    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW,
+    PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE,
+    WM_COPYDATA, WM_DROPFILES, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -498,6 +499,27 @@ pub(crate) fn set_file_events(sender: Sender<FileEvent>) {
 
 pub(crate) fn set_playlist_open(open: bool) {
     PLAYLIST_OPEN.store(open, Ordering::Relaxed);
+}
+
+/// 主显示器尺寸（物理像素）。进程是 per-monitor DPI aware，返回真实像素。
+/// 多显示器场景只按主屏钳制——弹窗贴主窗右侧是常规布局，跨屏细节后续
+/// 有需要再补 MonitorFromWindow 精确化。
+pub(crate) fn screen_size() -> (i32, i32) {
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+/// 任意 Slint 窗口的屏幕矩形（物理像素，left/top/right/bottom）。
+/// winit 窗口惰性创建：窗口未就绪时返回 None。
+pub(crate) fn window_rect_px(window: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    let hwnd = hwnd_from_window(window)?;
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetWindowRect(hwnd, &mut rc) };
+    Some((rc.left, rc.top, rc.right, rc.bottom))
 }
 
 pub(crate) fn set_about_open(open: bool) {

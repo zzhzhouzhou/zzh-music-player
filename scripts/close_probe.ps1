@@ -52,6 +52,14 @@ $pop = [W]::FindByEnum("zzhMusicPlayer Playlist")
 if ($pop -eq [IntPtr]::Zero) { Write-Output "NO POPOUT"; Stop-Process -Id $p.Id -Force; exit 1 }
 Write-Output "POPOUT alive"
 
+# position check: popout should sit at main-window right edge + 8px
+$main = [W]::FindByEnum("zzhMusicPlayer")
+$mr = New-Object RECT
+[void][W]::GetWindowRect($main, [ref]$mr)
+$pr = New-Object RECT
+[void][W]::GetWindowRect($pop, [ref]$pr)
+Write-Output ("POSITION main.R={0} pop.L={1} gap={2} dy={3}" -f $mr.R, $pr.L, ($pr.L - $mr.R), ($pr.T - $mr.T))
+
 $r0 = New-Object RECT
 [void][W]::GetWindowRect($pop, [ref]$r0)
 [void][W]::SetForegroundWindow($pop); Start-Sleep -Milliseconds 300

@@ -1,14 +1,13 @@
 // 全局与类型再导出：Rust 侧经 include_modules 访问（ui.global::<TransportState>() 等）。
-export { TransportState, PlaylistState, AboutState, DockState } from "state.slint";
+export { TransportState, PlaylistState, AboutState, DockState, EqState } from "state.slint";
 export { PlaylistEntry, UpdateState } from "state.slint";
 // 独立播放列表窗口（阶段 C）：Rust 侧按需实例化/销毁。
 export { PlaylistWindow } from "playlist_window.slint";
-import { TransportState, PlaylistState, AboutState, UpdateState, DockState } from "state.slint";
+import { TransportState, PlaylistState, AboutState, UpdateState, DockState, EqState } from "state.slint";
 import { IconButton, VolumeBar } from "widgets.slint";
 import { PlaylistDrawer } from "playlist.slint";
 import { AboutCard } from "about.slint";
-import { DockState } from "state.slint";
-import { TestPanel } from "test_panel.slint";
+import { EqPanel } from "eq.slint";
 // zzhMusicPlayer 主界面：无边框、亚克力毛玻璃 + 主题渐变背景。
 // 布局：左侧专辑封面（无封面时隐藏）+ 歌曲/艺术家两行信息、右上角窗口控制；
 // 中部圆润镜像波形进度条（视觉核心，已播主题色 / 未播半透明白）；
@@ -703,13 +702,14 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 播放列表模块（阶段 0：组件已独立，停靠撑满主窗口；阶段 C 可弹出新窗口）。
-        // 高度锚定基础区域（root.height - dock-h 恒为基准高度），抽屉展开时
-        // 覆盖主区域；收起位置在停靠动画期间恒定，不会被窗口生长带着滑动。
+        // 播放列表模块（阶段 0：组件已独立，阶段 C 可弹出新窗口）。
+        // 打开时覆盖整个窗口（含停靠区）——用户要求：停靠区开着时抽屉
+        // 盖满两层面板，形成更高的列表视口。收起时 visible=false 隐藏
+        // （playlist.slint），停靠动画不会把收起的抽屉带着滑动。
         pl-drawer := PlaylistDrawer {
             width: root.width;
-            height: root.height - dock-h;
-            closed-y: root.height - dock-h;
+            height: root.height;
+            closed-y: root.height;
         }
 
         // 停靠区（阶段 A）：模块面板停靠在主窗口底部，主控条在其上方。
@@ -735,7 +735,7 @@ export component MainWindow inherits Window {
                 border-color: #ffffff1f;
             }
 
-            // 模块标签：面板 A / 面板 B（验证多模块切换）。
+            // 模块标签：均衡器（阶段 1 首个真实模块；后续模块在此追加 tab）。
             Rectangle {
                 x: 20px;
                 y: 8px;
@@ -745,26 +745,10 @@ export component MainWindow inherits Window {
                 background: DockState.active == 0
                     ? TransportState.theme-color.with-alpha(0.30) : #ffffff14;
                 animate background { duration: 120ms; }
-                Text { text: "面板 A"; font-size: 11px; color: #f2f4f8;
+                Text { text: "均衡器"; font-size: 11px; color: #f2f4f8;
                        horizontal-alignment: center; vertical-alignment: center; }
                 ta := TouchArea {
                     clicked => { DockState.active = 0; }
-                    mouse-cursor: pointer;
-                }
-            }
-            Rectangle {
-                x: 92px;
-                y: 8px;
-                width: 64px;
-                height: 20px;
-                border-radius: 10px;
-                background: DockState.active == 1
-                    ? TransportState.theme-color.with-alpha(0.30) : #ffffff14;
-                animate background { duration: 120ms; }
-                Text { text: "面板 B"; font-size: 11px; color: #f2f4f8;
-                       horizontal-alignment: center; vertical-alignment: center; }
-                tb := TouchArea {
-                    clicked => { DockState.active = 1; }
                     mouse-cursor: pointer;
                 }
             }
@@ -779,12 +763,11 @@ export component MainWindow inherits Window {
             }
 
             // 模块内容（高度引用 module-height：动画中保持固有尺寸）。
-            TestPanel {
+            EqPanel {
                 x: 12px;
                 y: 32px;
                 width: parent.width - 24px;
                 height: DockState.module-height - 38px;
-                variant: DockState.active;
             }
         }
 

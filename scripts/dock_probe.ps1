@@ -55,6 +55,12 @@ if ([D3]::Sweep("zzhMusicPlayer")) {
     $mh2 = [D3]::Found.B - [D3]::Found.T
     Write-Output ("after click(218,151): height {0} -> {1}" -f $mh, $mh2)
 }
+# settle: the open animation is 240ms; sample the FINAL height after it ends
+Start-Sleep -Milliseconds 900
+if ([D3]::Sweep("zzhMusicPlayer")) {
+    $mh3 = [D3]::Found.B - [D3]::Found.T
+    Write-Output ("settled open height: {0} (expect base + module-height)" -f $mh3)
+}
 Shot (Join-Path $PSScriptRoot "dock_b.png") $mx $my ([Math]::Max($mw, 340)) ([Math]::Max($mh, 520))
 
 # close via the module button again (retry: click delivery can be flaky); sample ramp

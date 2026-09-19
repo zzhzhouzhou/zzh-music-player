@@ -5,15 +5,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, SharedString};
+use slint::{ComponentHandle, Model, SharedString};
 
 use crate::app::{App, close_playlist_window, do_close, open_playlist_window};
+use crate::audio_engine::EQ_BANDS;
 use crate::events::{FileEvent, UPDATE_INSTALLER_NAME, spawn_update_check};
 use crate::playlist::{play_at, track_name};
 use crate::windows_platform::{
     begin_native_drag, cursor_position, set_always_on_top, set_playlist_open,
 };
-use crate::{AboutState, PlaylistState, PlaylistWindow, TransportState, UpdateState};
+use crate::{AboutState, EqState, PlaylistState, PlaylistWindow, TransportState, UpdateState};
 
 /// 双击判定的最大时间间隔（毫秒）。
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -320,6 +321,77 @@ fn register_playlist_callbacks(app: &Rc<App>) {
             }
         });
     }
+
+    // —— 均衡器（阶段 1）：滑条/预设/开关 → 引擎命令 + 模型回写 ——
+    // 增益单一数据源是 app.eq_gains_model；每次改动从模型重建 EqSettings
+    // 下发引擎（Command::SetEq 即时生效），app.eq 同步更新供 do_close 持久化。
+    {
+        let app_weak = Rc::downgrade(app);
+        app.ui.global::<EqState>().on_set_gain(move |band, db| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let band = band as usize;
+            if band >= EQ_BANDS {
+                return;
+            }
+            app.eq_gains_model.set_row_data(band, db.clamp(-12.0, 12.0));
+            apply_eq(&app, 0);
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        app.ui.global::<EqState>().on_apply_preset(move |preset| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let idx = (preset as usize).saturating_sub(1);
+            if idx >= EQ_PRESET_GAINS.len() {
+                return;
+            }
+            for (i, g) in EQ_PRESET_GAINS[idx].iter().enumerate() {
+                app.eq_gains_model.set_row_data(i, *g);
+            }
+            apply_eq(&app, preset);
+        });
+    }
+    {
+        let app_weak = Rc::downgrade(app);
+        app.ui.global::<EqState>().on_toggle_enabled(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let mut eq = app.eq.borrow_mut();
+            eq.enabled = !eq.enabled;
+            app.ui.global::<EqState>().set_enabled(eq.enabled);
+            app.audio.set_eq(eq.clone());
+        });
+    }
+}
+
+/// 内置均衡器预设（顺序与 eq.slint 的 preset-names 一致；单位 dB，
+/// 频段 31Hz..16kHz）。手动拖动任一滑条会落回"自定义"（preset=0）。
+const EQ_PRESET_GAINS: [[f32; 10]; 6] = [
+    [0.0; 10],
+    [-1.0, 2.0, 4.0, 4.0, 2.0, 0.0, -1.0, -1.0, 1.0, 2.0], // 流行
+    [4.0, 3.0, 1.0, 0.0, -1.0, -1.0, 0.0, 2.0, 3.0, 4.0],  // 摇滚
+    [2.0, 2.0, 1.0, 1.0, -1.0, -1.0, 0.0, 1.0, 2.0, 3.0],  // 爵士
+    [-2.0, -1.0, 0.0, 2.0, 4.0, 4.0, 3.0, 1.0, 0.0, -1.0], // 人声
+    [3.0, 2.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0, 2.0, 3.0],  // 古典
+];
+
+/// 从增益模型重建 EqSettings 下发引擎，并同步预设高亮。
+fn apply_eq(app: &Rc<App>, preset: i32) {
+    let mut gains = [0f32; EQ_BANDS];
+    for (i, g) in gains.iter_mut().enumerate() {
+        *g = app.eq_gains_model.row_data(i).unwrap_or(0.0);
+    }
+    {
+        let mut eq = app.eq.borrow_mut();
+        eq.gains = gains;
+        app.audio.set_eq(eq.clone());
+    }
+    app.ui.global::<EqState>().set_active_preset(preset);
 }
 
 // —— 播放列表动作的共享实现：主窗口抽屉与独立弹窗的回调都落到这里 ——
