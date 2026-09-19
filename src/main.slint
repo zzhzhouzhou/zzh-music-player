@@ -546,8 +546,8 @@ export component MainWindow inherits Window {
             width: 330px;
             height: 38px;
 
-            // 玻璃胶囊背景：深色玻璃常驻；平时几乎隐形（不显示主题色），
-            // 鼠标靠近后显现保证可读性。
+            // 玻璃胶囊背景：半透明深色玻璃常驻，悬停只轻微加深
+            // （用户反馈旧版悬停 0.78 过于明显；主题色叠加层已按反馈移除）。
             Rectangle {
                 x: 0px;
                 y: 0px;
@@ -557,23 +557,11 @@ export component MainWindow inherits Window {
                 border-width: 1px;
                 border-color: TransportState.toolbar-hovered ? #ffffff30 : #ffffff1f;
                 background: #0e131d;
-                opacity: TransportState.toolbar-hovered ? 0.78 : 0.15;
+                opacity: TransportState.toolbar-hovered ? 0.55 : 0.15;
                 animate opacity { duration: 150ms; easing: ease-out; }
                 drop-shadow-offset-y: 3px;
                 drop-shadow-blur: 12px;
                 drop-shadow-color: #00000040;
-            }
-
-            // 主题色叠加层：只在鼠标靠近时轻轻显现。
-            Rectangle {
-                x: 0px;
-                y: 0px;
-                width: 100%;
-                height: 100%;
-                border-radius: 19px;
-                background: TransportState.theme-color;
-                opacity: TransportState.toolbar-hovered ? 0.18 : 0.0;
-                animate opacity { duration: 150ms; easing: ease-out; }
             }
 
             HorizontalLayout {
@@ -702,19 +690,10 @@ export component MainWindow inherits Window {
             }
         }
 
-        // 播放列表模块（阶段 0：组件已独立，阶段 C 可弹出新窗口）。
-        // 打开时覆盖整个窗口（含停靠区）——用户要求：停靠区开着时抽屉
-        // 盖满两层面板，形成更高的列表视口。收起时 visible=false 隐藏
-        // （playlist.slint），停靠动画不会把收起的抽屉带着滑动。
-        pl-drawer := PlaylistDrawer {
-            width: root.width;
-            height: root.height;
-            closed-y: root.height;
-        }
-
         // 停靠区（阶段 A）：模块面板停靠在主窗口底部，主控条在其上方。
         // 收起动画期间保持可见（dock-h 回落到 0 才隐藏），随窗口底缘幕布式
         // 收起；clip 遮住溢出，内部内容尺寸固定（引用 module-height）不压缩。
+        // 注意声明顺序：抽屉在其后声明才能盖住停靠区（Slint 按声明顺序叠放）。
         Rectangle {
             visible: dock-h > 0px;
             clip: true;
@@ -723,14 +702,15 @@ export component MainWindow inherits Window {
             width: root.width;
             height: dock-h;
 
-            // 面板玻璃底（尺寸固定，动画中只被容器裁切，不发生压缩形变）。
+            // 面板玻璃底（半透明：窗口自身的亚克力模糊透出来形成毛玻璃质感；
+            // 旧版 d9 近乎实色，被用户指出"背景要毛玻璃/半透明"）。
             Rectangle {
                 x: 8px;
                 y: 4px;
                 width: parent.width - 16px;
                 height: DockState.module-height - 10px;
                 border-radius: 12px;
-                background: #0f131bd9;
+                background: #0f131b99;
                 border-width: 1px;
                 border-color: #ffffff1f;
             }
@@ -769,6 +749,18 @@ export component MainWindow inherits Window {
                 width: parent.width - 24px;
                 height: DockState.module-height - 38px;
             }
+        }
+
+        // 播放列表模块（阶段 0：组件已独立，阶段 C 可弹出新窗口）。
+        // 打开时覆盖整个窗口（含停靠区）——用户要求：停靠区开着时抽屉
+        // 盖满两层面板，形成更高的列表视口。收起时 visible=false 隐藏
+        // （playlist.slint），停靠动画不会把收起的抽屉带着滑动。
+        // 声明在停靠区之后：Slint 按声明顺序叠放，保证抽屉在最上层
+        // （用户反馈：EQ 开着再点播放列表，列表应盖住停靠区）。
+        pl-drawer := PlaylistDrawer {
+            width: root.width;
+            height: root.height;
+            closed-y: root.height;
         }
 
         // 关于与更新模块（AboutState.about-open 控制显隐）。

@@ -1,34 +1,36 @@
 // 均衡器面板（阶段 1 首个真实停靠模块）：10 段竖向滑条 ±12dB + 预设 + 开关。
-// 窗口无关组件（与 PlaylistPanel 同模式），当前只停靠在主窗口底部；
-// 将来开放弹出照抄播放列表的模式。增益回写经 EqState.set-gain 回调到
-// Rust 侧（引擎即时生效 + 持久化），面板自身不持有任何音频状态。
+// 排布采用经典 EQ 布局：顶行 = 开关 + 预设 + 量程提示，下方滑条整行铺开
+// （旧版把滑条挤在右侧 1/4 宽度里，被用户指出"排版古怪"）。增益回写经
+// EqState.set-gain 回调到 Rust 侧（引擎即时生效 + 持久化），面板不持音频状态。
 import { EqState, TransportState } from "state.slint";
-import { IconButton } from "widgets.slint";
 
-// 频段标签（与 audio_engine::EQ_FREQS 一一对应）。
+// 单个频段滑条：数值 / 滑槽（0dB 中线 + 双向填充 + 拇指）/ 频段标签。
 component BandSlider inherits Rectangle {
     in property <int> band;
     in property <string> label;
-    in property <float> gain; // -12 ~ +12 dB
-    min-width: 34px;
+    in property <float> gain; // -12 ~ +12 dB（Rust 侧已按 0.5dB 吸附）
+    min-width: 36px;
+    horizontal-stretch: 1;
 
     Text {
         y: 0px;
         width: parent.width;
-        height: 12px;
-        text: root.gain > 0.5 ? "+" + round(root.gain)
-            : root.gain < -0.5 ? round(root.gain) : "0";
+        height: 14px;
+        text: root.gain == 0.0 ? "0"
+            : (root.gain > 0.0 ? "+" : "-")
+            + (root.gain == root.gain.floor()
+                ? round(abs(root.gain))
+                : round(abs(root.gain) * 2.0) / 2.0);
         font-size: 10px;
         color: root.gain != 0.0 ? TransportState.theme-color : #9aa3b2;
         horizontal-alignment: center;
     }
 
-    // 滑槽。
     Rectangle {
         x: (parent.width - 4px) / 2;
-        y: 12px;
+        y: 16px;
         width: 4px;
-        height: parent.height - 46px;
+        height: parent.height - 48px;
         border-radius: 2px;
         background: #ffffff14;
         // 0dB 中线刻度。
@@ -61,14 +63,19 @@ component BandSlider inherits Rectangle {
     }
 
     ta := TouchArea {
-        y: 12px;
-        height: parent.height - 46px;
-        // 按下即跳值，拖动跟随；方向与滑槽一致（上 = +12dB）。
+        y: 16px;
+        height: parent.height - 48px;
+        // 只在按住时调值：down 跳值 + moved 拖动跟随。上一版在
+        // pointer-event 里响应 move（悬停也触发），鼠标路过就改增益。
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.down || e.kind == PointerEventKind.move) {
+            if (e.kind == PointerEventKind.down) {
                 EqState.set-gain(root.band,
                     clamp((self.height / 2 - self.mouse-y) * 24.0 / self.height, -12.0, 12.0));
             }
+        }
+        moved => {
+            EqState.set-gain(root.band,
+                clamp((self.height / 2 - self.mouse-y) * 24.0 / self.height, -12.0, 12.0));
         }
         mouse-cursor: ns-resize;
     }
@@ -94,22 +101,23 @@ component BandSlider inherits Rectangle {
 }
 
 export component EqPanel inherits Rectangle {
-    HorizontalLayout {
-        x: 14px;
-        y: 4px;
-        width: parent.width - 28px;
-        height: parent.height - 8px;
-        spacing: 10px;
+    VerticalLayout {
+        x: 12px;
+        y: 6px;
+        width: parent.width - 24px;
+        height: parent.height - 12px;
+        spacing: 8px;
 
-        // 左列：开关 + dB 标尺说明。
-        VerticalLayout {
-            width: 88px;
-            spacing: 6px;
+        // 顶行：开关 + 预设 chips + 量程提示。
+        HorizontalLayout {
+            height: 26px;
+            spacing: 8px;
             alignment: start;
 
             Rectangle {
-                height: 24px;
-                border-radius: 12px;
+                width: 96px;
+                height: 26px;
+                border-radius: 13px;
                 border-width: 1px;
                 border-color: EqState.enabled
                     ? TransportState.theme-color.with-alpha(0.55) : #ffffff1f;
@@ -128,34 +136,11 @@ export component EqPanel inherits Rectangle {
                     mouse-cursor: pointer;
                 }
             }
-            Text {
-                height: 16px;
-                text: EqState.enabled ? "±12 dB · 即时生效" : "已旁路（直通）";
-                font-size: 10px;
-                color: #ffffff59;
-                vertical-alignment: center;
-            }
-            Rectangle { vertical-stretch: 1; }
-            Text {
-                height: 14px;
-                text: "10 段 ISO 倍频程";
-                font-size: 10px;
-                color: #ffffff38;
-                vertical-alignment: center;
-            }
-        }
-
-        // 预设行（横排 chips，随 active-preset 高亮）。
-        HorizontalLayout {
-            width: 296px;
-            height: 24px;
-            spacing: 6px;
-            alignment: start;
 
             for preset[i] in EqState.preset-names: Rectangle {
-                width: 44px;
-                height: 24px;
-                border-radius: 12px;
+                width: 48px;
+                height: 26px;
+                border-radius: 13px;
                 border-width: 1px;
                 border-color: EqState.active-preset == i + 1
                     ? TransportState.theme-color.with-alpha(0.55) : #ffffff1f;
@@ -174,14 +159,24 @@ export component EqPanel inherits Rectangle {
                     mouse-cursor: pointer;
                 }
             }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Text {
+                width: 160px;
+                height: 26px;
+                text: EqState.enabled ? "±12 dB · 0.5 dB 步进" : "已旁路（信号直通）";
+                font-size: 10px;
+                color: #ffffff59;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+            }
         }
 
-        Rectangle { horizontal-stretch: 1; }
-
-        // 10 根竖向滑条（禁用态整列降透明度，直观呈现"旁路"）。
+        // 滑条整行（禁用态整列降透明度，直观呈现"旁路"）。
         HorizontalLayout {
-            horizontal-stretch: 1;
-            spacing: 2px;
+            height: parent.height - 34px;
+            spacing: 4px;
             opacity: EqState.enabled ? 1.0 : 0.45;
             animate opacity { duration: 150ms; }
 

@@ -335,7 +335,9 @@ fn register_playlist_callbacks(app: &Rc<App>) {
             if band >= EQ_BANDS {
                 return;
             }
-            app.eq_gains_model.set_row_data(band, db.clamp(-12.0, 12.0));
+            // 0.5dB 吸附：拇指、显示值与实际增益一致，滑条手感更"准"。
+            let db = ((db * 2.0).round() / 2.0).clamp(-12.0, 12.0);
+            app.eq_gains_model.set_row_data(band, db);
             apply_eq(&app, 0);
         });
     }
