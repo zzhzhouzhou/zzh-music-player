@@ -58,6 +58,14 @@ pub struct App {
     /// EQ 面板 10 段增益的 Slint 模型：滑条回写与设置恢复的单一数据源，
     /// app.eq（引擎侧 EqSettings）在每次改动时从本模型重建。
     pub eq_gains_model: Rc<VecModel<f32>>,
+    /// 磁贴状态：弹窗是否贴靠主窗（true = 跟随主窗移动）+ 弹窗相对主窗
+    /// 左上角的偏移（物理像素）。弹出默认贴靠右侧；拖离超过阈值自动解绑，
+    /// 拖回贴靠带自动吸上（33ms 泵执行，见 pumps::sync_popout_snap）。
+    pub pop_snap: Cell<bool>,
+    pub pop_snap_off: Cell<(i32, i32)>,
+    /// 按住期间每拍记录的主窗矩形（松手后第一拍用于区分"拖的是主窗还是
+    /// 弹窗"——拖主窗时弹窗跟随，拖弹窗时才做解绑/磁性判断）。
+    pub snap_main_last: Cell<Option<(i32, i32, i32, i32)>>,
     /// 当前正在播放的曲目路径（事件泵维护，波形上屏判断用）。
     pub current_path: RefCell<Option<PathBuf>>,
     /// 播放列表显示模型：主窗口抽屉与独立弹窗共享同一 ModelRc，
@@ -173,6 +181,9 @@ fn place_popout_right_of_main(app: &App, pw: &PlaylistWindow) {
         y = 0;
     }
     pw.window().set_position(slint::PhysicalPosition::new(x, y));
+    // 磁贴：弹出即贴靠（右侧布局是贴靠位），记录相对偏移供 33ms 泵联动。
+    app.pop_snap.set(true);
+    app.pop_snap_off.set((x - ml, y - mt));
 }
 
 /// 关闭播放列表独立窗口（幂等）：记录位置（供会话内重开与退出持久化）、
@@ -290,6 +301,9 @@ pub fn run() {
         popup_hide_timer,
         eq: RefCell::new(settings.eq.clone()),
         eq_gains_model: Rc::clone(&eq_gains_model),
+        pop_snap: Cell::new(false),
+        pop_snap_off: Cell::new((0, 0)),
+        snap_main_last: Cell::new(None),
         current_path: RefCell::new(None),
         playlist_model: Rc::clone(&playlist_model),
         playlist_window: RefCell::new(None),

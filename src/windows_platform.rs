@@ -522,6 +522,12 @@ pub(crate) fn window_rect_px(window: &slint::Window) -> Option<(i32, i32, i32, i
     Some((rc.left, rc.top, rc.right, rc.bottom))
 }
 
+/// 左键当前是否按住。磁贴联动（泵周期执行）用它跳过拖动中的窗口——
+/// 原生拖动是模态循环，泵 tick 到也不能去改窗口位置，否则跟拖动打架。
+pub(crate) fn left_button_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000 != 0 }
+}
+
 pub(crate) fn set_about_open(open: bool) {
     ABOUT_OPEN.store(open, Ordering::Relaxed);
 }

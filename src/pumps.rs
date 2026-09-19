@@ -3,7 +3,8 @@
 //! （旧为 100ms：慢泵让 seek 回执、换曲状态、文件追加的感知延迟高达 100ms；
 //! 固定 16ms 与显示刷新对齐，四个 try_recv 的空转成本可忽略。不用动态调间隔——
 //! Slint Timer 每次 restart 需重新装箱闭包，违反“泵内零分配”约束。）
-//! 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动。
+//! 33ms 泵：粒子时钟、主题色补间、工具栏悬停、拖拽排序自动滚动、
+//! 弹窗磁贴联动。
 //! 约束：泵内不做每帧分配的重活；属性只在值变化时写入（先读后写比对）。
 
 use std::time::Instant;
@@ -18,7 +19,9 @@ use crate::render_utils::{format_time, placeholder_bars, push_background};
 use crate::transport::{SEEK_CONFIRM_TIMEOUT, SEEK_SETTLE_WINDOW, SeekState};
 use crate::waveform::{apply_waveform, cache_insert, prefetch_next_track};
 use crate::waveform_cache::read_wave_cache;
-use crate::windows_platform::{cursor_position, is_about_open, set_about_open};
+use crate::windows_platform::{
+    cursor_position, is_about_open, left_button_down, set_about_open, window_rect_px,
+};
 use crate::{AboutState, PlaylistState, TransportState, UpdateState};
 
 /// 16ms 事件泵：四个通道的统一消费点。轮询顺序（音频→文件→波形→更新）
@@ -486,6 +489,66 @@ pub fn particle_33ms(app: &App) {
             );
         }
     }
+    // 磁贴联动：贴靠中的弹窗跟随主窗移动（弹窗未打开时是纯读跳过，零成本）。
+    sync_popout_snap(app);
+}
+
+/// 磁贴（snap）联动：贴靠中的弹窗每拍对齐主窗（主窗被拖动/调整时弹窗
+/// 跟随）；拖离贴靠位超过阈值自动解绑；未贴靠时拖回主窗左右贴靠带内
+/// 自动吸上。左键按住期间整段跳过——原生拖动是模态循环，不能跟泵抢
+/// 窗口位置。每拍成本：两次 GetWindowRect + 一次比较，可忽略。
+fn sync_popout_snap(app: &App) {
+    // 左键按住期间（模态拖动循环）不做任何动作。snap_main_last 保留
+    // 按住前最后一拍的记录——松手后用它区分"刚拖完主窗"（弹窗跟随）
+    // 还是"刚拖完弹窗"（解绑/磁性判断）。若在这里清空，拖主窗结束时
+    // 弹窗与主窗的相对位移早已超过 RELEASE，第一拍就会被误判成"用户
+    // 把弹窗拖走了"而立即解绑（首测踩坑）。
+    if left_button_down() {
+        return;
+    }
+    let guard = app.playlist_window.borrow();
+    let Some(pw) = guard.as_ref() else {
+        return;
+    };
+    let Some((ml, mt, mr, _mb)) = window_rect_px(app.ui.window()) else {
+        return;
+    };
+    let Some((pl, pt, pr, _pb)) = window_rect_px(pw.window()) else {
+        return;
+    };
+    const RELEASE: i32 = 48; // 拖弹窗离贴靠位超过此距离解绑
+    const MAGNET: i32 = 24; // 贴靠带宽度（松手时吸上）
+    if app.pop_snap.get() {
+        let (ox, oy) = app.pop_snap_off.get();
+        let (dx, dy) = (pl - (ml + ox), pt - (mt + oy));
+        if dx != 0 || dy != 0 {
+            // 刚松手：主窗在按住期间被拖动过 → 弹窗贴着跟过去。
+            if let Some((lx, lt, _lr, _lb)) = app.snap_main_last.get()
+                && (lx, lt) != (ml, mt)
+            {
+                pw.window()
+                    .set_position(slint::PhysicalPosition::new(ml + ox, mt + oy));
+                return;
+            }
+            // 主窗没动而弹窗偏了：拖离超阈值解绑；小偏移磁性拉回。
+            if dx.abs() > RELEASE || dy.abs() > RELEASE {
+                app.pop_snap.set(false);
+            } else {
+                pw.window()
+                    .set_position(slint::PhysicalPosition::new(ml + ox, mt + oy));
+            }
+        }
+    } else {
+        // 未贴靠：松手位置落在主窗左/右贴靠带内则吸上。
+        let near_right = (pl - (mr + 8)).abs() <= MAGNET && (pt - mt).abs() <= 64;
+        let near_left = ((pr + 8) - ml).abs() <= MAGNET && (pt - mt).abs() <= 64;
+        if near_right || near_left {
+            app.pop_snap.set(true);
+            app.pop_snap_off.set((pl - ml, pt - mt));
+        }
+    }
+    // 记录本拍主窗位置（松手后的第一拍作对比基准）。
+    app.snap_main_last.set(Some((ml, mt, mr, _mb)));
 }
 
 /// 拖拽排序浮块跟随 / 边缘自动滚动 / 悬停清理：把系统光标换算到指定窗口

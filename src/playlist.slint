@@ -132,6 +132,11 @@ export component PlaylistRow inherits Rectangle {
 export component PlaylistPanel inherits Rectangle {
     in property <bool> active: false;
     in property <bool> docked: false;
+    // 圆角半径：抽屉形态 14px（窗口矩形大、圆角是面板自己的装饰）；
+    // 弹窗形态由 playlist_window.slint 覆写为 8px——必须与 Win11 DWM
+    // 系统圆角（DWMWCP_ROUND ≈ 8px）一致，否则面板圆角与系统裁剪
+    // 叠出"圆角缺一块"的双圆角缝隙（用户实测反馈）。
+    in property <length> corner-radius: 14px;
     callback close-requested();
 
     public function collapse-search() {
@@ -143,7 +148,7 @@ export component PlaylistPanel inherits Rectangle {
     // 面板本体：半透明深底透出下层毛玻璃；叠一层极淡主题色（全局补间
     // 自动随换曲过渡），保持整体色调统一。
     background: #0f131bee;
-    border-radius: 14px;
+    border-radius: root.corner-radius;
 
     // 极淡主题色叠加层。
     Rectangle {
@@ -151,7 +156,7 @@ export component PlaylistPanel inherits Rectangle {
         y: 0px;
         width: 100%;
         height: 100%;
-        border-radius: 14px;
+        border-radius: root.corner-radius;
         background: TransportState.theme-color;
         opacity: 0.08;
     }
@@ -596,7 +601,9 @@ export component PlaylistDrawer inherits Rectangle {
         // 把收起的抽屉带着滑过新展开区域（"点模块按钮播放列表弹出来又滑
         // 下去"的修复）；隐藏态不渲染，也省掉收起时的无谓绘制。
         visible: PlaylistState.playlist-open;
-        animate y { duration: 220ms; easing: ease-out; }
+        // 缓入缓出（用户要求）：320ms ease-in-out 双向曲线，展开收拢都有
+        // 惯性感；收起瞬间的 visible 隐藏保留（停靠开合期间防抽屉扫过）。
+        animate y { duration: 320ms; easing: ease-in-out; }
 
         panel := PlaylistPanel {
             width: 100%;

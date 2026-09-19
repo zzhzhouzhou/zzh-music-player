@@ -28,6 +28,8 @@ export component PlaylistWindow inherits Window {
         height: 100%;
         active: true;
         docked: false;
+        // 与 Win11 DWM 系统圆角对齐（见 PlaylistPanel.corner-radius 注释）。
+        corner-radius: 8px;
         // 弹窗右上角关闭按钮：收回独立窗口（位置记忆在 Rust 侧处理）。
         close-requested => { PlaylistState.pop-close(); }
     }
