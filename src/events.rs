@@ -52,15 +52,19 @@ pub fn spawn_update_check(tx: Sender<UpdateEvent>, auto_download: bool) {
             let _ = tx.send(UpdateEvent::Checking);
             match crate::updater::check_latest() {
                 Ok(v) if crate::updater::version_newer(app_version(), &v) => {
+                    // ASCII 尾标：更新探针靠它断言"发现新版本"分支命中。
+                    eprintln!("[update] available v{v} update-available");
                     let _ = tx.send(UpdateEvent::Available {
                         version: v,
                         auto_download,
                     });
                 }
                 Ok(_) => {
+                    eprintln!("[update] up-to-date {}", app_version());
                     let _ = tx.send(UpdateEvent::UpToDate);
                 }
                 Err(e) => {
+                    eprintln!("[update] failed: {e}");
                     let _ = tx.send(UpdateEvent::Failed(e));
                 }
             }
