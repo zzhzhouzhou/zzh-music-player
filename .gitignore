@@ -12,3 +12,4 @@ testmedia/
 .zcode/
 scripts/probe_err.log
 scripts/*.png
+scripts/perf_err.log

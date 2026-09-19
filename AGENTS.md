@@ -167,6 +167,15 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   `default-font-family`（系统回退字体，瞬时打开）；主窗/抽屉共享主窗上下文，
   用 HarmonyOS Sans SC（标题 font-weight 500 = Medium）。字体一致性若将来
   必须，可考虑持久化弹窗实例（hide/show 代替即建即毁）——接受内存代价。
+- **泵周期更新的属性绝不能挂 Slint `animate`**（"播放中 40% CPU"的根因）：
+  粒子 opacity 与播放头 played-frac 曾分别挂 200ms/200ms 补间，而泵每 33/50ms
+  写一次——补间时长 > 写入间隔意味着动画永远在途，Slint 动画时钟永不停歇，
+  winit 后端随即以显示器刷新率持续整窗重绘（240Hz 屏实测 237fps、44% 单核；
+  vsync 在亚克力无边框窗/RDP 下会被驱动忽略，靠 frame_throttle 也压不住
+  "动画常驻"）。删除补间后播放中 CPU 降到 14%。规则：**只对离散事件
+  （悬停、点击、状态切换）触发的一次性过渡用 animate；泵驱动的连续属性
+  一律直接赋值，靠提高写入频率换平滑**。探针方法：TotalProcessorTime
+  双采样 + SLINT_DEBUG_PERFORMANCE=refresh_lazy,console 看真实 fps。
 - **UI 线程看门狗**（pumps.rs `spawn_ui_watchdog` + `PUMP_TICK`）：33ms 泵
   心跳停止 >1s 即输出 `[watchdog]` 诊断，是排查"假死"类问题的第一现场；
   后台线程零锁零分配，勿在泵内加锁。

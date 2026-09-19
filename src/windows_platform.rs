@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -21,10 +21,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, HTCAPTION,
-    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, PostMessageW, SW_RESTORE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
+    DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, PostMessageW,
+    SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES,
+    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -444,8 +445,8 @@ pub(crate) fn setup_playlist_window(window: &slint::Window) {
     }
 }
 
-/// 播放列表独立窗口的窗口过程：只拦 WM_CLOSE，其余全部转发。
-/// （临时诊断：WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE 打点定位拖动卡死。）
+/// 播放列表独立窗口的窗口过程：拦 WM_CLOSE（转事件收回）与
+/// WM_EXITSIZEMOVE（补发指针释放），其余全部转发。
 unsafe extern "system" fn popout_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -459,13 +460,33 @@ unsafe extern "system" fn popout_wnd_proc(
             }
             0
         }
-        0x0231 => {
-            eprintln!("[pop-drag] enter sizemove");
-            unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
-        }
-        0x0232 => {
-            eprintln!("[pop-drag] exit sizemove");
-            unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
+        WM_EXITSIZEMOVE => {
+            // 原生拖动的模态移动循环会吞掉 WM_LBUTTONUP：Slint 的 TouchArea
+            // 停留在"按住"状态且指针抓取永不解除，之后窗口内所有点击都被
+            // Slint 路由给这个 TouchArea——表现为"拖过之后弹窗内任何 UI
+            // 都无法交互，只能再拖动"。模态循环退出即左键必然已释放，
+            // 补发"WM_MOUSEMOVE + WM_LBUTTONUP"让 winit 先刷新光标位置、
+            // Slint 再据此清除抓取（winit 从 WM_MOUSEMOVE 跟踪光标坐标，
+            // 直接发 up 会带着陈旧位置命中错误的元素）。
+            let mut pt = POINT { x: 0, y: 0 };
+            let mut rc = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            unsafe {
+                GetCursorPos(&mut pt);
+                GetWindowRect(hwnd, &mut rc);
+            }
+            // 无边框窗口客户区原点 == 窗口原点，屏幕坐标直接减窗口原点即可。
+            let lparam =
+                (((pt.y - rc.top) as u16 as u32) << 16 | (pt.x - rc.left) as u16 as u32) as LPARAM;
+            unsafe {
+                PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam);
+                PostMessageW(hwnd, WM_LBUTTONUP, 0, lparam);
+                forward_to_popout_original(hwnd, msg, wparam, lparam)
+            }
         }
         _ => unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) },
     }

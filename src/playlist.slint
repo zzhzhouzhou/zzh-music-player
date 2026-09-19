@@ -176,6 +176,9 @@ export component PlaylistPanel inherits Rectangle {
     }
 
     // 顶部抓取区：按住把手一带向下拖动超过 36px 收起抽屉（仅抽屉形态）。
+    // 独立弹窗形态（docked=false）则整条顶带兼作窗口拖动把手——转发给
+    // 窗口拖动回调，可拖区域从 80px 标题块扩大到全宽顶带（搜索框/关闭
+    // 按钮声明在其后，z 序在其上，交互不受影响）。
     // 声明在头部按钮之前：搜索框 / 关闭按钮落在其上的部分优先响应。
     Rectangle {
         x: 0px;
@@ -187,13 +190,22 @@ export component PlaylistPanel inherits Rectangle {
             pointer-event(e) => {
                 if e.kind == PointerEventKind.down {
                     press-y = self.mouse-y;
-                } else if e.kind == PointerEventKind.move
-                    && root.docked
-                    && PlaylistState.playlist-open
-                    && (self.mouse-y - press-y) > 36px
-                {
-                    root.collapse-search();
-                    PlaylistState.toggle-playlist();
+                    if (!root.docked) {
+                        TransportState.window-drag-down(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
+                } else if e.kind == PointerEventKind.move {
+                    if root.docked && PlaylistState.playlist-open
+                        && (self.mouse-y - press-y) > 36px
+                    {
+                        root.collapse-search();
+                        PlaylistState.toggle-playlist();
+                    } else if (!root.docked) {
+                        TransportState.window-drag-move(self.mouse-x / 1px, self.mouse-y / 1px);
+                    }
+                } else if e.kind == PointerEventKind.up {
+                    if (!root.docked) {
+                        TransportState.window-drag-up();
+                    }
                 }
             }
         }
@@ -207,7 +219,7 @@ export component PlaylistPanel inherits Rectangle {
         height: 20px;
         text: "播放列表";
         font-size: 13px;
-        font-weight: 500;
+        font-weight: 700;
         color: #f2f4f8;
         vertical-alignment: center;
     }
@@ -579,6 +591,11 @@ export component PlaylistDrawer inherits Rectangle {
         y: PlaylistState.playlist-open ? 0px : closed-y;
         width: parent.width;
         height: parent.height;
+        // 收起时整体隐藏：closed-y 锚定在不含停靠区的基础高度上（停靠开合
+        // 动画期间恒定，见 main.slint），展开/收拢动画照常，停靠动画不会
+        // 把收起的抽屉带着滑过新展开区域（"点模块按钮播放列表弹出来又滑
+        // 下去"的修复）；隐藏态不渲染，也省掉收起时的无谓绘制。
+        visible: PlaylistState.playlist-open;
         animate y { duration: 220ms; easing: ease-out; }
 
         panel := PlaylistPanel {

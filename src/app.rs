@@ -63,6 +63,9 @@ pub struct App {
     pub playlist_window: RefCell<Option<PlaylistWindow>>,
     /// 弹窗位置记忆（物理坐标）：会话内重开用，退出时随设置持久化。
     pub playlist_pop_pos: Cell<Option<(i32, i32)>>,
+    /// 波形悬停提示的格式化缓存（上次 frac, duration）：输入不变就跳过
+    /// format! 分配——泵内禁止每帧分配（性能预算），此提示每 33ms 触发。
+    pub wave_tip_cache: Cell<(f32, f32)>,
 }
 
 /// 统一关闭流程：保存记忆设置、隐藏窗口并退出事件循环。
@@ -257,6 +260,7 @@ pub fn run() {
         playlist_model: Rc::clone(&playlist_model),
         playlist_window: RefCell::new(None),
         playlist_pop_pos: Cell::new(settings.pop_pos),
+        wave_tip_cache: Cell::new((-1.0, 0.0)),
     });
 
     // winit 窗口是惰性创建的：事件循环启动（Resumed 阶段）后才真正存在，

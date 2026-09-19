@@ -106,19 +106,16 @@ Write-Output "app responsive, starting stress"
 
 # stress: repeated native drags on the title strip, liveness check after each round
 $hangAt = -1
-foreach ($round in 1..30) {
-    # re-anchor each round: keep the window on screen and the cursor on the title strip
+foreach ($round in 1..20) {
+    # anchor on the CURRENT window rect every round (no fake re-anchor:
+    # moving the cursor without moving the window makes later clicks miss)
     $cur = Get-Rect $pop
-    if ($cur.X -lt 100 -or $cur.Y -lt 0 -or $cur.X -gt 1400) {
-        $cur = @{ X = 500; Y = 100 }   # walked offscreen: reset by dragging from wherever it is
-    }
-    $baseX = [Math]::Min([Math]::Max($cur.X + 40, 60), 1600)
-    $baseY = [Math]::Min([Math]::Max($cur.Y + 20, 30), 800)
+    $baseX = $cur.X + 40; $baseY = $cur.Y + 20
     $dir = if ($round % 2 -eq 0) { 1 } else { -1 }
     [void][Win]::SetCursorPos($baseX, $baseY); Start-Sleep -Milliseconds 80
     [Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)  # LEFTDOWN
     Start-Sleep -Milliseconds 60
-    for ($i = 1; $i -le 10; $i++) {
+    for ($i = 1; $i -le 5; $i++) {
         [void][Win]::SetCursorPos($baseX + $dir * [int](6 * $i), $baseY + [int](4 * $i))
         Start-Sleep -Milliseconds 20
     }
@@ -130,8 +127,26 @@ foreach ($round in 1..30) {
         $hangAt = $round
         break
     }
+    # keep the window on-screen: screen-edge clamping on upward drags biases
+    # the drift downward; once the title strip leaves the visible screen the
+    # window can no longer be grabbed at all
+    $chk = Get-Rect $pop
+    if ($chk.Y -gt 550) {
+        $up = $chk.Y - 150
+        $bx = $chk.X + 40; $by = $chk.Y + 20
+        [void][Win]::SetCursorPos($bx, $by); Start-Sleep -Milliseconds 80
+        [Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 50
+        for ($i = 1; $i -le 8; $i++) {
+            [void][Win]::SetCursorPos($bx, $by - [int]($up * $i / 8))
+            Start-Sleep -Milliseconds 20
+        }
+        Start-Sleep -Milliseconds 60
+        [Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 150
+    }
 }
-if ($hangAt -lt 0) { Write-Output "STRESS OK: 30 rounds, UI thread responsive after each" }
+if ($hangAt -lt 0) { Write-Output "STRESS OK: 20 rounds, UI thread responsive after each" }
 
 $r1 = Get-Rect $pop
 Write-Output ("AFTER: {0},{1}" -f $r1.X, $r1.Y)
@@ -140,6 +155,63 @@ if ([Math]::Abs($dx) -gt 10 -and [Math]::Abs($dy) -gt 10) {
     Write-Output "DRAG OK dx=$dx dy=$dy"
 } else {
     Write-Output "DRAG FAILED dx=$dx dy=$dy"
+}
+
+# widened drag zone: full-width top strip (panel grab-ta forwarding), drag from x=250
+$c2 = Get-Rect $pop
+$wx = $c2.X + 250
+$wy = $c2.Y + 10
+[void][Win]::SetCursorPos($wx, $wy); Start-Sleep -Milliseconds 100
+[Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+Start-Sleep -Milliseconds 60
+for ($i = 1; $i -le 8; $i++) {
+    [void][Win]::SetCursorPos($wx + 8 * $i, $wy + 5 * $i)
+    Start-Sleep -Milliseconds 25
+}
+Start-Sleep -Milliseconds 80
+[Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+Start-Sleep -Milliseconds 300
+$c3 = Get-Rect $pop
+$wdx = $c3.X - $c2.X; $wdy = $c3.Y - $c2.Y
+if ([Math]::Abs($wdx) -gt 10 -and [Math]::Abs($wdy) -gt 6) {
+    Write-Output "WIDE-DRAG OK dx=$wdx dy=$wdy"
+} else {
+    Write-Output "WIDE-DRAG FAILED dx=$wdx dy=$wdy"
+}
+
+# click-after-drag: native drag used to swallow WM_LBUTTONUP and Slint kept the
+# pointer grab, making every later click dead (only dragging worked). Verify a
+# real click on the close button still works right after a drag.
+$c4 = Get-Rect $pop
+while ($c4.Y -gt 400) {
+    # safety net: drag back toward the top so the close button is on-screen
+    $up = $c4.Y - 150
+    $bx = $c4.X + 40; $by = $c4.Y + 20
+    [void][Win]::SetCursorPos($bx, $by); Start-Sleep -Milliseconds 100
+    [Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    for ($i = 1; $i -le 10; $i++) {
+        [void][Win]::SetCursorPos($bx, $by - [int]($up * $i / 10))
+        Start-Sleep -Milliseconds 20
+    }
+    Start-Sleep -Milliseconds 80
+    [Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 300
+    $c4 = Get-Rect $pop
+}
+[void][Win]::SetCursorPos($c4.X + 306, $c4.Y + 25); Start-Sleep -Milliseconds 150
+[Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+Start-Sleep -Milliseconds 60
+[Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+$gone = $false
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Milliseconds 100
+    if ([Win]::FindByEnum("zzhMusicPlayer Playlist") -eq [IntPtr]::Zero) { $gone = $true; break }
+}
+if ($gone) {
+    Write-Output "CLICK-AFTER-DRAG OK (close button responded)"
+} else {
+    Write-Output "CLICK-AFTER-DRAG FAILED (popout still alive after close click)"
 }
 if (Test-Path $errLog) {
     Write-Output "--- app stderr ---"

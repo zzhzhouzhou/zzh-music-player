@@ -410,19 +410,25 @@ pub fn particle_33ms(app: &App) {
     if is_about_open() != about {
         set_about_open(about);
     }
-    // 波形悬停时间提示：仅文本变化时写属性，避免逐帧重排。
+    // 波形悬停时间提示：输入（frac, duration）都没变就整段跳过——format!
+    // 是逐帧分配，性能预算禁止空转；仅输入变化时才格式化并写属性。
     let frac = transport.get_wave_hover_frac();
-    let tip = if frac >= 0.0 && transport.get_duration() > 0.0 {
-        slint::SharedString::from(format!(
-            "{} / {}",
-            format_time(frac * transport.get_duration()),
-            transport.get_duration_text()
-        ))
-    } else {
-        slint::SharedString::from("")
-    };
-    if tip != transport.get_tooltip_text() {
-        transport.set_tooltip_text(tip);
+    let duration = transport.get_duration();
+    let last = app.wave_tip_cache.get();
+    if frac != last.0 || duration != last.1 {
+        app.wave_tip_cache.set((frac, duration));
+        let tip = if frac >= 0.0 && duration > 0.0 {
+            slint::SharedString::from(format!(
+                "{} / {}",
+                format_time(frac * duration),
+                transport.get_duration_text()
+            ))
+        } else {
+            slint::SharedString::from("")
+        };
+        if tip != transport.get_tooltip_text() {
+            transport.set_tooltip_text(tip);
+        }
     }
     if transport.get_playing() {
         let t = transport.get_particle_time() + 0.033;
