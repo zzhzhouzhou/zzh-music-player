@@ -25,8 +25,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW,
     PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE,
-    WM_COPYDATA, WM_DROPFILES, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCLBUTTONDOWN,
+    WM_COPYDATA, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -446,6 +446,14 @@ pub(crate) fn setup_playlist_window(window: &slint::Window) {
     }
 }
 
+/// 弹窗是否处于原生拖动的模态循环中（WndProc 维护，泵据此让路——
+/// 主窗是自算拖动无模态循环，泵可以在主窗拖动中实时联动弹窗）。
+static POP_IN_SIZEMOVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn popout_dragging() -> bool {
+    POP_IN_SIZEMOVE.load(Ordering::Relaxed)
+}
+
 /// 播放列表独立窗口的窗口过程：拦 WM_CLOSE（转事件收回）与
 /// WM_EXITSIZEMOVE（补发指针释放），其余全部转发。
 unsafe extern "system" fn popout_wnd_proc(
@@ -461,7 +469,12 @@ unsafe extern "system" fn popout_wnd_proc(
             }
             0
         }
+        WM_ENTERSIZEMOVE => {
+            POP_IN_SIZEMOVE.store(true, Ordering::Relaxed);
+            unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
+        }
         WM_EXITSIZEMOVE => {
+            POP_IN_SIZEMOVE.store(false, Ordering::Relaxed);
             // 原生拖动的模态移动循环会吞掉 WM_LBUTTONUP：Slint 的 TouchArea
             // 停留在"按住"状态且指针抓取永不解除，之后窗口内所有点击都被
             // Slint 路由给这个 TouchArea——表现为"拖过之后弹窗内任何 UI

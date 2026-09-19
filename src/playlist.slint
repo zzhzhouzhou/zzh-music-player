@@ -170,6 +170,50 @@ export component PlaylistPanel inherits Rectangle {
         background: @linear-gradient(90deg, transparent 0%, #ffffff38 50%, transparent 100%);
     }
 
+    // —— 磁贴贴靠光效（仅弹窗形态）：朝向主窗的那条边亮起主题色辉光，
+    // 解绑后淡出。四条边各一根渐变条，由 snap-side（泵从 Rust 同步）选择。
+    // 抽屉形态永远 snap-side=0，不亮。
+    Rectangle {
+        visible: !root.docked;
+        x: 0px;
+        y: 10px;
+        width: 3px;
+        height: parent.height - 20px;
+        background: @linear-gradient(180deg, transparent 0%, TransportState.theme-color 50%, transparent 100%);
+        opacity: PlaylistState.snap-side == 1 ? 0.9 : 0.0;
+        animate opacity { duration: 250ms; easing: ease-in-out; }
+    }
+    Rectangle {
+        visible: !root.docked;
+        x: parent.width - 3px;
+        y: 10px;
+        width: 3px;
+        height: parent.height - 20px;
+        background: @linear-gradient(180deg, transparent 0%, TransportState.theme-color 50%, transparent 100%);
+        opacity: PlaylistState.snap-side == 2 ? 0.9 : 0.0;
+        animate opacity { duration: 250ms; easing: ease-in-out; }
+    }
+    Rectangle {
+        visible: !root.docked;
+        x: 10px;
+        y: 0px;
+        width: parent.width - 20px;
+        height: 3px;
+        background: @linear-gradient(90deg, transparent 0%, TransportState.theme-color 50%, transparent 100%);
+        opacity: PlaylistState.snap-side == 4 ? 0.9 : 0.0;
+        animate opacity { duration: 250ms; easing: ease-in-out; }
+    }
+    Rectangle {
+        visible: !root.docked;
+        x: 10px;
+        y: parent.height - 3px;
+        width: parent.width - 20px;
+        height: 3px;
+        background: @linear-gradient(90deg, transparent 0%, TransportState.theme-color 50%, transparent 100%);
+        opacity: PlaylistState.snap-side == 3 ? 0.9 : 0.0;
+        animate opacity { duration: 250ms; easing: ease-in-out; }
+    }
+
     // 顶部拖动把手装饰。
     Rectangle {
         x: (parent.width - 32px) / 2;
@@ -596,14 +640,13 @@ export component PlaylistDrawer inherits Rectangle {
         y: PlaylistState.playlist-open ? 0px : closed-y;
         width: parent.width;
         height: parent.height;
-        // 收起时整体隐藏：closed-y 锚定在不含停靠区的基础高度上（停靠开合
-        // 动画期间恒定，见 main.slint），展开/收拢动画照常，停靠动画不会
-        // 把收起的抽屉带着滑过新展开区域（"点模块按钮播放列表弹出来又滑
-        // 下去"的修复）；隐藏态不渲染，也省掉收起时的无谓绘制。
-        visible: PlaylistState.playlist-open;
-        // 缓入缓出（用户要求）：320ms ease-in-out 双向曲线，展开收拢都有
-        // 惯性感；收起瞬间的 visible 隐藏保留（停靠开合期间防抽屉扫过）。
-        animate y { duration: 320ms; easing: ease-in-out; }
+        // 收拢期间保持可见（closing 由 Rust 侧定时复位）：否则 visible
+        // 瞬时切断，收拢滑出动画根本播不出来（用户实测反馈）。收拢终点
+        // closed-y = root.height 在窗外，滑出后无可视残留；停靠开合期间
+        // 抽屉已完全关闭（closing=false、visible=false），不受影响。
+        visible: PlaylistState.playlist-open || PlaylistState.closing;
+        // 缓入缓出（用户要求，且缓入段再放慢）：380ms ease-in-out。
+        animate y { duration: 380ms; easing: ease-in-out; }
 
         panel := PlaylistPanel {
             width: 100%;

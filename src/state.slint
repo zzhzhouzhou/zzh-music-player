@@ -103,6 +103,13 @@ export global PlaylistState {
     in-out property <[PlaylistEntry]> playlist: [];
     in-out property <int> playlist-current: -1;
     in-out property <bool> playlist-open: false;
+    // 抽屉收拢动画窗口期：open 翻 false 后仍保持 visible 320ms，让收拢
+    // 滑出动画播完再真正隐藏（否则 visible 瞬时切断，看不到收拢动画）。
+    // 由 Rust 侧在关闭时置 true + 定时器复位。
+    in-out property <bool> closing: false;
+    // 弹窗磁贴贴靠方位（弹窗实例用，泵从 Rust 同步）：0=未贴靠 1=主窗右
+    // 2=主窗左 3=主窗下 4=主窗上。非 0 时面板朝向主窗的边缘亮辉光。
+    in-out property <int> snap-side: 0;
     in-out property <bool> search-open: false;
     in-out property <string> search-text: "";
     in-out property <float> reorder-from: -1.0;

@@ -220,6 +220,15 @@ fn register_playlist_callbacks(app: &Rc<App>) {
                     playlist_state.set_playlist_open(open);
                     set_playlist_open(open);
                     if !open {
+                        // 收拢动画窗口期：closing 保持抽屉可见 380ms，让
+                        // 缓入缓出的滑出动画播完再真正隐藏（定时复位）。
+                        playlist_state.set_closing(true);
+                        let weak = Rc::downgrade(&app);
+                        slint::Timer::single_shot(Duration::from_millis(400), move || {
+                            if let Some(app) = weak.upgrade() {
+                                app.ui.global::<PlaylistState>().set_closing(false);
+                            }
+                        });
                         // 收起抽屉时一并清掉搜索过滤，下次展开是完整列表。
                         playlist_state.set_search_open(false);
                         playlist_state.set_search_text(SharedString::default());
