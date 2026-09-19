@@ -26,8 +26,17 @@ jobs:
         run: |
           git remote add gitee git@gitee.com:zzhzhouzhou/zzh-music-player.git
 
-      # 4. 推送到 Gitee
+      # 4. 推送到 Gitee：Gitee 的 SSH 网关（ssh-pilot）偶发短时连接失败
+      #（实测出现过无输出 8 秒超时 exit 1，手动重跑即成功），这里加重试，
+      # 消除瞬时抖动造成的红叉。密钥被拒（认证错误）会立刻失败，不会
+      # 被循环吞掉成假绿——重试只对"连接类瞬断"有效。
       - name: Push to Gitee
         run: |
           ssh-keyscan -t ed25519 gitee.com >> ~/.ssh/known_hosts
-          git push gitee main --force
+          for i in 1 2 3; do
+            echo "gitee-push attempt $i"
+            if git push gitee main --force; then exit 0; fi
+            echo "push failed, retrying in 5s..."
+            sleep 5
+          done
+          exit 1
