@@ -84,17 +84,23 @@ $gap3 = $pr3.L - $mr3.R
 Write-Output ("3. dragged back: gap={0} dy={1} (expect ~{2} = re-snapped)" -f $gap3, ($pr3.T - $mr3.T), $gap0)
 
 # 4) move main via its title area drag -> popup must follow (real-time)
+# AND keep its size: the pump's SetWindowPos follow must never resize
+# (missing SWP_NOSIZE shrank the popup to 0x0 - window alive in taskbar
+# but invisible; regression guard for that exact bug).
+$w0 = $pr0.R - $pr0.L; $h0 = $pr0.B - $pr0.T
 Drag-From-To ($mr3.L + 360) ($mr3.T + 30) ($mr3.L + 360 - 120) ($mr3.T + 80)
 $mr4 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr4)
 $pr4 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr4)
 $follows = [Math]::Abs(($pr4.L - $mr4.R) - $gap3) -le 24 -and [Math]::Abs(($pr4.T - $mr4.T) - ($pr3.T - $mr3.T)) -le 24
-Write-Output ("4. main moved: popout follows = {0} (gap={1})" -f $follows, ($pr4.L - $mr4.R))
+$sizeOk = [Math]::Abs(($pr4.R - $pr4.L) - $w0) -le 4 -and [Math]::Abs(($pr4.B - $pr4.T) - $h0) -le 4
+Write-Output ("4. main moved: popout follows = {0}, size intact = {1} (gap={2} {3}x{4})" -f $follows, $sizeOk, ($pr4.L - $mr4.R), ($pr4.R - $pr4.L), ($pr4.B - $pr4.T))
 
 # 5) FAST fling of main (few large steps) -> must stay snapped
 Drag-From-To ($mr4.L + 360) ($mr4.T + 30) ($mr4.L + 360 + 500) ($mr4.T - 200)
 $mr5 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr5)
 $pr5 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr5)
 $fastOk = [Math]::Abs(($pr5.L - $mr5.R) - $gap3) -le 24 -and [Math]::Abs(($pr5.T - $mr5.T) - ($pr4.T - $mr4.T)) -le 24
-Write-Output ("5. FAST fling (500,-200): still snapped = {0} (gap={1} dy={2})" -f $fastOk, ($pr5.L - $mr5.R), ($pr5.T - $mr5.T))
+$sizeOk5 = [Math]::Abs(($pr5.R - $pr5.L) - $w0) -le 4 -and [Math]::Abs(($pr5.B - $pr5.T) - $h0) -le 4
+Write-Output ("5. FAST fling (500,-200): still snapped = {0}, size intact = {1} (gap={2} dy={3} {4}x{5})" -f $fastOk, $sizeOk5, ($pr5.L - $mr5.R), ($pr5.T - $mr5.T), ($pr5.R - $pr5.L), ($pr5.B - $pr5.T))
 
 Stop-Process -Id $p.Id -Force

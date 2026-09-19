@@ -23,11 +23,10 @@ use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW,
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MB_ICONWARNING, MB_OK,
-    MessageBoxW, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA,
-    WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCLBUTTONDOWN,
+    MessageBoxW, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -466,6 +465,8 @@ pub(crate) fn take_popout_dragged() -> bool {
 
 /// 供泵实时定位弹窗：绕过 Slint 的属性桥接，直接调 Win32 SetWindowPos，
 /// 同一消息循环内生效，主窗拖动中弹窗无一帧延迟地贴着跟。
+/// 必须带 SWP_NOSIZE：只移动不改尺寸——漏掉它会把 0,0 尺寸当真，
+/// 弹窗被缩成 0×0"消失"但窗口仍存活（任务栏两个窗口，实测踩坑）。
 pub(crate) fn set_popup_position_now(hwnd: isize, x: i32, y: i32) {
     unsafe {
         SetWindowPos(
@@ -475,7 +476,7 @@ pub(crate) fn set_popup_position_now(hwnd: isize, x: i32, y: i32) {
             y,
             0,
             0,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_FRAMECHANGED,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
 }
