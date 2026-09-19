@@ -16,6 +16,12 @@ export component PlaylistWindow inherits Window {
     title: "zzhMusicPlayer Playlist";
     width: 340px;
     height: 520px;
+    // 字体：**不要**在此声明 default-font-family: "HarmonyOS Sans SC"。
+    // femtovg 每窗口一个 GL 上下文 => 字形缓存按窗口实例独立；弹窗首帧要在
+    // 全新缓存里光栅化整张列表的 CJK 字形，实测随列表规模线性上涨
+    // （~100 首：弹出 3.8s、收回再 3.8s，UI 线程全程冻结——"弹出像死了一样"
+    // 的根因，scripts/popout_probe.ps1 实测；空列表同声明仅 652ms）。
+    // 弹窗沿用系统回退字体（瞬时打开）；主窗/抽屉（共享主窗上下文）用 HarmonyOS Sans。
 
     PlaylistPanel {
         width: 100%;

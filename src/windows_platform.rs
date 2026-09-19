@@ -16,13 +16,15 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, ReleaseCapture, VK_LBUTTON,
+};
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetWindowLongPtrW, HTCAPTION,
-    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, SW_RESTORE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
+    HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW, PostMessageW, SW_RESTORE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA, WM_DROPFILES, WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -399,16 +401,26 @@ pub(crate) fn setup_drag_drop(window: &slint::Window) {
 }
 
 /// 进入系统原生窗口拖动（无边框窗口的标准做法）：释放鼠标捕获后向本窗口
-/// 发送 WM_NCLBUTTONDOWN/HTCAPTION，由 OS 模态循环接管拖动直至松开按键。
+/// 投递 WM_NCLBUTTONDOWN/HTCAPTION，由 OS 模态移动循环接管拖动直至松开按键。
 /// 不自己用 GetCursorPos 增量算位置——系统光标读数与 Slint 的坐标空间在
 /// 混合 DPI / 远程会话下存在漂移偏移，自算会让窗口跑离光标导致拖动中断。
+/// 两个防御（弹窗"假死"问题的修复点）：
+/// 1. 仅在左键确实按住时进入——右键/合成事件误触发会让模态循环等不到
+///    左键释放，UI 线程被无限卡死；
+/// 2. 用 PostMessage 而非 SendMessage——模态循环从消息泵顶层启动，
+///    不在 Slint 回调栈内嵌套分发消息（winit/Slint 不保证可重入）。
 pub(crate) fn begin_native_drag(window: &slint::Window) {
     let Some(hwnd) = hwnd_from_window(window) else {
         return;
     };
     unsafe {
+        if GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000 == 0 {
+            eprintln!("[pop-drag] skip: left button not held");
+            return;
+        }
+        eprintln!("[pop-drag] post NCLBUTTONDOWN");
         ReleaseCapture();
-        SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        PostMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
     }
 }
 
@@ -433,6 +445,7 @@ pub(crate) fn setup_playlist_window(window: &slint::Window) {
 }
 
 /// 播放列表独立窗口的窗口过程：只拦 WM_CLOSE，其余全部转发。
+/// （临时诊断：WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE 打点定位拖动卡死。）
 unsafe extern "system" fn popout_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -445,6 +458,14 @@ unsafe extern "system" fn popout_wnd_proc(
                 let _ = tx.send(FileEvent::PlaylistWindowClose);
             }
             0
+        }
+        0x0231 => {
+            eprintln!("[pop-drag] enter sizemove");
+            unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
+        }
+        0x0232 => {
+            eprintln!("[pop-drag] exit sizemove");
+            unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
         }
         _ => unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) },
     }

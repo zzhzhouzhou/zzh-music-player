@@ -45,6 +45,17 @@ cargo build --release       # 产物 target\release\zzhmusicplayer.exe
 `ZZH_OPEN_POPOUT=1` 启动直达对应界面；`ZZH_VERSION_OVERRIDE=x.y.z` 伪装版本号
 （验证更新流程用）。
 
+GUI 回归探针（PowerShell，ASCII-only，SendInput 驱动 + SendMessageTimeout
+存活检测；点击前必须 SetForegroundWindow + 中性位置激活点击，非前台窗口的
+首次点击可能只激活不投递）：
+- `scripts/drag_probe.ps1 [exe]` — 启动直达弹窗，30 轮原生拖拽压力 + 每轮
+  存活检测 + 末尾拖拽位移验证；压测中 `[pop-drag] skip` 表示守卫拦下误触发。
+- `scripts/popout_probe.ps1 [empty]` — 真实路径（抽屉→⤴→弹窗）弹出/收回/
+  再弹出计时；`empty` 参数用干净 APPDATA 隔离字形量成本。
+- `scripts/dock_probe.ps1` — 模块按钮开停靠区，采样窗口高度渐变验证动画。
+- `scripts/liveness_probe.ps1` — 启动响应时间曲线（首次响应毫秒数）。
+- `scripts/sweep_probe.ps1` — 沿 x 扫掠 + 日志断言，定位控件真实坐标。
+
 发布流程：`Cargo.toml` 版本 → `installer.iss` AppVersion → git tag **三处同步**，
 ISCC 打包 → `gh release create vX.Y.Z zzhMusicPlayer_Setup.exe`（走代理）→ 静默覆盖
 升级本机 `D:\zzh-music-player`。**禁止在没有用户确认时推送或发版。**
@@ -128,15 +139,39 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   PipelineSource 时踩过，已有回归测试 `pipeline_forwards_seek_to_inner`）。
 - Slint 全局单例**按组件实例隔离**（每个导出组件实例一套全局）——多窗口之间
   属性不互通，跨窗口状态必须 Rust 侧桥接（见"播放列表独立弹窗"设计）。
-- Slint 窗口 height 加动画：伸展期间依赖 `height - X` 定位的元素会出现
-  "先瞬移再滑回"的布局瞬态——窗口尺寸变化一律瞬时生效。
-- PowerShell 5.1 下对 check.ps1 / cargo 外层加 `2>&1` 会把 stderr 进度行变成
-  错误记录导致脚本误报失败——直接原样运行 `./scripts/check.ps1`。
+- Slint 窗口 height 直接加动画会产生"先瞬移再滑回"的布局瞬态（依赖
+  `height - X` 定位的元素会瞬移出窗）。**安全模式是共享镜像动画**（停靠区
+  开合的现行做法）：`property <length> dock-h: open ? mh : 0px; animate dock-h`
+  然后 `height = base + dock-h`、`bar-y = height - 46 - dock-h`——所有依赖项
+  共用同一动画值，差值在逐帧动画期间数学恒定，主控条纹丝不动；容器 clip +
+  内部内容尺寸引用 module-height（不压缩，幕布式揭开）。探针
+  `scripts/dock_probe.ps1` 可采样中间高度验证渐变。
 - **次级窗口拖动必须走系统原生拖动**（`begin_native_drag`：ReleaseCapture +
   `WM_NCLBUTTONDOWN`/HTCAPTION），不要用 GetCursorPos 增量自算位置——混合 DPI /
   远程会话下系统光标读数与 Slint 坐标空间存在漂移偏移，自算会让窗口跑离光标、
   拖动数帧后中断（主窗口全窗 TouchArea 因窗口 1:1 跟随光标而未暴露此问题）。
   弹窗拖拽可用 `scripts/drag_probe.ps1` 做回归验证。
+- **原生拖动两个防御缺一不可**（"弹窗偶尔假死"的根因，30 轮压测实测拦到
+  2 次误触发）：① `GetAsyncKeyState(VK_LBUTTON)` 确认左键确实按住才进入——
+  右键/合成双击事件误触发时模态移动循环等不到左键释放，UI 线程无限卡死；
+  ② 用 `PostMessageW` 而非 `SendMessageW`——模态循环从消息泵顶层启动，
+  不在 Slint 回调栈内嵌套分发消息（winit/Slint 不保证可重入）。
+- **Slint 事件循环对"显示中"的窗口持强引用**：关闭次级窗口必须先
+  `pw.hide()` 再 drop，否则留下幽灵窗口——仍可见但脱离管理（✕ 只会去开
+  抽屉、Alt+F4 落在空引用上），即"弹窗像死了一样无法关闭"。探针
+  `scripts/popout_probe.ps1` 实测：drop 前无 hide 时收回后窗口存活 >10s。
+- **femtovg 每窗口一个 GL 上下文 => 字形缓存按窗口实例独立**：次级窗口声明
+  大字符集字体（HarmonyOS Sans SC）会在每次窗口创建+销毁时于 UI 线程光栅化
+  整张列表的 CJK 字形，~100 首实测弹出 3.8s + 收回再 3.8s 全程冻结（空列表仅
+  652ms，随列表规模线性）。因此弹窗（`playlist_window.slint`）**不声明**
+  `default-font-family`（系统回退字体，瞬时打开）；主窗/抽屉共享主窗上下文，
+  用 HarmonyOS Sans SC（标题 font-weight 500 = Medium）。字体一致性若将来
+  必须，可考虑持久化弹窗实例（hide/show 代替即建即毁）——接受内存代价。
+- **UI 线程看门狗**（pumps.rs `spawn_ui_watchdog` + `PUMP_TICK`）：33ms 泵
+  心跳停止 >1s 即输出 `[watchdog]` 诊断，是排查"假死"类问题的第一现场；
+  后台线程零锁零分配，勿在泵内加锁。
+- 关键生命周期日志带 ASCII 尾标（`playlist-opened` / `playlist-closed`），
+  GBK 控制台下可直接 grep——GUI 自动化探针靠它断言状态。
 
 ## 模块化路线图（最终目标 = C）
 
@@ -150,9 +185,10 @@ UIState 大杂烩拆为三个 global；抽屉/关于抽成独立组件；模块�
 
 **阶段 A（基建已完成）：同窗停靠**
 `DockState` 全局 + 主控条最左端"模块"按钮开关停靠区；停靠区固定在主窗口底部
-（窗口高度由 Slint 的 root.height 绑定按 DockState 直接管理，瞬时生效无动画，
-避免主控条布局瞬态）；`test_panel.slint` 的测试面板 A/B 验证滑条与点击交互
-（无实际功能）。新模块接入步骤：实现面板组件 → 在停靠区注册标签与 variant。
+（开合为 240ms 幕布式平滑动画：动画驱动源是 `dock-h` 共享镜像，窗口高度与
+主控条 y 共用同一动画值，差值恒定无布局瞬态，见坑列表）；`test_panel.slint`
+的测试面板 A/B 验证滑条与点击交互（无实际功能）。新模块接入步骤：实现面板
+组件 → 在停靠区注册标签与 variant。
 
 **阶段 C（首落地）：混合弹出**
 播放列表已可弹出为独立无边框窗口（弹出/收回切换 + 位置记忆 + 亚克力/圆角 +

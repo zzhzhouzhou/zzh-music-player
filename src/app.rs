@@ -13,7 +13,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::audio_engine::{AudioEngine, Command, EqSettings, PlaybackMode};
 use crate::events::{self, FileEvent, UpdateEvent};
 use crate::playlist::{PlaylistView, add_track, play_file_now};
-use crate::pumps::{particle_33ms, pump_events};
+use crate::pumps::{particle_33ms, pump_events, spawn_ui_watchdog};
 use crate::settings::{load_settings, save_settings};
 use crate::transport::{SeekState, ThemeTween};
 use crate::ui_callbacks::{register_callbacks, register_playlist_window_callbacks};
@@ -141,7 +141,7 @@ pub(crate) fn open_playlist_window(app: &Rc<App>) {
     }
     app.playlist_window.borrow_mut().replace(pw);
     app.ui.global::<PlaylistState>().set_popped(true);
-    eprintln!("[sys] 播放列表已弹出为独立窗口");
+    eprintln!("[sys] 播放列表已弹出为独立窗口 playlist-opened");
 }
 
 /// 关闭播放列表独立窗口（幂等）：记录位置（供会话内重开与退出持久化）、
@@ -156,7 +156,12 @@ pub(crate) fn close_playlist_window(app: &App) -> Option<(i32, i32)> {
         .borrow_mut()
         .set_filter("", &app.playlist.borrow());
     app.ui.global::<PlaylistState>().set_popped(false);
-    eprintln!("[sys] 播放列表独立窗口已收回");
+    eprintln!("[sys] 播放列表独立窗口已收回 playlist-closed");
+    // Slint 事件循环对“显示中”的窗口持强引用：不先 hide() 直接 drop 会留下
+    // 幽灵窗口——仍然可见但脱离管理，点 ✕ 只会去开抽屉、Alt+F4 落在空引用上
+    // （“弹窗像死了一样、无法关闭”的根因之一）。hide 后事件循环解除持有，
+    // 下一行的 drop 才会真正销毁窗口并同步释放全部 UI 资源。
+    let _ = pw.hide();
     Some((pos.x, pos.y)) // pw 在此 drop：窗口与全部 UI 资源同步释放
 }
 
@@ -343,6 +348,8 @@ pub fn run() {
             },
         );
     }
+    // UI 线程看门狗：事件循环停滞时输出诊断（后台线程，不干扰 UI）。
+    spawn_ui_watchdog();
 
     // —— 回调接线（按领域分组，见 ui_callbacks）——
     register_callbacks(&app);

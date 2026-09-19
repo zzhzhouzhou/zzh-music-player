@@ -14,7 +14,15 @@ public class Win {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, UIntPtr wp, IntPtr lp, uint flags, uint timeout, out UIntPtr result);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+
+    // liveness probe: returns true if the window's UI thread responds within 3s
+    public static bool IsAlive(IntPtr h) {
+        UIntPtr res;
+        IntPtr ok = SendMessageTimeoutW(h, 0, UIntPtr.Zero, IntPtr.Zero, 1, 3000, out res); // SMTO_BLOCK=1, WM_NULL=0
+        return ok != IntPtr.Zero;
+    }
 
     public static string ListWindows(uint target) {
         var sb = new StringBuilder();
@@ -81,20 +89,49 @@ if ($pop -eq [IntPtr]::Zero) {
 $r0 = Get-Rect $pop
 Write-Output ("BEFORE: {0},{1}" -f $r0.X, $r0.Y)
 [void][Win]::SetForegroundWindow($pop)
-Start-Sleep -Milliseconds 300
 
-# real drag on title strip (40,20) -> (+120,+80), 20 steps
-$sx = $r0.X + 40; $sy = $r0.Y + 20
-[void][Win]::SetCursorPos($sx, $sy); Start-Sleep -Milliseconds 150
-[Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)  # LEFTDOWN
-Start-Sleep -Milliseconds 80
-for ($i = 1; $i -le 20; $i++) {
-    [void][Win]::SetCursorPos($sx + [int](120 * $i / 20), $sy + [int](80 * $i / 20))
-    Start-Sleep -Milliseconds 30
+# wait until the app actually responds before stressing (startup can take seconds)
+$alive = $false
+foreach ($i in 1..20) {
+    if ([Win]::IsAlive($pop)) { $alive = $true; break }
+    Start-Sleep -Milliseconds 500
 }
-Start-Sleep -Milliseconds 120
-[Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)  # LEFTUP
-Start-Sleep -Milliseconds 400
+if (-not $alive) {
+    Write-Output "APP UNRESPONSIVE AT STARTUP (>10s) - aborting stress"
+    Get-Content $errLog -ErrorAction SilentlyContinue
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    exit 1
+}
+Write-Output "app responsive, starting stress"
+
+# stress: repeated native drags on the title strip, liveness check after each round
+$hangAt = -1
+foreach ($round in 1..30) {
+    # re-anchor each round: keep the window on screen and the cursor on the title strip
+    $cur = Get-Rect $pop
+    if ($cur.X -lt 100 -or $cur.Y -lt 0 -or $cur.X -gt 1400) {
+        $cur = @{ X = 500; Y = 100 }   # walked offscreen: reset by dragging from wherever it is
+    }
+    $baseX = [Math]::Min([Math]::Max($cur.X + 40, 60), 1600)
+    $baseY = [Math]::Min([Math]::Max($cur.Y + 20, 30), 800)
+    $dir = if ($round % 2 -eq 0) { 1 } else { -1 }
+    [void][Win]::SetCursorPos($baseX, $baseY); Start-Sleep -Milliseconds 80
+    [Win]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)  # LEFTDOWN
+    Start-Sleep -Milliseconds 60
+    for ($i = 1; $i -le 10; $i++) {
+        [void][Win]::SetCursorPos($baseX + $dir * [int](6 * $i), $baseY + [int](4 * $i))
+        Start-Sleep -Milliseconds 20
+    }
+    Start-Sleep -Milliseconds 80
+    [Win]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)  # LEFTUP
+    Start-Sleep -Milliseconds 120
+    if (-not [Win]::IsAlive($pop)) {
+        Write-Output ("HANG DETECTED at round {0} (UI thread unresponsive >3s)" -f $round)
+        $hangAt = $round
+        break
+    }
+}
+if ($hangAt -lt 0) { Write-Output "STRESS OK: 30 rounds, UI thread responsive after each" }
 
 $r1 = Get-Rect $pop
 Write-Output ("AFTER: {0},{1}" -f $r1.X, $r1.Y)

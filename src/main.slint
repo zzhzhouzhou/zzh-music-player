@@ -217,7 +217,7 @@ component WaveformArea inherits Rectangle {
             height: 100%;
             text: TransportState.tooltip-text;
             font-size: 11px;
-            font-weight: 600;
+            font-weight: 500;
             color: #ffffff;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -253,11 +253,14 @@ export component MainWindow inherits Window {
     background: transparent;
     title: "zzhMusicPlayer";
     width: 720px;
-    // 停靠区打开时窗口向下伸展（Slint 绑定直接管理高度）。
-    // 不要给 height 加动画：伸展期间 root.height 逐帧滞后于 module-height，
-    // 依赖“height - module-height”定位的主控条会先瞬移出窗再滑回（布局瞬态）。
-    // 窗口瞬时变高、主控内容纹丝不动，停靠区直接出现在新增的底部区域。
-    height: 178px + (DockState.open ? DockState.module-height : 0px);
+    // 停靠区开合平滑（幕布式）：动画驱动源是 dock-h 镜像，而非直接动画 height。
+    // 窗口高度 = 178 + dock-h、主控条 y = height - 46 - dock-h——两式共用同一
+    // 动画值，差值在逐帧动画期间数学恒定，主控条纹丝不动、无布局瞬态；
+    // 停靠容器 y = height - dock-h 同样恒定，内容锚定顶部被 clip 逐帧揭开。
+    // 亚克力背板随窗口逐帧生长，不再整窗瞬跳/闪烁。
+    property <length> dock-h: DockState.open ? DockState.module-height : 0px;
+    animate dock-h { duration: 240ms; easing: ease-out; }
+    height: 178px + dock-h;
     default-font-family: "HarmonyOS Sans SC";
 
     // 全局快捷键：空格 播放/暂停，左右方向键 快退/快进 5 秒，
@@ -306,10 +309,9 @@ export component MainWindow inherits Window {
 
     // 底部控制胶囊几何（Rust 侧工具栏悬停检测依赖同一布局，改动需同步 main.rs）。
     property <length> bar-x: (root.width - 330px) / 2;
-    // 主控条固定在主区域底部：停靠区打开时窗口向下伸展，主控条位置不变
-    //（伸展前后的 height - module-height 相同），无动画亦无瞬态。
-    property <length> bar-y: root.height - 46px
-        - (DockState.open ? DockState.module-height : 0px);
+    // 主控条固定在主区域底部：y = height - 46 - dock-h，与 height 共用同一
+    // 动画镜像（dock-h），开合动画期间差值恒等于基准高度 - 46，位置稳定。
+    property <length> bar-y: root.height - 46px - dock-h;
 
     // 最底层：空白区域拖动窗口（含双击打开文件检测）。
     TouchArea {
@@ -416,7 +418,7 @@ export component MainWindow inherits Window {
             height: 22px;
             text: TransportState.track-title;
             font-size: 15px;
-            font-weight: 600;
+            font-weight: 500;
             color: #f2f4f8;
             horizontal-alignment: left;
             vertical-alignment: center;
@@ -703,20 +705,22 @@ export component MainWindow inherits Window {
         }
 
         // 停靠区（阶段 A）：模块面板停靠在主窗口底部，主控条在其上方。
-        // 窗口高度由上方 root.height 绑定按 DockState 直接管理（瞬时生效）。
+        // 收起动画期间保持可见（dock-h 回落到 0 才隐藏），随窗口底缘幕布式
+        // 收起；clip 遮住溢出，内部内容尺寸固定（引用 module-height）不压缩。
         Rectangle {
-            visible: DockState.open;
+            visible: dock-h > 0px;
+            clip: true;
             x: 0px;
-            y: root.height - DockState.module-height;
+            y: root.height - dock-h;
             width: root.width;
-            height: DockState.module-height;
+            height: dock-h;
 
-            // 面板玻璃底。
+            // 面板玻璃底（尺寸固定，动画中只被容器裁切，不发生压缩形变）。
             Rectangle {
                 x: 8px;
                 y: 4px;
                 width: parent.width - 16px;
-                height: parent.height - 10px;
+                height: DockState.module-height - 10px;
                 border-radius: 12px;
                 background: #0f131bd9;
                 border-width: 1px;
@@ -766,12 +770,12 @@ export component MainWindow inherits Window {
                 clicked => { DockState.open = false; }
             }
 
-            // 模块内容。
+            // 模块内容（高度引用 module-height：动画中保持固有尺寸）。
             TestPanel {
                 x: 12px;
                 y: 32px;
                 width: parent.width - 24px;
-                height: parent.height - 38px;
+                height: DockState.module-height - 38px;
                 variant: DockState.active;
             }
         }

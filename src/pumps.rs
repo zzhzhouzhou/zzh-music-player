@@ -376,7 +376,30 @@ fn drain_updates(app: &App, about_state: &AboutState) {
 
 /// 33ms 泵：粒子时钟、关于开关同步、波形悬停提示、工具栏悬停与
 /// 拖拽排序的浮块跟随 / 边缘自动滚动 / 悬停清理。
+/// UI 线程心跳计数：33ms 泵每次推进 +1。看门狗后台线程据此判断
+/// 事件循环是否停滞（弹窗"假死"类问题的现场证据采集点）。
+static PUMP_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// UI 线程看门狗：心跳停止推进超过 1 秒时输出诊断日志并周期性提醒。
+/// 后台线程零锁零分配，不干扰事件循环；正常时完全静默。
+pub fn spawn_ui_watchdog() {
+    let _ = std::thread::Builder::new()
+        .name("ui-watchdog".to_string())
+        .spawn(|| {
+            let mut last = PUMP_TICK.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let now = PUMP_TICK.load(std::sync::atomic::Ordering::Relaxed);
+                if now == last {
+                    eprintln!("[watchdog] UI 线程心跳停止（>1s），事件循环疑似阻塞");
+                }
+                last = now;
+            }
+        });
+}
+
 pub fn particle_33ms(app: &App) {
+    PUMP_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let ui = &app.ui;
     let transport = ui.global::<TransportState>();
     let playlist_state = ui.global::<PlaylistState>();
