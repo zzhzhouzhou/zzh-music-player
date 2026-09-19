@@ -21,7 +21,7 @@ use crate::waveform::{apply_waveform, cache_insert, prefetch_next_track};
 use crate::waveform_cache::read_wave_cache;
 use crate::windows_platform::{
     cursor_position, is_about_open, left_button_down, popout_dragging, set_about_open,
-    window_rect_px,
+    set_popup_position_now, take_popout_dragged, window_rect_px, window_rect_px_hwnd,
 };
 use crate::{AboutState, PlaylistState, TransportState, UpdateState};
 
@@ -494,24 +494,26 @@ pub fn particle_33ms(app: &App) {
     sync_popout_snap(app);
 }
 
-/// 磁贴（snap）联动：贴靠中的弹窗每拍对齐主窗——主窗是自算拖动（无
-/// 模态循环），泵在主窗拖动中照常 tick，因此弹窗**实时**跟随主窗移动，
-/// 而不是等主窗停下再归位。拖离贴靠位超阈值解绑；未贴靠时拖回主窗
-/// 四边贴靠带（右/左/下/上）自动吸上。弹窗自己的原生拖动是模态循环
-/// （popout_dragging），泵不能抢窗口位置，整段让路。每拍成本：两次
-/// GetWindowRect + 一次比较，可忽略。
+/// 磁贴（snap）联动：贴靠中的弹窗**实时**跟随主窗位移——跟随写用 Win32
+/// SetWindowPos（windows_platform::set_popup_position_now）绕过 Slint 属性
+/// 桥接，与主窗拖动在同一消息循环内生效，无一帧延迟（用户反馈"不跟手"的
+/// 根因是 Slint set_position 异步生效，快速拖动时弹窗落后越拉越大）。
+/// 拖弹窗离贴靠位超阈值解绑（只认 POP_DRAGGED 锁存标志，跟随期的瞬时
+/// 误差不解绑）；未贴靠时拖回主窗四边贴靠带（右/左/下/上）自动吸上。
+/// 弹窗自己的原生拖动是模态循环（popout_dragging），泵整段让路。
 fn sync_popout_snap(app: &App) {
-    if left_button_down() && popout_dragging() {
-        return; // 弹窗正在被原生拖动（模态循环），松手后的下一拍再判定
-    }
-    let guard = app.playlist_window.borrow();
-    let Some(pw) = guard.as_ref() else {
-        return;
+    let Some(hwnd) = app.popup_hwnd.get() else {
+        return; // 弹窗未打开（纯读跳过，零成本）
     };
+    if left_button_down() && popout_dragging() {
+        return; // 弹窗正在被原生拖动（模态循环），标志保留待松手后判定
+    }
     let Some((ml, mt, mr, mb)) = window_rect_px(app.ui.window()) else {
         return;
     };
-    let Some((pl, pt, pr, pb)) = window_rect_px(pw.window()) else {
+    let Some((pl, pt, pr, pb)) = window_rect_px_hwnd(hwnd) else {
+        // 句柄失效（窗口已销毁而缓存未清）：复位，本拍不动作。
+        app.popup_hwnd.set(None);
         return;
     };
     const RELEASE: i32 = 48; // 拖弹窗离贴靠位超过此距离解绑
@@ -521,18 +523,19 @@ fn sync_popout_snap(app: &App) {
         let (ox, oy) = app.pop_snap_off.get();
         let (dx, dy) = (pl - (ml + ox), pt - (mt + oy));
         if dx != 0 || dy != 0 {
-            if dx.abs() > RELEASE || dy.abs() > RELEASE {
-                // 弹窗被拖离贴靠位：解绑（光效随之熄灭）。
+            // 解绑只认"弹窗确实被原生拖过"（WndProc 锁存、本拍取走）：
+            // 快速拖主窗时弹窗瞬时落后超过 RELEASE 是正常现象，绝不能解绑。
+            let pop_dragged = take_popout_dragged();
+            if pop_dragged && (dx.abs() > RELEASE || dy.abs() > RELEASE) {
                 app.pop_snap.set(false);
                 side = 0;
             } else {
-                // 主窗动了：贴着跟过去（拖动中每拍对齐 = 实时联动）。
-                pw.window()
-                    .set_position(slint::PhysicalPosition::new(ml + ox, mt + oy));
+                // 主窗拖动中：直接 SetWindowPos，同一消息循环内生效。
+                set_popup_position_now(hwnd, ml + ox, mt + oy);
             }
         }
     } else {
-        // 未贴靠：弹窗落在主窗任一边的贴靠带内（且与该边有重叠投影）则吸上。
+        // 未贴靠：弹窗落在主窗任一边的贴靠带内（且与该边有投影重叠）则吸上。
         let v_overlap = pt < mb && pb > mt;
         let h_overlap = pl < mr && pr > ml;
         let near_right = (pl - (mr + 8)).abs() <= MAGNET && v_overlap;
@@ -558,7 +561,9 @@ fn sync_popout_snap(app: &App) {
     if side != app.pop_snap_side.get() {
         app.pop_snap_side.set(side);
         // 光效提示：贴靠方位同步给弹窗自己的全局实例（边缘亮起主题色辉光）。
-        pw.global::<PlaylistState>().set_snap_side(side as i32);
+        if let Some(pw) = app.playlist_window.borrow().as_ref() {
+            pw.global::<PlaylistState>().set_snap_side(side as i32);
+        }
     }
 }
 

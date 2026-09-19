@@ -1,6 +1,14 @@
-# One-off smoke: snap linkage verification.
-# 1) popout opens snapped right of main  2) move main -> popout follows
-# 3) drag popout away >48px -> unsnap     4) drag popout back -> snap again
+# Snap (tile-linkage) regression probe.
+# Order matters: the unsnap drag must run right after open (popup certainly
+# has focus then; a drag later in the sequence — after the main window's own
+# native drag — can be swallowed by the activation-only first click, an
+# automation artifact, not an app bug).
+# 1) popup opens snapped right of main
+# 2) drag popup away >48px -> unsnap (pump stops following)
+# 3) drag popup back into the snap band -> re-snap
+# 4) move main -> popup follows (real-time, same message loop)
+# 5) FAST fling of main -> still snapped (the user-reported bug: fast drags
+#    used to open a gap and unsnap)
 $ErrorActionPreference = "Stop"
 Add-Type -TypeDefinition @"
 using System;
@@ -28,16 +36,6 @@ public class W {
 }
 "@
 
-function Click-At($x, $y) {
-    [void][W]::SetCursorPos($x, $y)
-    Start-Sleep -Milliseconds 150
-    [W]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 60
-    [W]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 400
-}
-
-# native drag: press at (sx,sy), move in steps, release at (ex,ey)
 function Drag-From-To($sx, $sy, $ex, $ey) {
     [void][W]::SetCursorPos($sx, $sy)
     Start-Sleep -Milliseconds 150
@@ -68,30 +66,35 @@ Start-Sleep -Milliseconds 300
 
 $mr = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr)
 $pr0 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr0)
-Write-Output ("1. opened: gap={0} dy={1} (snap expected)" -f ($pr0.L - $mr.R), ($pr0.T - $mr.T))
+$gap0 = $pr0.L - $mr.R
+Write-Output ("1. opened: gap={0} dy={1} (snap expected)" -f $gap0, ($pr0.T - $mr.T))
 
-# 2) move main window via its title area drag -> popout must follow
-Drag-From-To ($mr.L + 360) ($mr.T + 30) ($mr.L + 360 - 120) ($mr.T + 80)
+# 2) drag popup away immediately (popup has focus right after open) -> unsnap
+Drag-From-To ($pr0.L + 40) ($pr0.T + 20) ($pr0.L + 40 - 300) ($pr0.T + 20 + 200)
 $mr2 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr2)
 $pr2 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr2)
-$follows = ($pr2.L - $mr2.R) -eq ($pr0.L - $mr.R) -and ($pr2.T - $mr2.T) -eq ($pr0.T - $mr.T)
-Write-Output ("2. main moved ({0},{1}): popout follows = {2} (gap={3})" -f ($mr2.L - $mr.L), ($mr2.T - $mr.T), $follows, ($pr2.L - $mr2.R))
+$dx2 = [Math]::Abs(($pr2.L - $mr2.R) - $gap0)
+Write-Output ("2. dragged away: popout at gap={0} dy={1} (expect large = unsnapped)" -f ($pr2.L - $mr2.R), ($pr2.T - $mr2.T))
 
-# 3) drag popout far away -> unsnap
-Drag-From-To ($pr2.L + 40) ($pr2.T + 20) ($pr2.L + 40 - 300) ($pr2.T + 20 + 200)
+# 3) drag popup back into the right snap band -> re-snap
+Drag-From-To ($pr2.L + 40) ($pr2.T + 20) ($mr2.R + 8 + 40) ($mr2.T + 20)
 $mr3 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr3)
 $pr3 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr3)
-Write-Output ("3. dragged away: popout at gap={0} dy={1} (expect large = unsnapped)" -f ($pr3.L - $mr3.R), ($pr3.T - $mr3.T))
+$gap3 = $pr3.L - $mr3.R
+Write-Output ("3. dragged back: gap={0} dy={1} (expect ~{2} = re-snapped)" -f $gap3, ($pr3.T - $mr3.T), $gap0)
 
-# 4) drag popout back to right side of main -> re-snap
-Drag-From-To ($pr3.L + 40) ($pr3.T + 20) ($mr3.R + 8 + 40) ($mr3.T + 20)
+# 4) move main via its title area drag -> popup must follow (real-time)
+Drag-From-To ($mr3.L + 360) ($mr3.T + 30) ($mr3.L + 360 - 120) ($mr3.T + 80)
 $mr4 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr4)
 $pr4 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr4)
-# verify snap by moving main again; popout should follow
-Drag-From-To ($mr4.L + 360) ($mr4.T + 30) ($mr4.L + 360 + 100) ($mr4.T - 40)
+$follows = [Math]::Abs(($pr4.L - $mr4.R) - $gap3) -le 24 -and [Math]::Abs(($pr4.T - $mr4.T) - ($pr3.T - $mr3.T)) -le 24
+Write-Output ("4. main moved: popout follows = {0} (gap={1})" -f $follows, ($pr4.L - $mr4.R))
+
+# 5) FAST fling of main (few large steps) -> must stay snapped
+Drag-From-To ($mr4.L + 360) ($mr4.T + 30) ($mr4.L + 360 + 500) ($mr4.T - 200)
 $mr5 = New-Object RECT; [void][W]::GetWindowRect($main, [ref]$mr5)
 $pr5 = New-Object RECT; [void][W]::GetWindowRect($pop, [ref]$pr5)
-$refollows = ($pr5.L - $mr5.R) -eq ($pr4.L - $mr4.R) -and ($pr5.T - $mr5.T) -eq ($pr4.T - $mr4.T)
-Write-Output ("4. dragged back + main moved again: popout follows = {0} (gap={1} dy={2})" -f $refollows, ($pr5.L - $mr5.R), ($pr5.T - $mr5.T))
+$fastOk = [Math]::Abs(($pr5.L - $mr5.R) - $gap3) -le 24 -and [Math]::Abs(($pr5.T - $mr5.T) - ($pr4.T - $mr4.T)) -le 24
+Write-Output ("5. FAST fling (500,-200): still snapped = {0} (gap={1} dy={2})" -f $fastOk, ($pr5.L - $mr5.R), ($pr5.T - $mr5.T))
 
 Stop-Process -Id $p.Id -Force

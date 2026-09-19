@@ -187,10 +187,20 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   能不挂就不挂；确要挂则用短补间（≤150ms）并确认代价只发生在交互/播放期，
   禁止在纯空闲路径引入常驻动画。
   探针方法：TotalProcessorTime 双采样 + SLINT_DEBUG_PERFORMANCE=refresh_lazy,console 真实 fps。
-- **弹窗磁贴联动（snap）**：贴靠态在 33ms 泵里每拍 `GetWindowRect` 对齐
-  主窗（主窗动 → 弹窗跟随），拖离 >48px 解绑、拖回主窗左右 24px 贴靠带
-  吸上；左键按住期间整段跳过（原生拖动是模态循环，泵不能抢窗口位置）。
-  状态在 `App.pop_snap / pop_snap_off`，弹出默认贴靠右侧。
+- **弹窗磁贴联动（snap）**：贴靠态在 33ms 泵里跟随主窗——跟随写用 Win32
+  `SetWindowPos`（`windows_platform::set_popup_position_now`）**绕过 Slint
+  属性桥接**：Slint 的 `set_position` 异步生效，快速拖主窗时弹窗落后越拉
+  越大（用户实测"不跟手"的根因）；SetWindowPos 与主窗拖动在同一消息循环
+  内生效，实时贴住。弹窗 HWND 在弹出时缓存进 `App.popup_hwnd`，泵跳过
+  Slint 组件借用直接读 Win32 矩形。**解绑判定只认"弹窗确实被原生拖过"**
+  （WndProc `WM_ENTERSIZEMOVE/EXITSIZEMOVE` 置 `POP_DRAGGED` 锁存标志、
+  泵 `take_popout_dragged()` 取走即清）——跟随期 `set_position` 异步造成
+  的瞬时误差绝不能触发解绑。拖离 >48px 解绑、拖回主窗四边 28px 贴靠带
+  （要求投影重叠）吸上；弹窗自己的原生拖动（模态循环）泵整段让路。
+  弹出默认贴靠 + 显式推送一次 `snap-side` 给弹窗实例（泵只在变化时同步，
+  不推送则光效永远不亮）。探针 `scripts/snap_probe.ps1`（注意：解绑段
+  必须放在刚打开、弹窗焦点确定时——主窗拖过之后的自动化拖拽会被
+  "首次点击只激活"吞掉，是探针缺陷不是应用缺陷）。
 - **UI 线程看门狗**（pumps.rs `spawn_ui_watchdog` + `PUMP_TICK`）：33ms 泵
   心跳停止 >1s 即输出 `[watchdog]` 诊断，是排查"假死"类问题的第一现场；
   后台线程零锁零分配，勿在泵内加锁。

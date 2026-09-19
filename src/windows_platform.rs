@@ -22,11 +22,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowW, GWLP_WNDPROC, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW,
-    GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOPMOST, MB_ICONWARNING, MB_OK, MessageBoxW,
-    PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE,
-    WM_COPYDATA, WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCLBUTTONDOWN,
+    GetWindowRect, HTCAPTION, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MB_ICONWARNING, MB_OK,
+    MessageBoxW, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CLOSE, WM_COPYDATA,
+    WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCLBUTTONDOWN,
 };
 
 use crate::events::FileEvent;
@@ -449,9 +450,51 @@ pub(crate) fn setup_playlist_window(window: &slint::Window) {
 /// 弹窗是否处于原生拖动的模态循环中（WndProc 维护，泵据此让路——
 /// 主窗是自算拖动无模态循环，泵可以在主窗拖动中实时联动弹窗）。
 static POP_IN_SIZEMOVE: AtomicBool = AtomicBool::new(false);
+/// 弹窗自上次泵读取后发生过原生拖动（SIZEMOVE 消息锁存，泵取走即清）。
+/// 解绑判定只认这个标志：跟随用的定位调用异步生效，快速拖主窗时弹窗
+/// 瞬时落后超过阈值是正常现象，绝不能据此解绑（实测踩坑）。
+static POP_DRAGGED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn popout_dragging() -> bool {
     POP_IN_SIZEMOVE.load(Ordering::Relaxed)
+}
+
+/// 读取并清除"弹窗被原生拖动过"标志（泵每拍取走一次）。
+pub(crate) fn take_popout_dragged() -> bool {
+    POP_DRAGGED.swap(false, Ordering::Relaxed)
+}
+
+/// 供泵实时定位弹窗：绕过 Slint 的属性桥接，直接调 Win32 SetWindowPos，
+/// 同一消息循环内生效，主窗拖动中弹窗无一帧延迟地贴着跟。
+pub(crate) fn set_popup_position_now(hwnd: isize, x: i32, y: i32) {
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            HWND_TOP,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// 按原始句柄取窗口矩形（物理像素）。弹窗句柄在弹出时缓存进 App，
+/// 泵跳过 Slint 组件借用直接读 Win32——跟随路径上少一层间接。
+pub(crate) fn window_rect_px_hwnd(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        if GetWindowRect(hwnd as HWND, &mut rc) == 0 {
+            return None; // 句柄已失效（窗口被销毁）
+        }
+    }
+    Some((rc.left, rc.top, rc.right, rc.bottom))
 }
 
 /// 播放列表独立窗口的窗口过程：拦 WM_CLOSE（转事件收回）与
@@ -471,10 +514,12 @@ unsafe extern "system" fn popout_wnd_proc(
         }
         WM_ENTERSIZEMOVE => {
             POP_IN_SIZEMOVE.store(true, Ordering::Relaxed);
+            POP_DRAGGED.store(true, Ordering::Relaxed);
             unsafe { forward_to_popout_original(hwnd, msg, wparam, lparam) }
         }
         WM_EXITSIZEMOVE => {
             POP_IN_SIZEMOVE.store(false, Ordering::Relaxed);
+            POP_DRAGGED.store(true, Ordering::Relaxed);
             // 原生拖动的模态移动循环会吞掉 WM_LBUTTONUP：Slint 的 TouchArea
             // 停留在"按住"状态且指针抓取永不解除，之后窗口内所有点击都被
             // Slint 路由给这个 TouchArea——表现为"拖过之后弹窗内任何 UI

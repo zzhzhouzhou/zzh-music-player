@@ -52,6 +52,8 @@ pub struct App {
     pub update_rx: mpsc::Receiver<UpdateEvent>,
     pub mode_hide_timer: Rc<slint::Timer>,
     pub popup_hide_timer: Rc<slint::Timer>,
+    /// 播放列表弹窗句柄（弹出时缓存，供泵实时 SetWindowPos 用）；关闭后复位。
+    pub popup_hwnd: Cell<Option<isize>>,
     /// 引擎侧均衡器参数：EqState 回调改写（RefCell——Rc<App> 共享下的
     /// 运行时可变性），do_close 时随 settings 持久化。
     pub eq: RefCell<EqSettings>,
@@ -180,11 +182,19 @@ fn place_popout_right_of_main(app: &App, pw: &PlaylistWindow) {
         y = 0;
     }
     pw.window().set_position(slint::PhysicalPosition::new(x, y));
+    // 缓存弹窗 HWND：泵跟随路径用 Win32 SetWindowPos 直接写位置（绕过
+    // Slint 属性桥接的异步生效，保证主窗拖动中弹窗实时贴住）。
+    app.popup_hwnd
+        .set(hwnd_from_window(pw.window()).map(|h| h as isize));
     // 磁贴：弹出即贴靠（右侧布局是贴靠位；屏幕右缘放不下翻到左侧则贴
     // 左侧），记录相对偏移与方位（光效用）供 33ms 泵联动。
     app.pop_snap.set(true);
     app.pop_snap_off.set((x - ml, y - mt));
     app.pop_snap_side.set(if x >= mr { 1 } else { 2 });
+    // 光效提示的初始方位必须显式推送：泵只在"变化时"同步，弹窗实例的
+    // snap-side 初始为 0，不推送的话贴靠辉光永远不亮（实测踩坑）。
+    pw.global::<PlaylistState>()
+        .set_snap_side(app.pop_snap_side.get() as i32);
 }
 
 /// 关闭播放列表独立窗口（幂等）：记录位置（供会话内重开与退出持久化）、
@@ -193,6 +203,8 @@ pub(crate) fn close_playlist_window(app: &App) -> Option<(i32, i32)> {
     let pw = app.playlist_window.borrow_mut().take()?;
     let pos = pw.window().position();
     app.playlist_pop_pos.set(Some((pos.x, pos.y)));
+    // 清空句柄（泵将不再尝试实时定位）
+    app.popup_hwnd.set(None);
     // 弹窗内的搜索框属于它自己的全局实例（随窗口销毁），但共享显示模型
     // 的过滤必须复位，否则抽屉重新打开仍是被过滤状态。
     app.playlist_view
@@ -200,9 +212,9 @@ pub(crate) fn close_playlist_window(app: &App) -> Option<(i32, i32)> {
         .set_filter("", &app.playlist.borrow());
     app.ui.global::<PlaylistState>().set_popped(false);
     eprintln!("[sys] 播放列表独立窗口已收回 playlist-closed");
-    // Slint 事件循环对“显示中”的窗口持强引用：不先 hide() 直接 drop 会留下
+    // Slint 事件循环对"显示中"的窗口持强引用：不先 hide() 直接 drop 会留下
     // 幽灵窗口——仍然可见但脱离管理，点 ✕ 只会去开抽屉、Alt+F4 落在空引用上
-    // （“弹窗像死了一样、无法关闭”的根因之一）。hide 后事件循环解除持有，
+    // （"弹窗像死了一样、无法关闭"的根因之一）。hide 后事件循环解除持有，
     // 下一行的 drop 才会真正销毁窗口并同步释放全部 UI 资源。
     let _ = pw.hide();
     Some((pos.x, pos.y)) // pw 在此 drop：窗口与全部 UI 资源同步释放
@@ -305,6 +317,7 @@ pub fn run() {
         pop_snap: Cell::new(false),
         pop_snap_off: Cell::new((0, 0)),
         pop_snap_side: Cell::new(0),
+        popup_hwnd: Cell::new(None),
         current_path: RefCell::new(None),
         playlist_model: Rc::clone(&playlist_model),
         playlist_window: RefCell::new(None),
