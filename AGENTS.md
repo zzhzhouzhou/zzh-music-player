@@ -178,15 +178,14 @@ UI 线程（Slint 事件循环 + 两个 Timer 泵）
   "HWND 未就绪则 50ms 重试"分支后才生效）。位置计算统一走 Win32
   `GetWindowRect`（物理像素）——Slint 的 position/size 语义在窗口创建前后
   有出入，勿混用逻辑/物理单位。
-- **泵周期更新的属性绝不能挂 Slint `animate`**（"播放中 40% CPU"的根因）：
-  粒子 opacity 与播放头 played-frac 曾分别挂 200ms/200ms 补间，而泵每 33/50ms
-  写一次——补间时长 > 写入间隔意味着动画永远在途，Slint 动画时钟永不停歇，
-  winit 后端随即以显示器刷新率持续整窗重绘（240Hz 屏实测 237fps、44% 单核；
-  vsync 在亚克力无边框窗/RDP 下会被驱动忽略，靠 frame_throttle 也压不住
-  "动画常驻"）。删除补间后播放中 CPU 降到 14%。规则：**只对离散事件
-  （悬停、点击、状态切换）触发的一次性过渡用 animate；泵驱动的连续属性
-  一律直接赋值，靠提高写入频率换平滑**。探针方法：TotalProcessorTime
-  双采样 + SLINT_DEBUG_PERFORMANCE=refresh_lazy,console 看真实 fps。
+- **泵周期更新的属性挂 Slint `animate` = 播放中动画时钟常驻**（曾致
+  240Hz 屏 237fps、40% 单核）：补间时长 > 泵写入间隔意味着动画永远在途，
+  winit 以显示器刷新率持续整窗重绘。**处理原则已由用户拍板：美观 > 性能**
+  ——粒子 opacity（120ms）与播放头 played-frac（150ms linear）补间已恢复，
+  接受"仅播放中"的重绘代价（暂停/空闲 position 不更新，动画自然沉降回
+  惰性渲染）。新属性仍须遵守：能不挂就不挂；确要挂则用短补间（≤150ms）
+  并确认代价只发生在交互/播放期，禁止在纯空闲路径引入常驻动画。
+  探针方法：TotalProcessorTime 双采样 + SLINT_DEBUG_PERFORMANCE=refresh_lazy,console 真实 fps。
 - **UI 线程看门狗**（pumps.rs `spawn_ui_watchdog` + `PUMP_TICK`）：33ms 泵
   心跳停止 >1s 即输出 `[watchdog]` 诊断，是排查"假死"类问题的第一现场；
   后台线程零锁零分配，勿在泵内加锁。

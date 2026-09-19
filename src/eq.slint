@@ -48,12 +48,15 @@ component BandSlider inherits Rectangle {
             border-radius: 2px;
             background: TransportState.theme-color.with-alpha(0.75);
         }
-        // 拇指。
+        // 拇指。增益为正时拇指必须上移（y 减小）：中心 - gain*H/24，
+        // 与填充方向、鼠标映射（上 = +12dB）三者一致。
+        // （上一版这里写成了 + gain*...，正增益时拇指反而下行，
+        // 出现"高亮往上、把手往下"的劈叉。）
         Rectangle {
             width: 18px;
             height: 10px;
             x: (parent.width - self.width) / 2;
-            y: clamp(parent.height / 2 + root.gain * parent.height / 24.0
+            y: clamp(parent.height / 2 - root.gain * parent.height / 24.0
                 - self.height / 2, 0px, parent.height - self.height);
             border-radius: 5px;
             background: #f2f4f8;

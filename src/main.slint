@@ -167,10 +167,12 @@ component WaveformArea inherits Rectangle {
         border-radius: 1.5px;
         background: #ffffff;
         opacity: TransportState.playing ? pow(1.0 - age, 1.4 + mod(i, 3) * 0.4) : 0.0;
-        // 此处绝不能加 animate opacity：泵每 33ms 更新一次 opacity，每次
-        // 都会重启一个 200ms 动画，动画时钟永不空闲，Slint 会以显示器
-        // 刷新率（240Hz 屏实测 237fps）持续整窗重绘，空闲烧 40% CPU。
-        // 粒子的年龄曲线本身已经是逐帧渐隐，无需补间。
+        // 美观 > 性能（用户拍板）：恢复 120ms 补间让粒子淡出更柔。
+        // 代价：播放中动画时钟常驻（写入间隔 33ms < 补间时长），以显示器
+        // 刷新率持续重绘——仅播放中发生，暂停/空闲即回落。此前 200ms 版
+        // 在 240Hz 屏实测 237fps/40% 单核；120ms 缩短了在途占空比，
+        // 且粒子只有播放中才写入，空闲期依旧零动画。
+        animate opacity { duration: 120ms; }
     }
 
     // 悬停位置上报（Rust 侧 33ms 计时器读取并格式化时间提示，仅变化时写入）。
@@ -298,13 +300,13 @@ export component MainWindow inherits Window {
         shortcuts.focus();
     }
 
-    // 播放位置比例：播放引擎每 ~50ms 上报一次，直接步进。
-    // 此处绝不能加 200ms 线性补间（曾用于"平滑滑动"播放头）：上报间隔
-    // 50ms < 补间时长 200ms，动画永远在途 → Slint 动画时钟永不停歇 →
-    // 以显示器刷新率持续整窗重绘（240Hz 屏实测 237fps、40% CPU）。
-    // 20Hz 步进对细进度条视觉上已足够平滑。
+    // 播放位置比例：播放引擎每 ~50ms 上报一次。
+    // 美观 > 性能（用户拍板）：恢复 150ms 线性补间让播放头平滑滑动。
+    // 代价与粒子同理：播放中动画时钟常驻、以显示器刷新率重绘；仅播放中
+    // 发生（暂停/无 duration 时 position 不更新，动画自然沉降）。
     property <float> played-frac:
         TransportState.duration > 0.0 ? min(TransportState.position / TransportState.duration, 1.0) : 0.0;
+    animate played-frac { duration: 150ms; easing: linear; }
     // 进度比例：拖拽中跟随手指（不插值，保证跟手）；seek 锁定期钉在目标上
     // （点击跳转不回弹）；其余时间取插值后的播放位置（平滑滑动）。
     property <float> progress-frac:
@@ -710,7 +712,7 @@ export component MainWindow inherits Window {
                 width: parent.width - 16px;
                 height: DockState.module-height - 10px;
                 border-radius: 12px;
-                background: #0f131b99;
+                background: #0f131b66;
                 border-width: 1px;
                 border-color: #ffffff1f;
             }
